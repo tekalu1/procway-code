@@ -1,0 +1,19 @@
+procway-code
+Copyright 2026 Procway contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+The "Procway" name and logo are trademarks of the Procway project and are not
+licensed under the Apache License.
+
+---------------------------------------------------------------------------
+Vendored third-party code
+---------------------------------------------------------------------------
+
+src/auth/oauth/
+    Derived from @earendil-works/pi-ai
+    (packages/ai/src/utils/oauth/{pkce,oauth-page,openai-codex}.ts,
+    https://github.com/earendil-works/pi).
+    License: MIT, Copyright (c) 2025 Mario Zechner.
+    The full upstream license text is reproduced in
+    src/auth/oauth/LICENSE.md, which must be retained together with the
+    per-file attribution headers in that directory.

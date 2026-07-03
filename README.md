@@ -60,4 +60,8 @@ desktop/browser tooling — is specified in
 
 ## License
 
-MIT — see `LICENSE`.
+Apache-2.0 — see `LICENSE` and `NOTICE`.
+
+`src/auth/oauth/` contains code vendored from
+[`@earendil-works/pi-ai`](https://github.com/earendil-works/pi) (MIT,
+Copyright (c) 2025 Mario Zechner) — see `src/auth/oauth/LICENSE.md`.

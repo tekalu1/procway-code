@@ -16,7 +16,8 @@
   "files": [
     "src/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20.0.0"
@@ -29,7 +30,7 @@
     "url": "https://github.com/tekalu1/procway-code/issues"
   },
   "homepage": "https://github.com/tekalu1/procway-code#readme",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "scripts": {
     "start": "node src/cli.mjs",
     "test": "vitest run --config vitest.config.mjs",
