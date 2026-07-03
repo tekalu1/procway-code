@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal Openbox config for the procway-code-runtime virtual desktop.
+
+  Goals:
+   - Single workspace (no virtual desktop switching in the UI)
+   - No application menu (this desktop is driven by the agent, not a human)
+   - Maximize-by-default for new windows so Chromium fills the 1280x800 viewport
+   - Quiet theme (Clearlooks ships with Debian's openbox-themes implicitly)
+
+  Reference: http://openbox.org/wiki/Help:Configuration
+-->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+
+  <resistance>
+    <strength>10</strength>
+    <screen_edge_strength>20</screen_edge_strength>
+  </resistance>
+
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+    <focusLast>yes</focusLast>
+    <underMouse>no</underMouse>
+    <raiseOnFocus>no</raiseOnFocus>
+  </focus>
+
+  <placement>
+    <policy>Smart</policy>
+    <center>yes</center>
+    <monitor>Primary</monitor>
+  </placement>
+
+  <theme>
+    <name>Clearlooks</name>
+    <titleLayout>NLIMC</titleLayout>
+    <keepBorder>yes</keepBorder>
+    <animateIconify>no</animateIconify>
+    <font place="ActiveWindow">
+      <name>sans</name>
+      <size>9</size>
+      <weight>bold</weight>
+      <slant>normal</slant>
+    </font>
+    <font place="InactiveWindow">
+      <name>sans</name>
+      <size>9</size>
+      <weight>normal</weight>
+      <slant>normal</slant>
+    </font>
+  </theme>
+
+  <desktops>
+    <number>1</number>
+    <firstdesk>1</firstdesk>
+    <names>
+      <name>workspace</name>
+    </names>
+    <popupTime>0</popupTime>
+  </desktops>
+
+  <applications>
+    <!-- Chromium fills the viewport so the agent's browser view ~= full screen -->
+    <application class="Chromium" type="normal">
+      <maximized>yes</maximized>
+      <decor>no</decor>
+    </application>
+    <application class="Chromium-browser" type="normal">
+      <maximized>yes</maximized>
+      <decor>no</decor>
+    </application>
+  </applications>
+
+  <!--
+    Keybindings + mousebindings intentionally empty: this is an unattended
+    desktop driven by the agent. A human watching via noVNC should not be
+    able to accidentally trigger menus / spawn terminals.
+  -->
+  <keyboard/>
+  <mouse/>
+
+</openbox_config>

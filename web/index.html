@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>procway-code — WebSocket bridge PoC</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>procway-code</h1>
+      <div class="status" id="status">connecting…</div>
+      <div class="session" id="session"></div>
+    </header>
+    <main class="main">
+      <aside class="sessions" aria-label="Session list">
+        <div class="sessions-header">
+          <h2>Sessions</h2>
+          <button type="button" id="refresh-sessions" disabled>List</button>
+        </div>
+        <ul id="session-list" class="session-list"></ul>
+      </aside>
+      <section class="events" aria-label="Event log">
+        <pre id="event-log" class="event-log"></pre>
+      </section>
+      <section class="approval" id="approval-panel" hidden>
+        <h2>Approval requested</h2>
+        <p id="approval-summary"></p>
+        <div class="approval-actions">
+          <button type="button" data-decision="allow">Allow (y)</button>
+          <button type="button" data-decision="always-allow">Always (a)</button>
+          <button type="button" data-decision="deny">Deny (n)</button>
+        </div>
+      </section>
+      <section class="composer">
+        <form id="prompt-form">
+          <label for="prompt-input" class="visually-hidden">Prompt</label>
+          <input
+            id="prompt-input"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Type a prompt and press Enter…"
+            disabled
+          />
+          <button type="submit" id="prompt-submit" disabled>Send</button>
+          <button type="button" id="abort-btn" disabled>Abort</button>
+        </form>
+      </section>
+    </main>
+    <script type="module" src="/client.mjs"></script>
+  </body>
+</html>

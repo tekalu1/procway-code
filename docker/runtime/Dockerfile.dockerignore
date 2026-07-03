@@ -1,0 +1,84 @@
+# Per-Dockerfile ignore for docker/runtime/Dockerfile.
+# BuildKit ≥1.5 picks this up automatically when -f points at this Dockerfile.
+#
+# Goal: ship ONLY what the runtime image needs (ai-agent + docker/runtime/),
+# not the dashboard / cli / docs / .git of the full monorepo. Cuts the build
+# context from gigabytes to tens of MB.
+
+# --- Version control ---
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- Sibling apps the runtime image does not need ---
+dashboard/
+# ADR 0008 §F2: the procway CLI is now baked into the runtime image at
+# /opt/procway/cli so dev-mode sessions don't need procway repo on
+# /workspace. Keep cli/ in the build context.
+# cli/    (do not exclude)
+procway/
+docs/
+scripts/
+# …except the git credential helper, which the Dockerfile bakes into the
+# image (COPY scripts/git-credential-procway.mjs). Without this exception the
+# build fails: "scripts/git-credential-procway.mjs: not found".
+!scripts/git-credential-procway.mjs
+skills/
+.claude/
+.vscode/
+.playwright/
+.playwright-cli/
+.port-registry/
+.procway/
+ai-agent/
+!ai-agent/package.json
+!ai-agent/pnpm-lock.yaml
+!ai-agent/src/
+!ai-agent/web/
+!ai-agent/README.md
+!ai-agent/LICENSE
+temporary/
+node_modules/
+
+# --- Dep caches inside any subdir ---
+**/node_modules
+**/.pnpm-store
+**/.pnpm
+
+# --- Build outputs ---
+**/.nuxt
+**/.output
+**/dist
+**/build
+**/coverage
+**/.vite
+
+# --- Editor / OS ---
+.idea
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+**/*.log
+logs/
+
+# --- Other docker contexts ---
+docker-compose*.yml
+
+# --- Misc ---
+*.bak
+*.tmp
+*~
+README.md
+LICENSE
+AGENTS.md
+procway-settings.json
+vitest.config.mjs
+# ADR 0008 §F2: the pnpm workspace metadata is required at /opt/procway
+# for the bake-time `pnpm install --prod` to resolve @procway/core and
+# root deps (undici, @libsql/client). Keep them in the build context.
+# package.json   (do not exclude)
+# pnpm-lock.yaml (do not exclude)

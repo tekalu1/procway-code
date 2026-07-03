@@ -1,0 +1,79 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`snapshot — diff preview > creation banner 1`] = `
+"[bold][green]+ Created[/][/]: src/foo.mjs
+[green]+    1: export const foo = 1;[/]
+[green]+    2: export const bar = 2;[/]
+"
+`;
+
+exports[`snapshot — diff preview > modification with mixed adds + removes 1`] = `
+"[bold][yellow]~ Modified[/][/]: src/bar.mjs
+[dim]     1: a[/]
+[dim]     2: b[/]
+[green]+    3: new[/]
+[red]-    3: old[/]
+[dim]     4: d[/]
+"
+`;
+
+exports[`snapshot — markdown rendering > renders a fenced code block — no colour 1`] = `
+"--- code (ts)
+  function foo(): number {
+    return 1;
+  }
+---
+
+"
+`;
+
+exports[`snapshot — markdown rendering > renders a multi-column table 1`] = `
+"┌───────┬─────┐
+│ [bold]name [/] │ [bold]age[/] │
+├───────┼─────┤
+│ ada   │ 36  │
+│ grace │ 85  │
+└───────┴─────┘
+"
+`;
+
+exports[`snapshot — markdown rendering > renders a tutorial document 1`] = `
+"[bold][cyan]# Heading One[/][/]
+
+Some intro text with [bold]bold[/] and [italic]italic[/] and [bg-gray][brightYellow] inline code [/][/].
+
+[bold][blue]## Subsection[/][/]
+
+[cyan]•[/] bullet alpha
+[cyan]•[/] bullet beta
+
+[cyan]1.[/] step one
+[cyan]2.[/] step two
+
+[dim]┌─ code (js)[/]
+  [bg-black][brightYellow]const x = 1;                                            [/][/]
+[dim]└──[/]
+
+[underline][cyan]link text[/][/] [dim](https://example.com)[/] closes it.
+
+"
+`;
+
+exports[`snapshot — tool renderer > collapsed run_shell summary 1`] = `
+"[dim]> tool:[/] [bold][cyan]run_shell(command="pnpm test")[/][/] [green]→[/]
+  tests 185 passed
+  Test Files 47 passed
+  Tests 185 passed
+  [dim]... (2 more lines, type :show to expand)[/]
+"
+`;
+
+exports[`snapshot — tool renderer > read_file body 1`] = `
+"[dim]> tool:[/] [bold][cyan]read_file(path=README.md)[/][/] [green]→[/]
+  Read 1.2 KB from README.md
+  # project
+  
+  hello world
+  [dim]... (1 more lines, type :show to expand)[/]
+"
+`;

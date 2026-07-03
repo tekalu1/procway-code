@@ -1,0 +1,38 @@
+# Public CI for the procway-code repo — injected by scripts/publish-sync.mjs
+# (do not edit in the public repo; the next sync overwrites it).
+#
+# procway-code is standalone: single-importer pnpm lockfile at the repo root,
+# runtime dependency = undici only. `pnpm install && pnpm test` is the whole story.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + vitest (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install pnpm
+        run: npm install -g pnpm@9.15.4 && pnpm --version
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+      - name: Tests
+        run: pnpm test

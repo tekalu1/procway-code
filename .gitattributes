@@ -1,0 +1,26 @@
+# Force LF line endings for all text files (Docker/Linux compatibility)
+* text=auto eol=lf
+
+# Explicit binary types (do not normalize)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.pen binary
+*.pdf binary
+*.canvas.json binary
+
+# Shell scripts must be LF regardless of OS
+*.sh text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf

@@ -1,0 +1,17 @@
+# procway-code — injected by scripts/publish-sync.mjs (do not edit in the
+# public repo; the next sync overwrites it).
+
+node_modules/
+coverage/
+*.log
+
+# Agent runtime state (sessions, tokens, logs) — never commit.
+**/.procway/ai-agent/sessions/
+**/.procway/ai-agent/sessions.json
+**/.procway/ai-agent/secrets.json
+**/.procway/ai-agent/auth-profiles.json
+**/.procway/ai-agent/spawn.pid
+**/.procway/ai-agent/logs/
+**/.procway-git-credentials.json
+**/.procway-env-vars.json
+**/.procway/mcp-host.log
