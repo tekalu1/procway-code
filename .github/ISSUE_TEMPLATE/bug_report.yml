@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in procway-code does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! For security vulnerabilities, please do NOT file
+        a public issue — see SECURITY.md. Issues about the Procway platform
+        (dashboard, deployment, Kubernetes runtime) belong in tekalu1/procway.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what happened, and what did you expect instead?
+      placeholder: Steps to reproduce, actual behavior, expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: procway-code version (or `git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: dropdown
+    id: usage
+    attributes:
+      label: How are you running it?
+      options:
+        - CLI (interactive / one-shot)
+        - Embedded / headless API (createAgentSession)
+        - serve WebSocket protocol
+        - Inside a Procway session pod
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Node.js version, LLM provider in use.
+      placeholder: "Ubuntu 24.04, Node 22.11, Anthropic"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: Please redact API keys and tokens.
+      render: shell

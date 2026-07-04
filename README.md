@@ -1,7 +1,15 @@
 # procway-code
 
+<!-- The CI badge points at the PUBLIC repo workflow (tekalu1/procway-code,
+     .github/workflows/ci.yml, injected by publish-sync). It will 404 until
+     the repo is flipped public. -->
+[![CI](https://github.com/tekalu1/procway-code/actions/workflows/ci.yml/badge.svg)](https://github.com/tekalu1/procway-code/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 Local coding agent — events-first, multi-provider (Anthropic / OpenAI / OpenRouter),
-TUI-ready, headless API.
+TUI-ready, headless API. Built as the agent of the
+[Procway](https://github.com/tekalu1/procway) platform, and usable entirely on
+its own.
 
 `procway-code` is the CLI entry point. The same core can also be embedded as a library
 through `import { createAgentSession } from "procway-code"` for headless / WebSocket /
@@ -57,6 +65,14 @@ filesystem layout, LLM proxying, the `serve` WebSocket protocol (incl.
 `protocolVersion` negotiation), delegated-job drivers, and the optional
 desktop/browser tooling — is specified in
 [`docs/host-contract.md`](docs/host-contract.md).
+
+## Contributing & security
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) (dev setup,
+test commands, and the PR flow: this public repo is a one-way mirror of a
+private monorepo; accepted changes are applied upstream with credit). Please
+also read the [Code of Conduct](CODE_OF_CONDUCT.md), and report
+vulnerabilities privately per [SECURITY.md](SECURITY.md).
 
 ## License
 
