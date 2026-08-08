@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentSession } from "../src/agent/conversation.mjs";
 import { EventBus } from "../src/core/events/bus.mjs";
 import { createAgentSession } from "../src/core/index.mjs";
 import { PlanMode, buildDeferredToolResult } from "../src/agent/plan-mode.mjs";
 import { planCommand } from "../src/core/commands/plan.mjs";
+import { makeInvalidToolArgs } from "../src/providers/format/tool-args.mjs";
 
 const echoBin = fileURLToPath(new URL("./fixtures/cli-agent-echo.mjs", import.meta.url));
 
@@ -103,5 +103,23 @@ describe("AgentSession + Plan mode (integration)", () => {
     expect(result.data.planQueued).toBe(true);
     expect(queued).toHaveLength(1);
     expect(queued[0].kind).toBe("write_file");
+  });
+
+  it("fix 8: rejects an invalid-args write BEFORE queuing it under plan mode", async () => {
+    const events = new EventBus();
+    const queued = [];
+    events.on("plan.queued", (event) => queued.push(event));
+    const session = await createAgentSession({
+      settings: { ...settingsForCliAgent(), plan: { enabled: true } },
+      cwd,
+      sessionId: "plan-int-2",
+      events
+    });
+    // A truncated write must fail the model now (throw → ok:false), not get
+    // queued as a plan entry that only throws at apply time past recovery.
+    await expect(
+      session.executeSingleToolCall({ id: "tc-2", name: "write_file", args: makeInvalidToolArgs({ truncated: true }) })
+    ).rejects.toThrow(/write_file could not run because its arguments were truncated/);
+    expect(queued).toHaveLength(0);
   });
 });

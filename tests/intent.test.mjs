@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   buildTaskCompletionRetryPrompt,
-  detectsPlanIntent,
   extractProcwayMeta,
   hasMutationToolResult,
   hasTaskCompletionToolResult,
@@ -25,12 +24,6 @@ describe("file mutation intent", () => {
     ])).toBe(false);
   });
 
-  it("detects plan-mode prompts (Phase 7)", () => {
-    expect(detectsPlanIntent("Let's plan this out before writing")).toBe(true);
-    expect(detectsPlanIntent("Make a plan for the migration")).toBe(true);
-    expect(detectsPlanIntent("計画を立ててから実装してください")).toBe(true);
-    expect(detectsPlanIntent("just go ahead and fix it")).toBe(false);
-  });
 });
 
 describe("procway task-completion intent", () => {
@@ -279,7 +272,7 @@ describe("procway task-completion intent", () => {
   it("buildTaskCompletionRetryPrompt: directs blocked reviews to re-review, forbids worker review-resolve", () => {
     const text = buildTaskCompletionRetryPrompt({ project: "procway", ticket: "TK-139", task: "ui-design" });
     expect(text).toContain("task re-review");
-    expect(text).toContain("Do NOT use \`task review-resolve\`");
+    expect(text).toContain("Do NOT use `task review-resolve`");
   });
 
   it("buildTaskCompletionRetryPrompt: gracefully handles missing fields", () => {

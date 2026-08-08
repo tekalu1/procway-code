@@ -33,3 +33,15 @@ elif [ -n "${PROCWAY_NODE_FALLBACK_BIN:-}" ] && [ -x "${PROCWAY_NODE_FALLBACK_BI
     *) export PATH="${PROCWAY_NODE_FALLBACK_BIN}:${PATH}" ;;
   esac
 fi
+
+# ── Workspace env hook (ADR 0033 §D3 follow-up) ──────────────────────────────
+# If the session's workspace carries `.procway-env.sh`, source it into EVERY
+# shell the agent spawns (this file rides BASH_ENV + /etc/profile.d). The file
+# lives on the per-session PVC, so it persists across suspend→resume AND is
+# carried into environment templates («環境として保存» → seed) — the supported
+# way to make `export PATH=/workspace/flutter/bin:$PATH` style setup stick in
+# new sessions. Same trust boundary as any AI-executed command; fail-soft so a
+# broken hook can never take a tool shell down.
+if [ -n "${PROCWAY_WORKSPACE_DIR:-}" ] && [ -f "${PROCWAY_WORKSPACE_DIR}/.procway-env.sh" ]; then
+  \. "${PROCWAY_WORKSPACE_DIR}/.procway-env.sh" 2>/dev/null || true
+fi

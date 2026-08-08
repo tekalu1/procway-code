@@ -1,7 +1,34 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { getWorkspaceSettingsPath } from "./load-settings.mjs";
+import { getUserSettingsPath, getWorkspaceSettingsPath } from "./load-settings.mjs";
+
+export function getSettingsPath({ cwd = process.cwd(), homeDir, scope = "user" } = {}) {
+  if (scope === "user") return getUserSettingsPath(homeDir);
+  if (scope === "workspace") return getWorkspaceSettingsPath(path.resolve(cwd));
+  throw new Error("settings scope must be user or workspace");
+}
+
+export async function readScopedSettings(options = {}) {
+  const filePath = getSettingsPath(options);
+  if (!existsSync(filePath)) return {};
+  return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+export async function writeScopedSettings(options = {}, settings) {
+  const filePath = getSettingsPath(options);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  return filePath;
+}
+
+export async function setSetting({ cwd = process.cwd(), homeDir, scope = "user", key, value }) {
+  const options = { cwd, homeDir, scope };
+  const settings = await readScopedSettings(options);
+  setByPath(settings, key, parseConfigValue(value));
+  const pathWritten = await writeScopedSettings(options, settings);
+  return { path: pathWritten, scope, key, value: getByPath(settings, key) };
+}
 
 export async function readWorkspaceSettings(cwd = process.cwd()) {
   const filePath = getWorkspaceSettingsPath(path.resolve(cwd));
@@ -17,10 +44,8 @@ export async function writeWorkspaceSettings(cwd = process.cwd(), settings) {
 }
 
 export async function setWorkspaceSetting({ cwd = process.cwd(), key, value }) {
-  const settings = await readWorkspaceSettings(cwd);
-  setByPath(settings, key, parseConfigValue(value));
-  const pathWritten = await writeWorkspaceSettings(cwd, settings);
-  return { path: pathWritten, key, value: getByPath(settings, key) };
+  const { scope: _scope, ...result } = await setSetting({ cwd, scope: "workspace", key, value });
+  return result;
 }
 
 function setByPath(target, key, value) {

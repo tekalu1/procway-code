@@ -1,0 +1,56 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`pty: slash commands and editing > keeps both lines of a Ctrl+J multi-line buffer on screen 1`] = `
+"[csi:2A][CR][erase-below][accent]╭─[/color] [bold]workspace[/intensity][muted] · [/color][muted]openai-main:gpt-test[/color][muted] · [/color][muted]auto-readonly[/color][CR]
+[accentStrong][bold]╰─❯[/intensity][/color] first line[CR]
+    second line[CR][csi:15C][csi:2A][CR][erase-below][accent]╭─[/color] [bold]workspace[/intensity][muted] · [/color][muted]openai-main:gpt-test[/color][muted] · [/color][muted]auto-readonly[/color][CR]
+[accentStrong][bold]╰─❯[/intensity][/color] [CR][csi:4C][csi:1A][CR][erase-below]
+(Press Ctrl-C again to exit)
+"
+`;
+
+exports[`pty: slash commands and editing > prints the full command list for /help 1`] = `
+"[accent]▌[/color] [accentStrong][bold]Commands[/intensity][/color]
+  /branch from <messageId>  Branch the conversation from a message id (/branch
+                            from <messageId>)
+  /checkout <branchSessionId>
+                            Resume a branch session by id
+  /clear                    Clear the terminal while keeping the session
+  /compact [--strategy <name>] [--keep-last <n>]
+                            Compact the conversation history
+  /config [setup]           Show settings or configure a provider interactively
+                            (/config setup)
+  /context                  Show resolved instructions / skills
+  /exit                     Leave the REPL
+  /help                     List all slash commands with a one-line description
+  /history                  Print the recent transcript
+  /memory                   List persisted memory entries
+  /model                    Show the active provider:model
+  /plan                     Toggle plan mode (queue write tools for end-of-turn
+                            approval)
+  /resume                   Pick a session to resume
+  /status                   Show workspace, session, model, and mode
+  /terminal-setup           Bind Shift+Enter to a newline in this terminal
+                            (shows a diff first)
+  /thinking [on|off]        Show or hide the model's reasoning stream
+  /todos                    Show the agent's running todo list
+  /usage                    Show round-by-round usage / cost
+"
+`;
+
+exports[`pty: slash commands and editing > prints the session panel for /status 1`] = `
+"[accent]▌[/color] [accentStrong][bold]Status[/intensity][/color]
+  [muted]Workspace[/color]  <workspace>
+  [muted]Session  [/color]  <session-id>
+  [muted]Model    [/color]  openai-main:gpt-test
+  [muted]Approval [/color]  auto-readonly
+  [muted]Plan mode[/color]  off
+  [muted]Thinking [/color]  shown
+  <tool-off-rows>
+"
+`;
+
+exports[`pty: slash commands and editing > renders a line of Japanese without corrupting the redraw 1`] = `
+"[csi:1A][CR][erase-below][accent]╭─[/color] [bold]workspace[/intensity][muted] · [/color][muted]openai-main:gpt-test[/color][muted] · [/color][muted]auto-readonly[/color][CR]
+[accentStrong][bold]╰─❯[/intensity][/color] 日本語のテスト[CR][csi:18C]"
+`;

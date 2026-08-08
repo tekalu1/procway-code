@@ -9,17 +9,6 @@
  * a fake controller that records calls.
  */
 
-const SUBSCRIPTIONS = [
-  ["session.created", "sessionStarted"],
-  ["session.resumed", "sessionStarted"],
-  ["user.prompt.submitted", "turnStarted"],
-  ["assistant.message.completed", "turnEnded"],
-  ["turn.failed", "turnFailed"],
-  ["turn.completed", "turnEnded"],
-  ["tool.call.started", "toolCallStarted"],
-  ["tool.call.completed", "toolCallEnded"]
-];
-
 export function spanMapForBus(events, controller) {
   if (!events || typeof events.on !== "function" || !controller) {
     return () => {};

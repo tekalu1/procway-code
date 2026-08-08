@@ -54,6 +54,25 @@ function isTelemetryEnabled(env) {
   return ["on", "1", "true", "yes"].includes(flag.toLowerCase());
 }
 
+let warnedMissingOtel = false;
+
+/** One line, once per process — never a wall of text on every turn. */
+function warnMissingOtel(env) {
+  if (warnedMissingOtel) return;
+  warnedMissingOtel = true;
+  if (env?.PROCWAY_TELEMETRY_QUIET) return;
+  process.stderr.write(
+    "[telemetry] PROCWAY_TELEMETRY is on but the OpenTelemetry packages are not installed. " +
+      "Install them to enable tracing:\n" +
+      "  npm i -g @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http @opentelemetry/resources\n"
+  );
+}
+
+/** @internal test seam — the warning is once-per-process by design. */
+export function __resetOtelWarning() {
+  warnedMissingOtel = false;
+}
+
 async function loadOtelSdk({ env, settings }) {
   let sdkPkg;
   let exporterPkg;
@@ -63,6 +82,11 @@ async function loadOtelSdk({ env, settings }) {
     exporterPkg = await import("@opentelemetry/exporter-trace-otlp-http");
     resourcesPkg = await import("@opentelemetry/resources").catch(() => null);
   } catch {
+    // The OTel packages are NOT bundled (they pull ~35 transitive packages and
+    // ~74 MB for a feature that is off by default — see README "Tracing").
+    // Someone who explicitly set PROCWAY_TELEMETRY=on deserves to know why
+    // nothing is being exported, rather than silent no-op.
+    warnMissingOtel(env);
     return null;
   }
   const SdkCtor = sdkPkg.NodeSDK ?? sdkPkg.default?.NodeSDK ?? sdkPkg.default;

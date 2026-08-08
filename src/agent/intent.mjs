@@ -31,25 +31,6 @@ export function requiresFileMutation(prompt) {
     && FILE_HINT_PATTERNS.some((pattern) => pattern.test(prompt));
 }
 
-const PLAN_INTENT_PATTERNS = [
-  /plan\s+(this|out|first)/i,
-  /make a plan/i,
-  /draft a plan/i,
-  /\bplan mode\b/i,
-  /計画/,
-  /プラン/
-];
-
-/**
- * Detect whether a user prompt suggests plan mode is appropriate (queue
- * write operations for review instead of running them). Used by REPL
- * adapters that auto-toggle plan mode based on phrasing.
- */
-export function detectsPlanIntent(prompt) {
-  if (typeof prompt !== "string" || prompt.length === 0) return false;
-  return PLAN_INTENT_PATTERNS.some((pattern) => pattern.test(prompt));
-}
-
 /**
  * Detect whether the message stream from `startIndex` onward contains a
  * successful mutation tool result. Accepts both the Phase 2 internal

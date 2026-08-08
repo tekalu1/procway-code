@@ -7,6 +7,7 @@
  * module isolates the conversion so `core/` stays provider-agnostic.
  */
 import { isInlineImageBlock } from "../image-hydration.mjs";
+import { parseToolArgs, stripInvalidToolArgs } from "./tool-args.mjs";
 
 /**
  * Convert internal Message[] (or legacy raw messages) into the shape the
@@ -60,7 +61,10 @@ export function toAnthropicMessages(messages = []) {
               type: "tool_use",
               id: toolUse.id,
               name: toolUse.name,
-              input: toolUse.args ?? {}
+              // Never re-send the invalid-args marker (e.g. from parseJsonArgs on
+              // broken legacy history, or a pre-fix persisted session) — Anthropic
+              // requires input to be an object and `{}` is the safe, marker-free form.
+              input: stripInvalidToolArgs(toolUse.args ?? {})
             }))
           ]
         });
@@ -375,10 +379,8 @@ function extractToolCallId(message) {
 }
 
 function parseJsonArgs(value) {
-  if (typeof value !== "string") return value ?? {};
-  try {
-    return JSON.parse(value);
-  } catch {
-    return {};
-  }
+  // Re-serializing stored history: a stored tool call whose arguments string is
+  // unparseable is marked invalid (identifiable downstream) rather than coerced
+  // to `{}`, matching the initial-parse paths.
+  return parseToolArgs(value);
 }

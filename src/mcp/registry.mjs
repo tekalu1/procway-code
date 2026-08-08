@@ -1,6 +1,7 @@
 import { McpClient, discoverMcpServer } from "./client.mjs";
 import { StdioMcpTransport } from "./transports/stdio.mjs";
 import { HttpMcpTransport } from "./transports/http.mjs";
+import { StreamableHttpMcpTransport } from "./transports/streamable-http.mjs";
 
 /**
  * McpToolRegistry manages MCP server connections and exposes their tools
@@ -111,10 +112,23 @@ function defaultTransportFactory({ cwd, env, fetchImpl }) {
   return (server) => {
     const transport = (server?.transport ?? "stdio").toLowerCase();
     if (transport === "http" || transport === "sse") {
-      return new HttpMcpTransport({
+      // "sse" pins the legacy HTTP+SSE transport. "http" with an explicit
+      // `oauth` block also stays legacy (that config predates Streamable
+      // HTTP and its token grant lives in that transport). Everything else
+      // on "http" gets Streamable HTTP with automatic legacy fallback.
+      if (transport === "sse" || server.oauth) {
+        return new HttpMcpTransport({
+          baseUrl: server.baseUrl,
+          headers: server.headers ?? {},
+          oauth: server.oauth ?? null,
+          authProvider: server.authProvider ?? null,
+          fetchImpl
+        });
+      }
+      return new StreamableHttpMcpTransport({
         baseUrl: server.baseUrl,
         headers: server.headers ?? {},
-        oauth: server.oauth ?? null,
+        authProvider: server.authProvider ?? null,
         fetchImpl
       });
     }
@@ -152,20 +166,3 @@ export function expandEnvReferences(value, env = process.env) {
   return value;
 }
 
-/**
- * One-shot discovery (for backward compatibility / diagnostic use).
- */
-export async function discoverConfiguredMcpServers({ settings, cwd = process.cwd(), env = process.env, fetchImpl = globalThis.fetch } = {}) {
-  const discovered = {};
-  const factory = defaultTransportFactory({ cwd, env, fetchImpl });
-  for (const [id, rawServer] of Object.entries(settings?.mcpServers ?? {})) {
-    if (rawServer?.enabled === false) continue;
-    const server = expandEnvReferences(rawServer, env);
-    const transport = factory(server, id);
-    const client = new McpClient({ transport, timeoutMs: server.timeoutMs ?? 30000 });
-    await client.start();
-    discovered[id] = await discoverMcpServer(client);
-    await client.close();
-  }
-  return discovered;
-}

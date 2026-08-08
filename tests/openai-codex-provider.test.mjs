@@ -96,6 +96,33 @@ describe("runOpenAiCodexProvider (non-streaming)", () => {
     expect(result.message.content).toBeNull();
   });
 
+  it("fix 7: marks a truncated function call (status incomplete / max_output_tokens) via the shared helper", async () => {
+    const fetchImpl = vi.fn(async () =>
+      okResponse([
+        {
+          event: "response.output_item.added",
+          data: {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { id: "fc_2", type: "function_call", call_id: "call_cut", name: "write_file", arguments: "" }
+          }
+        },
+        { event: "response.function_call_arguments.delta", data: { type: "response.function_call_arguments.delta", output_index: 0, delta: "{\"filePath\":\"a.txt\",\"conte" } },
+        { event: "response.completed", data: { type: "response.completed", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 5, output_tokens: 9 } } } }
+      ])
+    );
+    const result = await runOpenAiCodexProvider({
+      provider: baseProvider(),
+      messages: [{ role: "user", content: "write please" }],
+      tools: [{ type: "function", function: { name: "write_file", parameters: { type: "object" } } }],
+      fetchImpl,
+      stream: false
+    });
+    expect(result.toolCalls).toEqual([
+      { id: "call_cut", name: "write_file", args: { __procwayInvalidToolArgs: { reason: "parse_error", truncated: true } } }
+    ]);
+  });
+
   it("surfaces response.failed events as thrown errors", async () => {
     const fetchImpl = vi.fn(async () =>
       okResponse([

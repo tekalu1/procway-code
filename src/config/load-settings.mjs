@@ -100,8 +100,8 @@ export async function loadSettings({ cwd = process.cwd(), repoRoot = null, env =
   const sources = [
     { name: "default", path: null, settings: DEFAULT_SETTINGS },
     { name: "environment", path: null, settings: settingsFromEnv(env) },
-    { name: "user", path: userPath, settings: await readJsonIfExists(userPath) },
-    { name: "workspace", path: workspacePath, settings: await readJsonIfExists(workspacePath) },
+    { name: "user", path: userPath, settings: stripNullPermissions(await readJsonIfExists(userPath)) },
+    { name: "workspace", path: workspacePath, settings: stripNullPermissions(await readJsonIfExists(workspacePath)) },
     { name: "cli", path: null, settings: settingsFromCliOptions(cliOptions) }
   ];
   const merged = mergeSettings(...sources.map((source) => source.settings));
@@ -122,6 +122,19 @@ export async function loadSettings({ cwd = process.cwd(), repoRoot = null, env =
       keys: sourceSettings && typeof sourceSettings === "object" ? Object.keys(sourceSettings) : []
     }))
   };
+}
+
+// `permissions: null` in a settings file would clobber the builtin
+// deny/allow/ask defaults (mergeSettings lets null override an object), which
+// silently disables the default deny rules (`rm -rf` 等). Dashboards have shipped
+// files with the key explicitly nulled, so treat null as "no opinion" and let
+// the defaults through. Disabling rules on purpose is still possible with an
+// explicit object (e.g. `{ "deny": [] }`).
+function stripNullPermissions(settings) {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return settings;
+  if (settings.permissions !== null) return settings;
+  const { permissions: _omit, ...rest } = settings;
+  return rest;
 }
 
 async function readJsonIfExists(filePath) {

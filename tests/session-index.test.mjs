@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, mkdirSync, statSync, writeFileSync, readdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, statSync, writeFileSync, readdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";

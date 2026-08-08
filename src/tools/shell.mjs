@@ -6,6 +6,27 @@ import { resolveSandbox, wrapShellCommand } from "../safety/sandbox.mjs";
 import { getSharedJobRegistry } from "../jobs/delegated-jobs.mjs";
 import { createProcessDriver } from "../jobs/process-driver.mjs";
 import { decodeShellBytes } from "../adapters/tui/input-preprocessor.mjs";
+import { USER_INTERRUPT_MESSAGE } from "../agent/abort.mjs";
+import { KILL_ESCALATION_MS, SUPPORTS_PROCESS_GROUPS, killProcessTree } from "./process-tree.mjs";
+
+/** Foreground shells currently running. Used only by the process-exit reaper
+ *  below; entries are removed as soon as the child closes. */
+const activeForegroundChildren = new Set();
+let exitReaperInstalled = false;
+
+function trackForegroundChild(child) {
+  activeForegroundChildren.add(child);
+  if (exitReaperInstalled) return;
+  exitReaperInstalled = true;
+  // 'exit' handlers must be synchronous — process.kill is, so this works even
+  // for an immediate process.exit(130).
+  process.on("exit", () => {
+    for (const tracked of activeForegroundChildren) {
+      killProcessTree(tracked, "SIGKILL");
+    }
+    activeForegroundChildren.clear();
+  });
+}
 
 export async function runShell({
   command,
@@ -22,15 +43,38 @@ export async function runShell({
   // Delegated-job registry the background path routes through (ADR 0029 P2).
   // Injectable for tests; defaults to the process-wide shared registry.
   jobRegistry,
+  // Owning AgentSession id (ADR 0037 D4): stamped onto the background job's
+  // meta so the session snapshot can dehydrate/rehydrate ITS jobs across a
+  // Pod restart. Null for direct/headless callers (job is then snapshot-less).
+  sessionId = null,
   // Called with `{ detail }` while the foreground child runs: throttled
   // output tails as they stream in, plus a periodic heartbeat when the child
   // is silent. The caller (turn-orchestrator via registry) forwards these as
   // `activity.tick` events, which (a) feed the 90s turn-idle watchdog so a
   // long-but-healthy foreground command no longer aborts the TURN, and
   // (b) give the ChatPanel live output. Null → byte-identical to before.
-  onProgress = null
+  onProgress = null,
+  // The turn's AbortSignal (user Stop / idle watchdog). On abort the child's
+  // whole process GROUP is terminated and the tool settles as interrupted.
+  signal = null
 } = {}) {
   const classification = classifyCommand(command);
+  // A Stop that landed while this call was queued must not start a process.
+  if (signal?.aborted) {
+    return {
+      kind: "run_shell",
+      summary: `${USER_INTERRUPT_MESSAGE}: ${truncateInline(command, 60)}`,
+      data: {
+        command,
+        cwd: path.resolve(cwd),
+        interrupted: true,
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        classification
+      }
+    };
+  }
 
   // Hard guard: refuse direct writes to tasks/<task>/(memo.md|evidence/|report/).
   // These artifacts must be deposited via the `task put` API, which routes
@@ -80,7 +124,8 @@ export async function runShell({
     const { jobId } = registry.spawnJob({
       kind: "process",
       driver,
-      spec: { command: effectiveCommand, cwd }
+      spec: { command: effectiveCommand, cwd },
+      ...(sessionId ? { meta: { sessionId } } : {})
     });
     const handle = registry.getJobHandle(jobId);
     const pid = handle?.pid ?? null;
@@ -105,18 +150,55 @@ export async function runShell({
     cwd: path.resolve(cwd),
     env: { ...process.env, ...(profile.env ?? {}) },
     stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true
+    windowsHide: true,
+    // Make the shell a process-group leader so timeout/abort can kill the
+    // whole tree (see killProcessTree). We deliberately do NOT unref() — the
+    // foreground path still awaits this child.
+    detached: SUPPORTS_PROCESS_GROUPS
   });
+  // Safety net for the paths that DON'T go through abort: a detached child no
+  // longer receives the terminal's Ctrl+C (that is the point — we want the kill
+  // to be deterministic), so a hard `process.exit()` (the TUI's second Ctrl+C)
+  // would otherwise leave the group running. Sync group-SIGKILL on exit.
+  trackForegroundChild(child);
 
   const stdoutChunks = [];
   const stderrChunks = [];
   let stdoutBytes = 0;
   let stderrBytes = 0;
   let timedOut = false;
+  let interrupted = false;
+  let escalationTimer = null;
+  let settled = false;
+
+  // Single termination path for BOTH the timeout and the abort: SIGTERM the
+  // process group, then SIGKILL it if anything is still alive after the grace
+  // window. Previously the timeout's lone child.kill("SIGTERM") was the only
+  // stop mechanism and it never reached grandchildren.
+  const terminate = () => {
+    if (settled) return;
+    killProcessTree(child, "SIGTERM");
+    if (escalationTimer) return;
+    escalationTimer = setTimeout(() => {
+      if (settled) return;
+      killProcessTree(child, "SIGKILL");
+    }, KILL_ESCALATION_MS);
+    try { escalationTimer.unref?.() } catch { /* mock timers */ }
+  };
+
   const timer = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGTERM");
+    terminate();
   }, effectiveTimeout);
+
+  let onAbort = null;
+  if (signal) {
+    onAbort = () => {
+      interrupted = true;
+      terminate();
+    };
+    signal.addEventListener?.("abort", onAbort, { once: true });
+  }
 
   // Progress plumbing: throttle streamed output to one event per window so a
   // chatty build doesn't flood the event log, and heartbeat when silent so
@@ -185,8 +267,14 @@ export async function runShell({
     });
     child.on("close", resolve);
   });
+  settled = true;
+  activeForegroundChildren.delete(child);
   clearTimeout(timer);
+  if (escalationTimer) clearTimeout(escalationTimer);
   if (heartbeat) clearInterval(heartbeat);
+  if (onAbort) {
+    try { signal.removeEventListener?.("abort", onAbort); } catch { /* ignore */ }
+  }
 
   if (spawnError) {
     const code = spawnError.code ?? spawnError.name ?? "SPAWN_ERROR";
@@ -219,18 +307,26 @@ export async function runShell({
     cwd: path.resolve(cwd),
     exitCode,
     timedOut,
+    ...(interrupted ? { interrupted: true } : {}),
     stdout,
     stderr,
     classification,
     ...(sandboxNotes.length > 0 ? { sandbox: sandboxNotes } : {})
   };
-  const summary = `Ran: ${truncateInline(command, 60)} (exit ${exitCode}${timedOut ? ", timed out" : ""})`;
+  // An interrupted run still returns a normal (non-throwing) ToolResult: the
+  // tool_use block already exists in the transcript, so it MUST get its paired
+  // tool_result or the next provider request is invalid.
+  const summary = interrupted
+    ? `${USER_INTERRUPT_MESSAGE}: ${truncateInline(command, 60)}`
+    : `Ran: ${truncateInline(command, 60)} (exit ${exitCode}${timedOut ? ", timed out" : ""})`;
   const result = {
     kind: "run_shell",
     summary,
     data
   };
-  if (timedOut) {
+  if (interrupted) {
+    result.diagnostics = { warnings: [`${USER_INTERRUPT_MESSAGE} — the command's process group was terminated.`] };
+  } else if (timedOut) {
     result.diagnostics = { warnings: [`Process timed out after ${effectiveTimeout}ms`] };
   }
   return result;
@@ -250,9 +346,43 @@ function resolveProcessHandle(shellId, jobRegistry) {
   return handle && typeof handle.status === "function" ? handle : null;
 }
 
+/**
+ * ADR 0037 D4: a job REHYDRATED from a session snapshot after a restart has no
+ * live process handle (status()/logs() died with the old process) — but the
+ * registry still knows its settled state. Answer from that state instead of
+ * the misleading "unknown shellId" so callers see the truth (typically
+ * `failed: job lost to an agent restart`).
+ */
+function makeRestoredJobResult(tool, shellId, job) {
+  return {
+    kind: "run_shell",
+    summary: `${job.status} (restored after restart)`,
+    data: {
+      tool,
+      shellId,
+      status: job.status,
+      restored: true,
+      ...(job.error ? { error: job.error } : {}),
+      note: "This job predates an agent restart; live status/logs are unavailable. Re-run the command if its work is still needed."
+    }
+  };
+}
+
+/** Job state when the registry knows the id but no live process handle exists
+ *  (a snapshot-restored job). Null when the id is unknown or the job is live. */
+function restoredJobState(shellId, jobRegistry) {
+  const registry = jobRegistry ?? getSharedJobRegistry();
+  const job = registry.getJob(shellId);
+  if (!job) return null;
+  const handle = registry.getJobHandle(shellId);
+  return handle && typeof handle.status === "function" ? null : job;
+}
+
 export async function runShellStatus({ shellId, jobRegistry }) {
   const handle = resolveProcessHandle(shellId, jobRegistry);
   if (!handle) {
+    const restored = restoredJobState(shellId, jobRegistry);
+    if (restored) return makeRestoredJobResult("shell_status", shellId, restored);
     return makeMissingResult("shell_status", shellId);
   }
   const status = handle.status();
@@ -266,6 +396,8 @@ export async function runShellStatus({ shellId, jobRegistry }) {
 export async function runShellLogs({ shellId, stream = "both", tail = null, jobRegistry }) {
   const handle = resolveProcessHandle(shellId, jobRegistry);
   if (!handle) {
+    const restored = restoredJobState(shellId, jobRegistry);
+    if (restored) return makeRestoredJobResult("shell_logs", shellId, restored);
     return makeMissingResult("shell_logs", shellId);
   }
   const logs = handle.logs({ stream, tail });
@@ -290,7 +422,10 @@ export async function runShellWait({
   pollMs = 250,
   heartbeatMs = 15000,
   onProgress = null,
-  jobRegistry
+  jobRegistry,
+  // A Stop must break this poll loop too — it can legitimately block for
+  // minutes, which used to keep a "stopped" turn alive until waitMs elapsed.
+  signal = null
 } = {}) {
   // ADR 0029 P2: the job is owned by the registry; the process driver's handle
   // exposes live status()/logs() (full ring-buffer fidelity). We keep the poll
@@ -298,6 +433,8 @@ export async function runShellWait({
   // heartbeats, logsTail, timedOut-without-killing — is byte-preserved.
   const handle = resolveProcessHandle(shellId, jobRegistry);
   if (!handle) {
+    const restored = restoredJobState(shellId, jobRegistry);
+    if (restored) return makeRestoredJobResult("shell_wait", shellId, restored);
     return makeMissingResult("shell_wait", shellId);
   }
   const startedAtMs = Date.now();
@@ -307,6 +444,20 @@ export async function runShellWait({
     try { onProgress({ detail }) } catch { /* best-effort */ }
   };
   while (true) {
+    if (signal?.aborted) {
+      const status = handle.status();
+      return {
+        kind: "run_shell",
+        summary: `${USER_INTERRUPT_MESSAGE} while waiting on ${shellId.slice(0, 8)}`,
+        data: {
+          tool: "shell_wait",
+          ...status,
+          shellId,
+          waitedMs: Date.now() - startedAtMs,
+          interrupted: true
+        }
+      };
+    }
     const status = handle.status();
     if (status.status === "exited") {
       const logs = handle.logs({ stream: "both", tail: 50 });
@@ -338,6 +489,8 @@ export async function runShellWait({
 export async function runShellKill({ shellId, signal = "SIGTERM", graceMs = 0, jobRegistry }) {
   const handle = resolveProcessHandle(shellId, jobRegistry);
   if (!handle) {
+    const restored = restoredJobState(shellId, jobRegistry);
+    if (restored) return makeRestoredJobResult("shell_kill", shellId, restored);
     return makeMissingResult("shell_kill", shellId);
   }
   const result = await handle.kill({ signal, graceMs });

@@ -29,6 +29,34 @@ describe("loadSettings", () => {
     expect(settings.context.compatibilityMode).toBe("codex");
   });
 
+  it("permissions: null in a settings file does NOT clobber the builtin deny defaults", async () => {
+    const homeDir = await makeTempDir();
+    const cwd = await makeTempDir();
+    // Dashboards have shipped settings.json with `permissions` explicitly
+    // nulled — treated as "no opinion", so the default deny rules stay live.
+    await writeSettings(cwd, ".procway/ai-agent/settings.json", {
+      approvalMode: "full-auto",
+      permissions: null
+    });
+
+    const { settings } = await loadSettings({ cwd, homeDir, env: {} });
+
+    expect(settings.approvalMode).toBe("full-auto");
+    expect(settings.permissions?.deny).toContain("run_shell:rm -rf *");
+  });
+
+  it("an explicit permissions object still overrides the defaults", async () => {
+    const homeDir = await makeTempDir();
+    const cwd = await makeTempDir();
+    await writeSettings(cwd, ".procway/ai-agent/settings.json", {
+      permissions: { deny: [] }
+    });
+
+    const { settings } = await loadSettings({ cwd, homeDir, env: {} });
+
+    expect(settings.permissions.deny).toEqual([]);
+  });
+
   it("CLI --model overrides the active provider's defaultModel", async () => {
     const cwd = await makeTempDir();
     await writeSettings(cwd, ".procway/ai-agent/settings.json", {

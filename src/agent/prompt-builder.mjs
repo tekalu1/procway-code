@@ -56,16 +56,6 @@ const SKILLS_USAGE_NOTE =
 const MAX_SKILLS = 40;
 const MAX_DESCRIPTION_LENGTH = 200;
 
-export async function buildInitialMessages({ cwd, prompt, context, sessionId, memorySnapshot = null }) {
-  const system = await buildSystemMessage({ cwd, context, sessionId, memorySnapshot });
-  const user = createMessage({
-    role: "user",
-    sessionId,
-    content: [{ kind: "text", text: prompt }]
-  });
-  return [system, user];
-}
-
 export async function buildSystemMessage({ cwd, context, sessionId, memorySnapshot = null }) {
   const listResult = await listFiles({ cwd, dirPath: "." }).catch(() => null);
   const rootEntries = Array.isArray(listResult?.data) ? listResult.data : [];
@@ -97,7 +87,7 @@ Compatibility mode: ${context.compatibilityMode}
 
 Use the available file tools to inspect the repository before answering repository-specific questions.
 Do not claim you inspected files unless you used tools or the file content is included in this prompt.
-When the user asks you to create, write, save, update, edit, or generate a file, you must call write_file or apply_patch before giving the final answer.
+When the user asks you to create, write, save, update, edit, or generate a file, you must call write_file, apply_patch, or Edit before giving the final answer.
 Do not end a turn with phrases like "I will create it" or "I will write it" unless the relevant file tool call has already succeeded.
 If you need to create a new file, use write_file with the complete file content.
 To ask the user for structured input, call the request_user_action tool instead of only asking in prose — the user answers via an inline widget in the chat. Use kind 'survey' to ask questions (you may ask several at once; mark a recommended option per question), 'env_vars' to have the user set environment variables / secrets (you receive only which keys were set, never the values), and 'approval' to obtain a recorded approval for the current ticket task. Plain-prose questions are fine for quick clarifications, but prefer request_user_action whenever a choice, a form, a value, or a recorded approval is involved.

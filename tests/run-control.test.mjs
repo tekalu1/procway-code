@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { startRun, getRunStatus, resumeRun, replyRun } from "../src/tools/run-control.mjs";
+import { startRun, attachRun, getRunStatus, resumeRun, replyRun } from "../src/tools/run-control.mjs";
 
 const DASH = "https://dash.example.test";
 const TOKEN = "proxy-token-123";
@@ -163,6 +163,88 @@ describe("run-control tool facade", () => {
     });
   });
 
+  // ADR 0038 D2 — the ticket header's「実行」button now starts the run itself and
+  // hands the AI a run id. attach_run is start_run MINUS the POST: same
+  // await-yield rendezvous, no side effect, and it learns project/ticket from the
+  // job (they are deliberately not model-writable arguments).
+  describe("attachRun (accompany an already-started run)", () => {
+    it("never POSTs — it only polls the existing job until it yields", async () => {
+      const fetchImpl = makeSeqFetch({
+        polls: [
+          { jobId: "job_9", status: "running", project: "proj-a", ticket: "T-1" },
+          {
+            jobId: "job_9",
+            status: "awaiting-user-input",
+            inputKind: "conversational",
+            hearing: "Which environment?",
+            project: "proj-a",
+            ticket: "T-1",
+            result: { status: "awaiting-user-input", runs: [], sessionId: "sess-9" }
+          }
+        ]
+      });
+      const result = await attachRun({ runId: "job_9", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+
+      // Two GET polls, ZERO writes — attaching must never start a second run.
+      expect(fetchImpl.calls).toHaveLength(2);
+      for (const call of fetchImpl.calls) {
+        expect(call.init.method).toBeUndefined();
+        expect(call.url).toBe(`${DASH}/api/run/jobs/job_9`);
+        expect(call.init.headers["x-procway-session"]).toBe(TOKEN);
+      }
+
+      expect(result).toEqual({
+        kind: "attach_run",
+        jobId: "job_9",
+        status: "awaiting-user-input",
+        inputKind: "conversational",
+        hearing: "Which environment?",
+        sessionId: "sess-9",
+        result: { status: "awaiting-user-input", runs: [], sessionId: "sess-9" },
+        // Resolved from the JOB — reply_run / resume_run need them and the model
+        // was never asked for them.
+        project: "proj-a",
+        ticket: "T-1"
+      });
+    });
+
+    it("returns immediately when the run has already finished", async () => {
+      const fetchImpl = makeSeqFetch({
+        polls: [{ jobId: "job_9", status: "completed", project: "p", ticket: "t", result: { status: "completed", runs: [] } }]
+      });
+      const result = await attachRun({ runId: "job_9", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+      expect(fetchImpl.calls).toHaveLength(1);
+      expect(result.status).toBe("completed");
+    });
+
+    it("tolerates a transient poll miss (the job may still be registering)", async () => {
+      // First poll 404s (the dashboard has just minted the job), then it resolves.
+      let n = 0;
+      const calls = [];
+      const fetchImpl = async (url, init = {}) => {
+        calls.push({ url, init });
+        n += 1;
+        const ok = n > 1;
+        const json = ok ? { jobId: "job_9", status: "completed", project: "p", ticket: "t" } : {};
+        return { ok, status: ok ? 200 : 404, statusText: ok ? "OK" : "Not Found", json: async () => json, text: async () => JSON.stringify(json) };
+      };
+      const result = await attachRun({ runId: "job_9", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+      expect(calls).toHaveLength(2);
+      expect(result.status).toBe("completed");
+    });
+
+    it("requires a runId and a proxy token, and issues no request without them", async () => {
+      const fetchImpl = makeFetch();
+      await expect(attachRun({ dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl }))
+        .rejects.toThrow(/runId is required/);
+      await expect(attachRun({ runId: "  ", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl }))
+        .rejects.toThrow(/runId is required/);
+      await expect(attachRun({ runId: "job_9", dashboardUrl: DASH, proxyToken: "", fetchImpl }))
+        .rejects.toThrow(/PROCWAY_PROXY_TOKEN is not set/);
+      expect(fetchImpl.calls).toHaveLength(0);
+    });
+  });
+
   describe("getRunStatus", () => {
     it("GETs /api/run/jobs/:jobId with the session header and lifts result/interaction/error", async () => {
       const fetchImpl = makeFetch({
@@ -295,6 +377,44 @@ describe("run-control tool facade", () => {
       const fetchImpl = makeFetch({ ok: false, status: 400, statusText: "Bad Request", text: JSON.stringify({ data: { error: { message: "answer は必須です" } } }) });
       await expect(replyRun({ project: "p", ticket: "t", sessionId: "s", answer: "a", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl }))
         .rejects.toThrow(/reply_run failed: 400.*answer は必須です/);
+    });
+  });
+
+  // ADR 0038 D1 — the run ⇄ conversation attach. conversationId is supplied by
+  // the HOST (the tool dispatcher passes the owning AgentSession id), never by
+  // the model: it is deliberately absent from the tool schemas so it cannot be
+  // forged in tool arguments. It rides on the job-start POST body only.
+  describe("conversationId attach (ADR 0038 D1)", () => {
+    const bodyOf = (fetchImpl) => JSON.parse(fetchImpl.calls[0].init.body);
+
+    it("start_run puts the host-supplied conversationId on the POST body", async () => {
+      const fetchImpl = makeSeqFetch({ polls: [{ jobId: "job_1", status: "completed" }] });
+      await startRun({ project: "p", ticket: "t", conversationId: "2026-07-26T00-00-00-000Z", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+      expect(bodyOf(fetchImpl)).toEqual({ project: "p", ticket: "t", conversationId: "2026-07-26T00-00-00-000Z" });
+    });
+
+    it("omits conversationId entirely when absent or blank (old-dashboard compatible)", async () => {
+      for (const conversationId of [undefined, "", "   ", null, 42]) {
+        const fetchImpl = makeSeqFetch({ polls: [{ jobId: "job_1", status: "completed" }] });
+        await startRun({ project: "p", ticket: "t", conversationId, dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+        expect(bodyOf(fetchImpl)).toEqual({ project: "p", ticket: "t" });
+      }
+    });
+
+    it("resume_run re-declares the attach (a resume mints a NEW jobId)", async () => {
+      const fetchImpl = makeSeqFetch({ polls: [{ jobId: "job_1", status: "completed" }] });
+      await resumeRun({ project: "p", ticket: "t", conversationId: "conv-x", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+      expect(bodyOf(fetchImpl)).toEqual({ project: "p", ticket: "t", conversationId: "conv-x" });
+
+      const bare = makeSeqFetch({ polls: [{ jobId: "job_1", status: "completed" }] });
+      await resumeRun({ project: "p", ticket: "t", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl: bare, sleepImpl: noSleep });
+      expect(bodyOf(bare)).toEqual({ project: "p", ticket: "t" });
+    });
+
+    it("reply_run carries the CONVERSATION id alongside the paused worker sessionId", async () => {
+      const fetchImpl = makeSeqFetch({ polls: [{ jobId: "job_1", status: "completed" }] });
+      await replyRun({ project: "p", ticket: "t", sessionId: "worker-sess", answer: "yes", conversationId: "conv-x", dashboardUrl: DASH, proxyToken: TOKEN, fetchImpl, sleepImpl: noSleep });
+      expect(bodyOf(fetchImpl)).toEqual({ project: "p", ticket: "t", sessionId: "worker-sess", answer: "yes", conversationId: "conv-x" });
     });
   });
 });

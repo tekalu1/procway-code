@@ -1,7 +1,16 @@
 /**
- * Render a textual progress bar for the agent's todo list. Used by the REPL
- * to show "[2/5] in progress: <activeForm>" between turns.
+ * The agent's todo list on the live feed.
+ *
+ * Two forms on purpose (P3b-1):
+ *  - `renderTodoSummary` — the one-line `[2/5] in progress: <activeForm>` ping
+ *    written on every `todos.updated` DURING a turn. Re-printing the whole
+ *    checklist on each update would bury the assistant's prose.
+ *  - `renderTodos` (command-render.mjs) — the full checklist `/todos` prints
+ *    on demand, which is where the JSON dump used to be.
  */
+
+import { style } from "./ansi.mjs";
+import { sanitizeInline } from "./sanitize.mjs";
 
 export function renderTodoSummary(todos = []) {
   if (!Array.isArray(todos) || todos.length === 0) return "";
@@ -14,20 +23,23 @@ export function renderTodoSummary(todos = []) {
     if (inProgressIndex === -1 && status === "in_progress") inProgressIndex = i;
   }
   const cursor = inProgressIndex >= 0 ? inProgressIndex + 1 : completed;
-  const active = inProgressIndex >= 0 ? todos[inProgressIndex]?.activeForm ?? "" : "";
+  // `activeForm` is free text the model wrote into `todo_write`, and this line
+  // is printed mid-turn between streamed blocks.
+  const active = inProgressIndex >= 0 ? sanitizeInline(todos[inProgressIndex]?.activeForm) : "";
   const phase = inProgressIndex >= 0
     ? `in progress: ${active}`
     : completed === total ? "complete" : "ready";
   return `[${cursor}/${total}] ${phase}`;
 }
 
-export function attachTodoRenderer({ session, output }) {
+export function attachTodoRenderer({ session, output, colorize = false }) {
   if (!session?.events || !output || typeof output.write !== "function") return { dispose: () => {} };
   const handler = (event) => {
     if (event?.type !== "todos.updated") return;
     const summary = renderTodoSummary(event.todos);
     if (summary) {
-      try { output.write(`\n${summary}\n`); } catch { /* ignore */ }
+      const line = colorize ? style("muted", summary) : summary;
+      try { output.write(`\n${line}\n`); } catch { /* ignore */ }
     }
   };
   session.events.on("todos.updated", handler);

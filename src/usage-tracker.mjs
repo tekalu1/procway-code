@@ -2,8 +2,8 @@ import { resolveActiveModel } from "./config/active-model.mjs";
 
 /**
  * UsageTracker — listens for `usage.recorded` events on an EventBus, keeps
- * the per-round entries in memory, and exposes `summary()` for `/cost` and
- * `/usage`. Stays attached for the whole session lifetime; callers `dispose()`
+ * the per-round entries in memory, and exposes `summary()` for the `/usage`
+ * command and the prompt line. Stays attached for the whole session lifetime; callers `dispose()`
  * before tearing the session down.
  */
 export function createUsageTracker({ session, initialEvents = [] } = {}) {
@@ -34,8 +34,8 @@ export function createUsageTracker({ session, initialEvents = [] } = {}) {
  * round-by-round breakdown plus a cumulative summary, with optional USD
  * pricing per `provider:model` key.
  *
- * Phase 5 §2.10. Pure module — no I/O. Both the `/cost` and `/usage` REPL
- * commands consume `summarizeUsage` to produce their structured response.
+ * Phase 5 §2.10. Pure module — no I/O. The `/usage` command and the prompt
+ * spend indicator both consume `summarizeUsage`.
  *
  * Pricing structure (also documented in `default-settings.mjs`):
  *

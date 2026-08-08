@@ -17,6 +17,7 @@
  *   | "save_attachment"
  *   | "attach_file"
  *   | "start_run"
+ *   | "attach_run"
  *   | "get_run_status"
  *   | "resume_run"
  *   | "reply_run"
@@ -57,6 +58,7 @@ export const KNOWN_TOOL_KINDS = Object.freeze([
   "save_attachment",
   "attach_file",
   "start_run",
+  "attach_run",
   "get_run_status",
   "resume_run",
   "reply_run",

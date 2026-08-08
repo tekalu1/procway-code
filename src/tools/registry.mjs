@@ -12,18 +12,20 @@ import { runDesktopAction, getDesktopActionAvailability } from "./desktop.mjs";
 import { viewImage } from "./view-image.mjs";
 import { saveAttachment } from "./save-attachment.mjs";
 import { attachFile } from "./attach-file.mjs";
-import { startRun, getRunStatus, resumeRun, replyRun } from "./run-control.mjs";
+import { startRun, attachRun, getRunStatus, resumeRun, replyRun } from "./run-control.mjs";
 import { askImage } from "./ask-image.mjs";
 import { providerSupportsVision, resolveVisionProviderId } from "../providers/vision.mjs";
 import * as jiraTools from "./integrations/jira.mjs";
 import * as confluenceTools from "./integrations/confluence.mjs";
 import * as slackTools from "./integrations/slack.mjs";
+import * as discordTools from "./integrations/discord.mjs";
 import { IntegrationApiError, IntegrationNotConnectedError } from "./integrations/_auth.mjs";
 import { classifyCommand } from "../safety/command-classifier.mjs";
 import { requestApproval } from "../safety/approval.mjs";
 import { createSafeFetch } from "../safety/safe-fetch.mjs";
 import { getProxyAwareFetch } from "../safety/proxy-fetch.mjs";
 import { isToolResult } from "../core/types/tool-result.mjs";
+import { getInvalidToolArgs } from "../providers/format/tool-args.mjs";
 import { writeMemory as writeMemoryFile, loadMemoryIndex } from "../memory/store.mjs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -90,6 +92,10 @@ const DEFERRED_TOOL_SUMMARIES = Object.freeze({
   slack_read_channel: "read recent messages in a Slack channel",
   slack_read_thread: "read a Slack thread",
   slack_post_message: "post a Slack message",
+  discord_list_channels: "list Discord channels in the connected guild",
+  discord_read_channel: "read recent messages in a Discord channel",
+  discord_read_thread: "read a Discord thread",
+  discord_post_message: "post a Discord message",
   save_attachment: "save a message attachment (by attachment id) into the workspace as a file",
   attach_file: "attach a workspace file to the conversation (renders in chat; reflected to connected surfaces)",
   load_project_env: "switch the ACTIVE project whose env vars are loaded into your shell (for multi-project sessions, e.g. Slack) — pass a project name; the project's env vars become available to subsequent run_shell commands. Returns the now-available env var NAMES (values, especially secrets, are never shown)"
@@ -136,6 +142,24 @@ export function detectDisplayToolAvailability({
 
 function resolveDisplayToolAvailability(settings) {
   if (!displayToolAvailabilityCache) displayToolAvailabilityCache = detectDisplayToolAvailability({ settings });
+  return displayToolAvailabilityCache;
+}
+
+/**
+ * Probe (and cache) display-tool availability EARLY, with a caller-supplied
+ * logger. The TUI uses this so the `[tools] disabled …` warning does not
+ * console.warn its way onto the screen above the welcome banner: it primes the
+ * cache with a collector, prints the banner, then shows a dim one-line summary
+ * underneath (P3b-3). Session creation afterwards hits the cache and warns
+ * nothing. No-op when the cache is already warm.
+ *
+ * @param {{ settings?: object, logger?: (line: string) => void }} options
+ * @returns {{ web_browser: object, desktop_action: object }}
+ */
+export function primeDisplayToolAvailability({ settings, logger } = {}) {
+  if (!displayToolAvailabilityCache) {
+    displayToolAvailabilityCache = detectDisplayToolAvailability({ settings, ...(logger ? { logger } : {}) });
+  }
   return displayToolAvailabilityCache;
 }
 
@@ -205,7 +229,7 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
       type: "function",
       function: {
         name: "request_user_action",
-        description: "Ask the user for structured input and (when blocking) wait for their response. This is NOT an approval gate — use it to have the user fill a form, pick an option, set values, or confirm a choice. The user's answer is returned as JSON in the tool result. Supported kinds: 'survey' (ask one or more questions at once, each option may be marked recommended — use this to elicit requirements instead of asking in plain prose), 'env_vars' (ask the user to set env vars/secrets — you receive only which keys were set, never their values), 'approval' (ask the user to approve something for the current ticket task — records worker-proof evidence the checkAgent trusts).",
+        description: "Ask the user for structured input. This is NOT an approval gate — use it to have the user fill a form, pick an option, set values, or confirm a choice. For information-gathering kinds ('survey', 'env_vars') you do NOT wait: the widget is shown, your turn ends, and the conversation resumes automatically in a NEW turn once the user answers (their answer arrives as a message). Do not decide whether to block — the runtime handles that per kind. Supported kinds: 'survey' (ask one or more questions at once, each option may be marked recommended — use this to elicit requirements instead of asking in plain prose), 'env_vars' (ask the user to set env vars/secrets — you receive only which keys were set, never their values), 'approval' (ask the user to approve something for the current ticket task — records worker-proof evidence the checkAgent trusts; this one is a synchronous gate and waits inline).",
         parameters: {
           type: "object",
           properties: {
@@ -214,8 +238,7 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
             spec: {
               type: "object",
               description: "Kind-specific UI descriptor. survey: { questions: [{ id, prompt, type: 'single'|'multi'|'text', options?: [{ label, value, recommended?, description? }], allowFreeText?, required? }] } — questions are OPTIONAL by default; set required:true only on the answers you truly need (the user can submit leaving optional ones blank). env_vars: { keys: [{ key, label?, isSecret?, scope: 'tenant'|'project', scopeId? }] }. approval: { subject, detail?, project, ticket, taskId, checklistItemId? } (project/ticket/taskId are required to record the approval)."
-            },
-            blocking: { type: "boolean", description: "Wait for the user's response before continuing (default true). When false, fire-and-forget." }
+            }
           },
           required: ["kind"]
         }
@@ -846,6 +869,67 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
         }
       }
     },
+    // ---- Discord (ADR 0031 Phase 1 — guild bot install, broker-backed) ----
+    {
+      type: "function",
+      function: {
+        name: "discord_list_channels",
+        description: "List text-bearing channels in the connected Discord guild (id/name/type/topic, max 200).",
+        parameters: {
+          type: "object",
+          properties: {
+            limit: { type: "number", description: "Cap on returned channels (1-200, default 100)." }
+          },
+          required: []
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "discord_read_channel",
+        description: "Read recent messages in a Discord channel, oldest first. `channel` accepts a channel id or a #name.",
+        parameters: {
+          type: "object",
+          properties: {
+            channel: { type: "string", description: "Channel id (snowflake) or #name." },
+            limit: { type: "number", description: "Cap on returned messages (1-100, default 20)." }
+          },
+          required: ["channel"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "discord_read_thread",
+        description: "Read the messages of a Discord thread. `threadId` is the thread's id (a thread is a channel — see discord_read_channel output `threadId`).",
+        parameters: {
+          type: "object",
+          properties: {
+            threadId: { type: "string", description: "Thread id (snowflake)." },
+            limit: { type: "number", description: "Cap on returned messages (1-100, default 50)." }
+          },
+          required: ["threadId"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "discord_post_message",
+        description: "Post a message to a Discord channel or thread (long text is split into 2000-char messages). Requires approval.",
+        parameters: {
+          type: "object",
+          properties: {
+            channel: { type: "string", description: "Channel id (snowflake) or #name. Ignored when threadId is given." },
+            text: { type: "string", description: "Message text (Discord markdown)." },
+            threadId: { type: "string", description: "Thread id to post into instead of a channel." }
+          },
+          required: ["text"]
+        }
+      }
+    },
     {
       type: "function",
       function: {
@@ -890,6 +974,20 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
             autoApprove: { type: "boolean", description: "Run without pausing for step approvals (optional)." }
           },
           required: ["project", "ticket"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "attach_run",
+        description: "ACCOMPANY a run that is ALREADY started — use this, not start_run, when you are told a run id (e.g. the user pressed the ticket's Run button and the run was started for you). It starts nothing: it AWAITS the existing run exactly like start_run does and RETURNS only when the run pauses for input or finishes (it may run for minutes — live progress streams into the panel meanwhile). Handle the returned `status` the same way as start_run: if `awaiting-user-input` with a `hearing` (inputKind 'conversational'), relay the `hearing` text to the user, get their answer, and call reply_run with that answer + the returned `sessionId`; if it returns a structured `interaction` (inputKind 'structured'), tell the user to answer the widget, then call resume_run; if `awaiting-approval` (inputKind 'approval'), the run is PAUSED awaiting approval of the completed task — say which task needs approval and point the user at the notification bell / the ticket's review tab, never report it as done; only `completed` means finished. The yield also carries the run's `project` / `ticket`, which resume_run and reply_run need. Do NOT shell out to the procway CLI to watch a run.",
+        parameters: {
+          type: "object",
+          properties: {
+            runId: { type: "string", description: "Run (job) id of the already-started run to accompany." }
+          },
+          required: ["runId"]
         }
       }
     },
@@ -1000,10 +1098,18 @@ const READ_ONLY_TOOLS = new Set([
   // get_run_status is a read-only poll of a run-loop job (start_run / resume_run
   // have side effects and stay mutations).
   "get_run_status",
+  // attach_run (ADR 0038 D2) is the SAME poll, just held open until the run
+  // yields: it starts/changes nothing server-side, so gating it as a mutation
+  // would ask the user to approve watching a run they just launched themselves
+  // from the ticket header. Blocking the turn for minutes is a SCHEDULING
+  // concern, handled by the long-running tool budget (turn-orchestrator), not by
+  // the approval gate.
+  "attach_run",
   "WebSearch", "WebFetch",
   "jira_list_projects", "jira_search_issues", "jira_get_issue", "jira_list_transitions",
   "confluence_list_spaces", "confluence_search", "confluence_get_page",
-  "slack_list_channels", "slack_read_channel", "slack_read_thread"
+  "slack_list_channels", "slack_read_channel", "slack_read_thread",
+  "discord_list_channels", "discord_read_channel", "discord_read_thread"
 ]);
 
 export function isMutationTool(name) {
@@ -1016,6 +1122,82 @@ function makeSkippedResult(kind, summary, extra = {}) {
     summary,
     data: { skipped: true, error: "User denied approval", ...extra }
   };
+}
+
+// Runtime enforcement of the required args each tool's schema already declares.
+// The JSON Schemas ride to the model but nothing enforced them on dispatch, so a
+// truncated/malformed argument stream (input_json_delta cut off at max_tokens,
+// or a mis-keyed field) reached the handler with the field simply absent — e.g.
+// write_file with no filePath, which threw a cryptic TypeError deep in
+// path.isAbsolute(undefined). Validating here turns that into a clear ok:false
+// result (the throw becomes a tool_result the scheduler tags ok:false) the model
+// can recover from by retrying with complete arguments.
+const SCHEMA_TYPE_CHECKS = {
+  string: (v) => typeof v === "string",
+  number: (v) => typeof v === "number" && Number.isFinite(v),
+  integer: (v) => typeof v === "number" && Number.isInteger(v),
+  boolean: (v) => typeof v === "boolean",
+  array: (v) => Array.isArray(v),
+  object: (v) => v !== null && typeof v === "object" && !Array.isArray(v)
+};
+
+let toolArgSchemaCache = null;
+function getToolArgSchemas() {
+  if (toolArgSchemaCache) return toolArgSchemaCache;
+  const map = new Map();
+  // Build from the FULL, UNFILTERED tool set: passing an explicit empty
+  // `availability` bypasses getToolDefinitions' display-availability filter
+  // (which drops web_browser/desktop_action when no X display is present) AND
+  // avoids seeding the process-wide availability cache with no settings.
+  // Validation must cover every tool regardless of the runtime environment, and
+  // required/type are static per tool (availability only shapes which schemas
+  // are SENT to the model, not their contents), so this is cached once.
+  for (const def of getToolDefinitions({ availability: {} })) {
+    const fn = def?.function;
+    if (!fn || typeof fn.name !== "string") continue;
+    const params = fn.parameters ?? {};
+    map.set(fn.name, {
+      required: Array.isArray(params.required) ? params.required : [],
+      properties: params.properties && typeof params.properties === "object" ? params.properties : {}
+    });
+  }
+  toolArgSchemaCache = map;
+  return map;
+}
+
+function typeName(value) {
+  return Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
+}
+
+/**
+ * Throw a clear, model-recoverable error when a tool call's arguments are
+ * unusable — either an unparseable/truncated arg stream (flagged by the
+ * provider layer via an invalid-args marker) or a schema-required field that is
+ * missing or the wrong type. Tools without a registered schema (MCP, and any
+ * caller-supplied name) are left untouched.
+ */
+export function validateToolArgs(name, args) {
+  const invalid = getInvalidToolArgs(args);
+  if (invalid) {
+    const cause = invalid.truncated
+      ? "its arguments were truncated (the response reached its output-token limit before the JSON was complete)"
+      : "its arguments were not valid JSON";
+    throw new Error(`${name} could not run because ${cause}. Retry the call with complete, well-formed arguments.`);
+  }
+  const schema = getToolArgSchemas().get(name);
+  if (!schema) return;
+  const bag = args && typeof args === "object" ? args : {};
+  for (const key of schema.required) {
+    const declaredType = schema.properties[key]?.type;
+    const value = bag[key];
+    if (value === undefined || value === null) {
+      throw new Error(`${name} requires "${key}"${typeof declaredType === "string" ? ` (${declaredType})` : ""} but it was missing — arguments may have been truncated; retry with complete arguments.`);
+    }
+    const check = typeof declaredType === "string" ? SCHEMA_TYPE_CHECKS[declaredType] : null;
+    if (check && !check(value)) {
+      throw new Error(`${name} requires "${key}" to be ${declaredType} but got ${typeName(value)} — retry with complete, well-formed arguments.`);
+    }
+  }
 }
 
 /**
@@ -1031,6 +1213,11 @@ export async function executeToolCall({
   args,
   cwd,
   settings,
+  // Effective approval mode for this turn. Defaults to settings.approvalMode so
+  // existing direct callers are unchanged; the session threads its per-turn
+  // override (activeApprovalMode ?? settings) here so `gate` and safe-fetch
+  // honor a full-auto worker turn without reading settings.approvalMode raw.
+  approvalMode = settings?.approvalMode,
   approvalRequester = requestApproval,
   // UIR (User Interaction Request): a generic, NON-gated round-trip that asks
   // the user for structured input. Distinct from approvalRequester (a gate).
@@ -1050,18 +1237,32 @@ export async function executeToolCall({
   // Forwarded into long-running tools (run_shell foreground streaming,
   // shell_job wait): each call surfaces as an `activity.tick` on the session
   // bus — feeding the turn-idle watchdog and the ChatPanel live view.
-  onProgress = null
+  onProgress = null,
+  // The turn's AbortSignal. Forwarded to the tools that can actually stop
+  // mid-flight: run_shell (kills its process group) and shell_job wait (breaks
+  // its poll loop). Null for direct/headless callers → unchanged behavior.
+  signal = null,
+  // Owning AgentSession id (ADR 0037 D4): stamped onto delegated jobs spawned
+  // by this call (background run_shell / spawn_agent) so the session snapshot
+  // can dehydrate/rehydrate ITS jobs across a Pod restart. Null for direct /
+  // headless callers.
+  sessionId = null
 }) {
   async function gate({ kind, summary, mutation, payload }) {
     return approvalRequester({
       kind,
       summary,
       mutation,
-      approvalMode: settings?.approvalMode,
+      approvalMode,
       permissions: settings?.permissions,
       payload
     });
   }
+
+  // Enforce the tool's declared required args before dispatch (see
+  // validateToolArgs) so a truncated/missing argument surfaces as a clear,
+  // retryable tool result instead of crashing the handler.
+  validateToolArgs(name, args);
 
   let result;
 
@@ -1108,8 +1309,24 @@ export async function executeToolCall({
     } else {
       // ADR 0029 await-yield: startRun polls internally until the run pauses or
       // finishes (minutes). onProgress feeds the turn-idle watchdog meanwhile.
-      const r = await startRun({ project: args.project, ticket: args.ticket, autoApprove: args.autoApprove, onProgress });
+      // ADR 0038 D1: the owning conversation id rides along so the dashboard can
+      // ATTACH the run to this conversation. Taken from the DISPATCH context
+      // (the host's AgentSession id) — never from `args`, which the model
+      // controls and could point at somebody else's conversation.
+      const r = await startRun({ project: args.project, ticket: args.ticket, autoApprove: args.autoApprove, conversationId: sessionId, onProgress });
       result = { kind: "start_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
+    }
+  } else if (name === "attach_run") {
+    // ADR 0038 D2: accompany an ALREADY-started run (the ticket header's「実行」
+    // button now starts it deterministically and tells us the id). Shares
+    // start_run's await-yield verbatim (run-control awaitJobYield) but performs
+    // NO POST → not a mutation (see READ_ONLY_TOOLS for why).
+    const allowed = await gate({ kind: "attach_run", summary: args.runId ?? "", mutation: false });
+    if (!allowed) {
+      result = makeSkippedResult("attach_run", `Skipped attach_run: ${args.runId}`, { runId: args.runId });
+    } else {
+      const r = await attachRun({ runId: args.runId, onProgress });
+      result = { kind: "attach_run", summary: `Run ${r.jobId ?? args.runId} ${r.status ?? "?"}`, data: r };
     }
   } else if (name === "get_run_status") {
     // Read-only poll of GET /api/run/jobs/:jobId.
@@ -1130,7 +1347,8 @@ export async function executeToolCall({
       result = makeSkippedResult("resume_run", `Skipped resume_run: ${summary}`, { project: args.project, ticket: args.ticket });
     } else {
       // ADR 0029 await-yield: resumeRun polls internally until the next pause/finish.
-      const r = await resumeRun({ project: args.project, ticket: args.ticket, onProgress });
+      // conversationId: ADR 0038 D1 attach, host-supplied (see start_run).
+      const r = await resumeRun({ project: args.project, ticket: args.ticket, conversationId: sessionId, onProgress });
       result = { kind: "resume_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
     }
   } else if (name === "reply_run") {
@@ -1142,7 +1360,9 @@ export async function executeToolCall({
     if (!allowed) {
       result = makeSkippedResult("reply_run", `Skipped reply_run: ${summary}`, { project: args.project, ticket: args.ticket });
     } else {
-      const r = await replyRun({ project: args.project, ticket: args.ticket, sessionId: args.sessionId, answer: args.answer, onProgress });
+      // args.sessionId = the paused WORKER session; conversationId = THIS
+      // conversation (ADR 0038 D1 attach, host-supplied — see start_run).
+      const r = await replyRun({ project: args.project, ticket: args.ticket, sessionId: args.sessionId, answer: args.answer, conversationId: sessionId, onProgress });
       result = { kind: "reply_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
     }
   } else if (name === "ask_image") {
@@ -1226,7 +1446,9 @@ export async function executeToolCall({
         timeoutMs: args.timeoutMs ?? settings?.tools?.shellTimeoutMs ?? 300000,
         runInBackground: args.runInBackground === true,
         settings,
-        onProgress
+        onProgress,
+        signal,
+        sessionId
       });
     }
   } else if (name === "shell_job") {
@@ -1247,7 +1469,7 @@ export async function executeToolCall({
     } else if (action === "wait") {
       const allowed = await gate({ kind: "shell_wait", summary: args.shellId ?? "", mutation: false });
       result = allowed
-        ? await runShellWait({ shellId: args.shellId, waitMs: args.waitMs, onProgress })
+        ? await runShellWait({ shellId: args.shellId, waitMs: args.waitMs, onProgress, signal })
         : makeSkippedResult("run_shell", `Skipped wait: ${args.shellId}`, { tool: "shell_wait", shellId: args.shellId });
     } else if (action === "kill") {
       const allowed = await gate({ kind: "shell_kill", summary: args.shellId ?? "", mutation: true });
@@ -1324,7 +1546,7 @@ export async function executeToolCall({
     if (!allowed) {
       result = makeSkippedResult("web_search", `Skipped web search: ${summary}`, { query: args?.query });
     } else {
-      const safeFetchImpl = resolveFetch(fetchImpl, approvalRequester, settings);
+      const safeFetchImpl = resolveFetch(fetchImpl, approvalRequester, settings, approvalMode);
       result = await webSearchRunner({
         query: args?.query,
         maxResults: args?.maxResults,
@@ -1338,7 +1560,7 @@ export async function executeToolCall({
     if (!allowed) {
       result = makeSkippedResult("web_fetch", `Skipped web fetch: ${summary}`, { url: args?.url });
     } else {
-      const safeFetchImpl = resolveFetch(fetchImpl, approvalRequester, settings);
+      const safeFetchImpl = resolveFetch(fetchImpl, approvalRequester, settings, approvalMode);
       result = await webFetchRunner({
         url: args?.url,
         maxBytes: args?.maxBytes,
@@ -1396,7 +1618,8 @@ export async function executeToolCall({
       const { jobId } = registry.spawnJob({
         kind: "agent",
         driver,
-        spec: { task: args.task, childCwd: args.cwd ?? "." }
+        spec: { task: args.task, childCwd: args.cwd ?? "." },
+        ...(sessionId ? { meta: { sessionId } } : {})
       });
       // Forward the job's progress events as turn heartbeats so the parent turn's
       // idle watchdog stays fed while a long child runs (mirrors how run_shell /
@@ -1430,7 +1653,7 @@ export async function executeToolCall({
         data: { ...childResult, text }
       };
     }
-  } else if (name.startsWith("jira_") || name.startsWith("confluence_") || name.startsWith("slack_")) {
+  } else if (name.startsWith("jira_") || name.startsWith("confluence_") || name.startsWith("slack_") || name.startsWith("discord_")) {
     result = await runIntegrationTool({ name, args, cwd, gate });
   } else if (name === "request_user_action") {
     // NOT an approval gate — a generic UIR round-trip. Resolves to whatever
@@ -1452,12 +1675,13 @@ export async function executeToolCall({
         spec: (args?.spec && typeof args.spec === "object") ? args.spec : undefined,
         blocking
       });
-      // §6 run-loop hearing RETURN mode: the requester recorded the request and
-      // returned `{ deferred: true }` instead of waiting. The user answers
-      // asynchronously (via the side panel), and `run loop resume` re-opens this
-      // session with the answer injected. The worker must NOT keep working or
-      // self-answer — instruct it to END the turn now so control returns to the
-      // run loop (which surfaces awaiting-user-input).
+      // Deferred UIR: the requester recorded the request and returned
+      // `{ deferred: true }` instead of waiting. This covers both run-loop
+      // workers (§6 hearingReturnMode — resumed by `run loop resume`) and
+      // info-gathering kinds on any interactive surface (issue #134 Phase A —
+      // resumed automatically as a new turn when the user answers). Either way
+      // the model must NOT keep working or self-answer — instruct it to END the
+      // turn now so the deferred hand-off is clean.
       if (response && typeof response === "object" && response.deferred === true) {
         result = {
           kind: "interaction",
@@ -1467,7 +1691,7 @@ export async function executeToolCall({
             blocking: false,
             deferred: true,
             requestId: response.requestId ?? null,
-            note: "Your request has been recorded and is awaiting the user's reply. Do NOT answer it yourself and do NOT call `task complete`. End your turn now with a brief note that you are waiting for the user — the run loop will resume this session once the user responds."
+            note: "Your request has been recorded and is awaiting the user's reply. Do NOT answer it yourself and do NOT call `task complete`. End your turn now with a brief note that you are waiting for the user — the conversation will resume automatically once the user responds."
           }
         };
       } else {
@@ -1521,7 +1745,7 @@ async function runIntegrationTool({ name, args = {}, cwd, gate }) {
   const writeTools = new Set([
     "jira_create_issue", "jira_update_issue", "jira_add_comment", "jira_transition_issue",
     "confluence_create_page", "confluence_update_page",
-    "slack_post_message"
+    "slack_post_message", "discord_post_message"
   ]);
   const mutation = writeTools.has(name);
 
@@ -1581,6 +1805,9 @@ function summarizeIntegrationCall(name, args) {
     case "slack_read_channel":     return args.channel ?? "";
     case "slack_read_thread":      return `${args.channel ?? ""} @ ${args.threadTs ?? ""}`;
     case "slack_post_message":     return `${args.channel ?? ""}: ${args.text ?? ""}`.slice(0, 80);
+    case "discord_read_channel":   return args.channel ?? "";
+    case "discord_read_thread":    return args.threadId ?? "";
+    case "discord_post_message":   return `${args.threadId ?? args.channel ?? ""}: ${args.text ?? ""}`.slice(0, 80);
     default: return "";
   }
 }
@@ -1633,11 +1860,18 @@ async function dispatchIntegrationCall(name, args, cwd) {
     case "slack_post_message":     return slackTools.postMessage({
       cwd, channel: args.channel, text: args.text, threadTs: args.threadTs
     });
+    // ---- Discord ----
+    case "discord_list_channels":  return discordTools.listChannels({ cwd, limit: args.limit });
+    case "discord_read_channel":   return discordTools.readChannel({ cwd, channel: args.channel, limit: args.limit });
+    case "discord_read_thread":    return discordTools.readThread({ cwd, threadId: args.threadId, limit: args.limit });
+    case "discord_post_message":   return discordTools.postMessage({
+      cwd, channel: args.channel, text: args.text, threadId: args.threadId
+    });
     default: throw new Error(`Unknown integration tool: ${name}`);
   }
 }
 
-function resolveFetch(fetchImpl, approvalRequester, settings) {
+function resolveFetch(fetchImpl, approvalRequester, settings, approvalMode = settings?.approvalMode) {
   if (typeof fetchImpl === "function") return fetchImpl;
   if (typeof globalThis.fetch !== "function") {
     throw new Error("Network tools require a global fetch implementation");
@@ -1649,7 +1883,7 @@ function resolveFetch(fetchImpl, approvalRequester, settings) {
     // (globalThis.fetch) when no proxy env is present.
     fetchImpl: getProxyAwareFetch(),
     approvalRequester: approvalRequester
-      ? (req) => approvalRequester({ ...req, approvalMode: settings?.approvalMode, permissions: settings?.permissions })
+      ? (req) => approvalRequester({ ...req, approvalMode, permissions: settings?.permissions })
       : null
   });
 }

@@ -13,7 +13,11 @@ export async function runOpenAiCompatibleProvider({
   tools,
   fetchImpl = llmFetch,
   sleepImpl = sleep,
-  stream = true
+  stream = true,
+  // The turn's AbortSignal (session.abort() / idle watchdog). Threaded into
+  // every fetch AND the SSE read loop so a Stop tears the HTTP request down
+  // instead of leaving the model streaming (and billing) to nobody.
+  signal
 }) {
   if (!fetchImpl) {
     throw new Error("fetch is not available in this Node.js runtime");
@@ -58,18 +62,19 @@ export async function runOpenAiCompatibleProvider({
   };
 
   if (stream && provider.stream !== false) {
-    return runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider });
+    return runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider, signal });
   }
-  return runNonStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider });
+  return runNonStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider, signal });
 }
 
-async function runNonStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider }) {
-  const request = { method: "POST", headers, body: JSON.stringify(body) };
+async function runNonStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider, signal }) {
+  const request = { method: "POST", headers, body: JSON.stringify(body), ...(signal ? { signal } : {}) };
   const { text } = await fetchWithRetry({
     endpoint,
     request,
     fetchImpl,
     sleepImpl,
+    signal,
     maxRetries: provider.maxRetries ?? 2,
     retryBaseDelayMs: provider.retryBaseDelayMs ?? 1000
   });
@@ -77,17 +82,19 @@ async function runNonStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, 
   return responseFromOpenAiData(data);
 }
 
-async function runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider }) {
+async function runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider, signal }) {
   const request = {
     method: "POST",
     headers,
-    body: JSON.stringify({ ...body, stream: true, stream_options: { include_usage: true } })
+    body: JSON.stringify({ ...body, stream: true, stream_options: { include_usage: true } }),
+    ...(signal ? { signal } : {})
   };
   const response = await fetchStreamingWithRetry({
     endpoint,
     request,
     fetchImpl,
     sleepImpl,
+    signal,
     maxRetries: provider.maxRetries ?? 2,
     retryBaseDelayMs: provider.retryBaseDelayMs ?? 1000
   });
@@ -100,7 +107,7 @@ async function runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, pro
 
   const consumePromise = (async () => {
     try {
-      for await (const sse of parseSseStream(response.body)) {
+      for await (const sse of parseSseStream(response.body, { signal })) {
         sseEvents.push(sse);
         // Reasoning ("thinking") deltas arrive out of band before visible
         // output. Tag them with kind:"reasoning" so the turn orchestrator
@@ -168,7 +175,11 @@ function responseFromOpenAiData(data) {
     throw new Error("Provider response did not include choices[0].message");
   }
   const usage = normalizeUsage(data?.usage);
-  const toolCalls = normalizeOpenAiToolCalls(message.tool_calls);
+  // finish_reason "length" = output truncated at max tokens; a tool call's
+  // arguments JSON is the likely casualty, so tag the parse so the retry
+  // message can name the cause.
+  const truncated = data?.choices?.[0]?.finish_reason === "length";
+  const toolCalls = normalizeOpenAiToolCalls(message.tool_calls, { truncated });
   // DeepSeek thinking-mode reasoning_content (also exposed under `reasoning`
   // by some upstream proxies). Bubble it up so callers can persist + echo.
   const reasoningContent = typeof message.reasoning_content === "string"
@@ -217,6 +228,10 @@ function aggregateOpenAiStream(sseEvents) {
   const message = { role: "assistant", content: "" };
   const toolCallsByIndex = new Map();
   let usage = null;
+  // Carry the terminal finish_reason through so responseFromOpenAiData can flag
+  // a truncated ("length") response — without this, streaming (the default
+  // path) never detected truncation and tool-arg cut-offs went unlabeled.
+  let finishReason = null;
   for (const event of sseEvents) {
     if (!event || typeof event !== "object") continue;
     if (event.type === "done") continue;
@@ -225,6 +240,9 @@ function aggregateOpenAiStream(sseEvents) {
     }
     const choice = event.choices?.[0];
     if (!choice) continue;
+    if (typeof choice.finish_reason === "string" && choice.finish_reason.length > 0) {
+      finishReason = choice.finish_reason;
+    }
     const delta = choice.delta ?? {};
     if (typeof delta.role === "string") message.role = delta.role;
     const content = delta.content;
@@ -268,7 +286,7 @@ function aggregateOpenAiStream(sseEvents) {
     message.content = null;
   }
   return {
-    choices: [{ message }],
+    choices: [{ message, ...(finishReason ? { finish_reason: finishReason } : {}) }],
     usage
   };
 }
@@ -301,13 +319,18 @@ export class ProviderRequestError extends Error {
   }
 }
 
-async function fetchWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetries, retryBaseDelayMs }) {
+async function fetchWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetries, retryBaseDelayMs, signal = null }) {
   let lastError = null;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    // A Stop must never be re-dialed: without this an abort that surfaced as a
+    // transient-looking network error would be retried, re-opening the very
+    // request the user just cancelled.
+    throwIfAborted(signal);
     let response;
     try {
       response = await fetchImpl(endpoint, request);
     } catch (err) {
+      throwIfAborted(signal);
       // Transient network failures ("fetch failed", ECONNRESET, ENOTFOUND, …)
       // throw before producing a Response. Treat them the same as HTTP 5xx —
       // back off and retry until exhausted.
@@ -332,13 +355,15 @@ async function fetchWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetr
   throw lastError;
 }
 
-async function fetchStreamingWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetries, retryBaseDelayMs }) {
+async function fetchStreamingWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetries, retryBaseDelayMs, signal = null }) {
   let lastError = null;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    throwIfAborted(signal);
     let response;
     try {
       response = await fetchImpl(endpoint, request);
     } catch (err) {
+      throwIfAborted(signal);
       lastError = err;
       if (!isRetryableNetworkError(err) || attempt >= maxRetries) break;
       await sleepImpl(getRetryDelayMs({ response: null, attempt, retryBaseDelayMs }));
@@ -357,6 +382,12 @@ async function fetchStreamingWithRetry({ endpoint, request, fetchImpl, sleepImpl
     await sleepImpl(getRetryDelayMs({ response, attempt, retryBaseDelayMs }));
   }
   throw lastError;
+}
+
+/** Rethrow the abort reason (the unified interrupt Error) when the turn was
+ *  cancelled, so no retry loop re-issues a request the user stopped. */
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
 }
 
 function isRetryableStatus(status) {

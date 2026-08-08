@@ -15,6 +15,8 @@
   },
   "files": [
     "src/",
+    "web/",
+    "docs/host-contract.md",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -24,7 +26,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tekalu1/procway-code.git"
+    "url": "git+https://github.com/tekalu1/procway-code.git"
   },
   "bugs": {
     "url": "https://github.com/tekalu1/procway-code/issues"
@@ -34,7 +36,8 @@
   "scripts": {
     "start": "node src/cli.mjs",
     "test": "vitest run --config vitest.config.mjs",
-    "lint": "eslint src/core",
+    "lint": "eslint .",
+    "lint:exports": "node scripts/check-test-only-exports.mjs",
     "prepublishOnly": "pnpm test && pnpm lint"
   },
   "dependencies": {
@@ -46,9 +49,6 @@
     "eslint": "^10.3.0"
   },
   "optionalDependencies": {
-    "@opentelemetry/exporter-trace-otlp-http": "^0.55.0",
-    "@opentelemetry/resources": "^1.28.0",
-    "@opentelemetry/sdk-node": "^0.55.0",
     "keytar": "^7.9.0"
   },
   "pnpm": {

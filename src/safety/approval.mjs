@@ -7,7 +7,30 @@ import { evaluatePermissions } from "./permissions.mjs";
  * - auto-readonly: read-only tools run automatically; mutation/dangerous tools ask.
  * - always-ask:   every tool call asks (permissions allow rules are ignored).
  * - full-auto:    every tool call runs without asking.
+ *
+ * deny rules always win, regardless of mode: a `permissions.deny` match is
+ * evaluated FIRST and returns "deny" even under full-auto / always-ask. This
+ * mirrors permissions.mjs ("A deny match always wins") so a full-auto worker
+ * still can't run e.g. `run_shell:rm -rf *` if a deny rule forbids it.
  */
+
+/**
+ * ADR 0037 D1 — the park signal a mid-turn "ask" verdict raises instead of
+ * blocking. The session's parking approval requester registers a parked entry
+ * (persisted in the session snapshot) and throws this; executeSingleToolCall
+ * catches it and returns a placeholder ToolResult, runTurn winds the turn
+ * down, and `resolveParkedApproval` later re-drives the tool + the remaining
+ * rounds from the checkpoint. Deliberately an Error subclass so an unexpected
+ * escape still fails loudly with the requestId in the message.
+ */
+export class ApprovalParkSignal extends Error {
+  constructor(requestId, { kind, summary } = {}) {
+    super(`approval parked (requestId=${requestId}${kind ? `, kind=${kind}` : ""}${summary ? `, ${summary}` : ""})`);
+    this.name = "ApprovalParkSignal";
+    this.requestId = requestId;
+    this.kind = kind;
+  }
+}
 
 /**
  * Coordinator for approval requests. core/ never reads stdin — when a rule
@@ -16,6 +39,12 @@ import { evaluatePermissions } from "./permissions.mjs";
  * adapter (TUI / Web / Headless caller).
  *
  * Phase 4 (§2.3): replaces the readline-based prompt with an event roundtrip.
+ *
+ * ADR 0037 (Phase 2): DURING A TURN the session no longer blocks here — the
+ * parking requester consults `evaluate()` (the pure rule verdict) and parks
+ * the tool call on "ask" (see conversation.mjs). The blocking `request()`
+ * round-trip remains for NON-turn contexts (TUI shell pre-gates, ad-hoc
+ * callers), where the asking process IS the surface that answers.
  */
 export class ApprovalCoordinator {
   constructor({ events, settings, defaultMode = "auto-readonly", alwaysAllow = [] } = {}) {
@@ -25,7 +54,12 @@ export class ApprovalCoordinator {
     this.events = events;
     this.settings = settings ?? {};
     this.defaultMode = defaultMode;
-    /** @type {Map<string, { resolve: (decision: "allow" | "deny" | "always-allow") => void, kind: string }>} */
+    /** ADR 0037 D5: the pending entry retains the full requested-event payload
+     *  (summary / payload / sessionId), not just `kind`, so the serve bridge can
+     *  REPLAY `approval.requested` verbatim on re-attach — a browser reconnect
+     *  wipes its approval cards and would otherwise never see them again while
+     *  the worker is still blocked here.
+     *  @type {Map<string, { resolve: (decision: "allow" | "deny" | "always-allow") => void, kind: string, summary: string, payload: object | undefined, sessionId: string | undefined }>} */
     this.pending = new Map();
     /** @type {Set<string>} — kinds always-allowed for the rest of this session */
     this.alwaysAllow = new Set(Array.isArray(alwaysAllow) ? alwaysAllow.filter((k) => typeof k === "string") : []);
@@ -46,25 +80,37 @@ export class ApprovalCoordinator {
    * }} args
    * @returns {Promise<"allow" | "deny" | "always-allow">}
    */
-  async request({ kind, summary = "", payload, mutation = false, approvalMode, sessionId } = {}) {
+  /**
+   * Pure rule verdict for a tool call: "deny" | "allow" | "ask" — the shared
+   * decision core `request()` blocks on and the ADR 0037 parking requester
+   * parks on. A deny rule always wins (evaluated BEFORE the mode shortcuts so
+   * full-auto / always-ask can't bypass it, matching permissions.mjs);
+   * full-auto and session alwaysAllow short-circuit to allow; always-ask
+   * ignores allow rules (every call still asks).
+   */
+  evaluate({ kind, summary = "", mutation = false, approvalMode } = {}) {
     const mode = approvalMode ?? this.settings?.approvalMode ?? this.defaultMode;
+    const decision = evaluatePermissions({
+      rules: this.settings?.permissions,
+      kind,
+      summary,
+      mutation
+    });
+    if (decision === "deny") return "deny";
     if (mode === "full-auto") return "allow";
     if (this.alwaysAllow.has(kind)) return "allow";
+    if (mode !== "always-ask" && decision === "allow") return "allow";
+    return "ask";
+  }
 
-    if (mode !== "always-ask") {
-      const decision = evaluatePermissions({
-        rules: this.settings?.permissions,
-        kind,
-        summary,
-        mutation
-      });
-      if (decision === "allow") return "allow";
-      if (decision === "deny") return "deny";
-    }
+  async request({ kind, summary = "", payload, mutation = false, approvalMode, sessionId } = {}) {
+    const verdict = this.evaluate({ kind, summary, mutation, approvalMode });
+    if (verdict === "deny") return "deny";
+    if (verdict === "allow") return "allow";
 
     const requestId = randomUUID();
     return new Promise((resolve) => {
-      this.pending.set(requestId, { resolve, kind });
+      this.pending.set(requestId, { resolve, kind, summary, payload: payload ?? undefined, sessionId });
       this.events.emit(createEvent("approval.requested", {
         sessionId,
         requestId,
@@ -108,12 +154,20 @@ export class ApprovalCoordinator {
   }
 
   /**
-   * Returns true if ANY approval is awaiting a human decision. The turn idle
-   * watchdog pauses while this is true so a slow human reviewer doesn't trip
-   * the stall abort (mirrors InteractionCoordinator.hasPending).
+   * ADR 0037 D5: snapshot every awaiting approval as a replay descriptor. The
+   * serve bridge re-emits `approval.requested` from these on re-attach so a
+   * reconnected client rebuilds its approval cards from the live coordinator
+   * (the worker is still blocked here — the entry lives until resolve()).
+   * @returns {Array<{ requestId: string, kind: string, summary: string, payload: object | undefined, sessionId: string | undefined }>}
    */
-  hasPending() {
-    return this.pending.size > 0;
+  listPending() {
+    return [...this.pending.entries()].map(([requestId, e]) => ({
+      requestId,
+      kind: e.kind,
+      summary: e.summary ?? "",
+      payload: e.payload,
+      sessionId: e.sessionId
+    }));
   }
 }
 

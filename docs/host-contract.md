@@ -62,14 +62,15 @@ process start (plus settings files, §2). Everything is optional unless noted.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `PROCWAY_TELEMETRY` | no | off | `on`/`1`/`true`/`yes` enables OpenTelemetry tracing (requires the optional `@opentelemetry/*` deps; silently no-op otherwise). |
+| `PROCWAY_TELEMETRY` | no | off | `on`/`1`/`true`/`yes` enables OpenTelemetry tracing. The `@opentelemetry/*` packages are **not bundled** — install them yourself (see README "Tracing"). Without them the CLI runs normally and prints one line naming what to install. |
+| `PROCWAY_TELEMETRY_QUIET` | no | unset | Suppresses that one-line notice. Set it when embedding the CLI and you do not want the reminder on stderr. |
 
 ### Timeouts
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `PROCWAY_TURN_IDLE_TIMEOUT_MS` | no | `180000` | Turn-level idle watchdog: aborts a turn that produced no events for this long (paused while a UIR/approval awaits a human). `0` disables. |
-| `PROCWAY_UIR_TIMEOUT_MS` | no | `900000` (15 min) | How long a blocking `request_user_action` (user-interaction request) waits for a human answer. `0` = wait indefinitely. |
+| `PROCWAY_UIR_TIMEOUT_MS` | no | (removed) | No longer read. `request_user_action` is record-and-return: the request is recorded, the turn ends, and the user's answer resumes the conversation as a new turn — nothing waits in-process, so there is no timeout to configure. |
 | `PROCWAY_LLM_HEADERS_TIMEOUT_MS` | no | `60000` | Max wait for LLM response headers (undici). |
 | `PROCWAY_LLM_BODY_TIMEOUT_MS` | no | `120000` | Max gap between LLM response body chunks before the stream is treated as dead. |
 
@@ -83,7 +84,7 @@ process start (plus settings files, §2). Everything is optional unless noted.
 
 | Variable | Direction | Purpose |
 |---|---|---|
-| `PROCWAY_CLI` | host → session shell env | Never read via `process.env` by agent code. The system prompt instructs the model to run `node "$PROCWAY_CLI" …` in `run_shell`, so a procway host exports it into the session environment as the path to its CLI. Non-procway hosts can ignore it. |
+| `PROCWAY_CLI` | host → session shell env | Never read via `process.env` by agent code. Injected runner task prompts and some tool descriptions instruct the model to run `node "$PROCWAY_CLI" …` in `run_shell`, so a procway host exports it into the session environment as the path to its CLI. Non-procway hosts can ignore it. |
 | `PROCWAY_MCP_HOST_CLI` | agent → child process | Set *by* the agent when it spawns an external agent CLI with injected MCP config; not a host input. |
 
 ## 2. Filesystem contract

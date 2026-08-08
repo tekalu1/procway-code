@@ -127,15 +127,18 @@ export async function upsertSessionIndex({ homeDir = os.homedir(), sessionId, en
   return next;
 }
 
-export async function removeSessionIndex({ homeDir = os.homedir(), sessionId } = {}) {
+export async function removeSessionIndex({ homeDir = os.homedir(), sessionsDir = null, sessionId } = {}) {
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     throw new TypeError("removeSessionIndex: sessionId is required");
   }
-  const index = await readSessionIndex({ homeDir });
+  // `sessionsDir` scopes the removal to a specific sessions root (the
+  // dashboard passes the per-tenant subtree) — same contract as listSessions.
+  // Omitted → the HOME-relative default, byte-identical to before.
+  const index = await readSessionIndex({ homeDir, sessionsDir });
   const sessions = { ...(index.sessions ?? {}) };
   delete sessions[sessionId];
   const next = { version: VERSION, sessions };
-  await writeIndexFile(indexPath(homeDir), JSON.stringify(next, null, 2) + "\n");
+  await writeIndexFile(indexPath(homeDir, sessionsDir), JSON.stringify(next, null, 2) + "\n");
   return next;
 }
 

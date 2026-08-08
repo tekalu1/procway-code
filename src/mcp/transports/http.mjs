@@ -13,12 +13,17 @@ import { parseSseStream } from "../../providers/sse.mjs";
  *   - Bearer:  pre-set headers["Authorization"] = "Bearer <token>"
  *   - OAuth:   `oauth: { tokenEndpoint, clientId, refreshToken? }` triggers a
  *              token grant on `start()` and refresh on 401 responses.
+ *   - authProvider: async `() => headers` re-invoked on start() and on 401.
+ *              Used by dashboard-distributed connections to re-read the
+ *              connections snapshot after the dashboard's refresh sweep
+ *              rotates a token (the Pod never holds a refresh token itself).
  */
 export class HttpMcpTransport {
   constructor({
     baseUrl,
     headers = {},
     oauth = null,
+    authProvider = null,
     fetchImpl,
     sseStreamFactory = null,
     bodyTimeoutMs = 30000
@@ -29,6 +34,7 @@ export class HttpMcpTransport {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.headers = { ...headers };
     this.oauth = oauth;
+    this.authProvider = authProvider;
     this.fetchImpl = fetchImpl ?? globalThis.fetch;
     this.sseStreamFactory = sseStreamFactory;
     this.bodyTimeoutMs = bodyTimeoutMs;
@@ -40,7 +46,16 @@ export class HttpMcpTransport {
     this.token = null;
   }
 
+  async applyAuthProvider() {
+    if (!this.authProvider) return;
+    const fresh = await this.authProvider();
+    if (fresh && typeof fresh === "object") {
+      this.headers = { ...this.headers, ...fresh };
+    }
+  }
+
   async start() {
+    await this.applyAuthProvider();
     if (this.oauth) {
       const token = await this.fetchOauthToken();
       this.token = token;
@@ -69,6 +84,9 @@ export class HttpMcpTransport {
       const token = await this.fetchOauthToken({ forceRefresh: true });
       this.token = token;
       this.headers.Authorization = `Bearer ${token}`;
+      response = await this.postMessage(message);
+    } else if (response.status === 401 && this.authProvider) {
+      await this.applyAuthProvider();
       response = await this.postMessage(message);
     }
     if (!response.ok) {

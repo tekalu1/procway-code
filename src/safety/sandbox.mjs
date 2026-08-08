@@ -8,8 +8,6 @@
  * `notes` array so the caller can report it.
  */
 
-import os from "node:os";
-
 const POSIX_PLATFORMS = new Set(["linux", "darwin", "freebsd", "openbsd", "netbsd", "sunos", "aix"]);
 
 export function isPosixPlatform(platform = process.platform) {
@@ -70,8 +68,4 @@ export function resolveSandbox({ settings } = {}) {
   if (Number.isFinite(config.cpuSeconds)) out.cpuSeconds = Number(config.cpuSeconds);
   if (Number.isFinite(config.timeoutMs)) out.timeoutMs = Number(config.timeoutMs);
   return Object.keys(out).length > 0 ? out : null;
-}
-
-export function platformInfo() {
-  return { platform: process.platform, arch: process.arch, release: os.release() };
 }

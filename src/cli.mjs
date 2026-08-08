@@ -1,19 +1,18 @@
 #!/usr/bin/env node
-import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import path from "node:path";
 import { installCrashHandlers } from "./telemetry/crash-reporter.mjs";
 import { loadSettings } from "./config/load-settings.mjs";
-import { applySecretsFromFiles } from "./config/load-secrets.mjs";
+import { applySecretsFromFiles, setSecret } from "./config/load-secrets.mjs";
 import { startSettingsHotReload } from "./config/hot-reload.mjs";
 import { createUserEnvManager } from "./config/user-env.mjs";
 import { validateSettings } from "./config/schema.mjs";
 import { initSettings } from "./config/init-settings.mjs";
-import { setWorkspaceSetting } from "./config/workspace-settings.mjs";
+import { setSetting } from "./config/workspace-settings.mjs";
 import { resolveActiveModel } from "./config/active-model.mjs";
 import { runAgent } from "./agent/loop.mjs";
 import { getSharedShellManager } from "./tools/shell-manager.mjs";
-import { invalidateDisplayToolAvailability } from "./tools/registry.mjs";
+import { invalidateDisplayToolAvailability, primeDisplayToolAvailability } from "./tools/registry.mjs";
 import {
   createAgentSession,
   EventBus,
@@ -34,12 +33,38 @@ import { migrateLegacyFormatIfNeeded } from "./session/migration.mjs";
 import { listSessions, loadSessionState } from "./session/store.mjs";
 import { createTimelineRenderer } from "./adapters/tui/timeline-renderer.mjs";
 import { pickSession } from "./adapters/tui/session-picker.mjs";
-import { printTranscript, renderTranscript } from "./adapters/tui/markdown-render.mjs";
+import { renderAssistantContent } from "./adapters/tui/transcript-node-render.mjs";
+import { printSessionRecap } from "./adapters/tui/session-recap.mjs";
+import { swapActiveSession, disposeSessionRenderers } from "./adapters/tui/session-swap.mjs";
 import { attachApprovalPrompt } from "./adapters/tui/approval-prompt.mjs";
 import { createStreamingRenderer } from "./adapters/tui/streaming-renderer.mjs";
 import { attachInterruptHandler } from "./adapters/tui/interrupt.mjs";
-import { attachTodoRenderer, renderTodoSummary } from "./adapters/tui/todo-render.mjs";
-import { createSlashCompleter, formatMenu, findSkillMd, isBuiltinSlashCommand, slashCommandName } from "./adapters/tui/slash-completion.mjs";
+import { createInputController } from "./adapters/tui/input-controller.mjs";
+import { createInputHistory } from "./adapters/tui/input-history.mjs";
+import { createShutdown } from "./adapters/tui/shutdown.mjs";
+import { applyTerminalSetup, planTerminalSetup, CTRL_J_ADVICE } from "./adapters/tui/terminal-setup.mjs";
+import { sanitizeTerminalText } from "./adapters/tui/sanitize.mjs";
+import { renderDiff } from "./adapters/tui/diff.mjs";
+import { createReplCompleter } from "./adapters/tui/path-completion.mjs";
+import { attachTodoRenderer } from "./adapters/tui/todo-render.mjs";
+import { createSlashCompleter, formatMenu, formatSlashHelp, findSkillMd, isBuiltinSlashCommand, slashCommandName } from "./adapters/tui/slash-completion.mjs";
+import { createCompletionSource } from "./adapters/tui/completion-menu.mjs";
+import { clearTerminal, renderDisabledToolNote, renderPrompt, renderStatus, renderWelcome } from "./adapters/tui/shell.mjs";
+import { resolveHyperlinks, style, supportsColor, terminalWidth } from "./adapters/tui/ansi.mjs";
+import {
+  renderBranch,
+  renderCompact,
+  renderContext,
+  renderMemory,
+  renderModel,
+  renderPlan,
+  renderTodos,
+  renderUsage
+} from "./adapters/tui/command-render.mjs";
+import { renderTurnError } from "./adapters/tui/error-render.mjs";
+import { renderHeading } from "./adapters/tui/panel.mjs";
+import { createReasoningRenderer } from "./adapters/tui/reasoning-render.mjs";
+import { readSecretInput } from "./adapters/tui/secret-input.mjs";
 import { expandInput } from "./adapters/tui/input-preprocessor.mjs";
 import { startServer } from "./adapters/serve/server.mjs";
 import { handleAuthCommand } from "./auth/auth-cli.mjs";
@@ -111,7 +136,7 @@ async function main() {
         cwd: repoRoot ?? cwd
       });
     } catch (error) {
-      console.error(error?.message ?? String(error));
+      console.error(sanitizeTerminalText(error?.message ?? String(error)));
       process.exitCode = 1;
     }
     // Force exit: undici keeps the global keep-alive socket pool alive after
@@ -145,6 +170,7 @@ function parseArgs(argv) {
     const arg = argv[index];
     if (arg === "--cwd") parsed.cwd = argv[++index];
     else if (arg === "--repo-root") parsed.repoRoot = argv[++index];
+    else if (arg === "--scope") parsed.scope = argv[++index];
     else if (arg === "--model") parsed.model = argv[++index];
     else if (arg === "--provider") parsed.provider = argv[++index];
     else if (arg === "--approval-mode") parsed.approvalMode = argv[++index];
@@ -165,7 +191,7 @@ function parseArgs(argv) {
         parsed.initSettings = next;
         index += 1;
       } else {
-        parsed.initSettings = "workspace";
+        parsed.initSettings = "user";
       }
     }
     else if (arg === "--force") parsed.force = true;
@@ -201,11 +227,12 @@ Usage:
   procway-code -p "fix tests"
   procway-code --show-config
   procway-code --scan-context
-  procway-code --init-settings workspace
+  procway-code --init-settings user
   procway-code resume [sessionId]
   procway-code compact [sessionId]
   procway-code config
   procway-code config set providers.<id>.defaultModel model-id
+  procway-code config set-secret OPENAI_API_KEY
   procway-code model set model-id
   procway-code serve [--port 7777] [--host 127.0.0.1]
     PROCWAY_SERVE_TOKEN=<token> required; bind 0.0.0.0 to expose to LAN.
@@ -215,6 +242,7 @@ Usage:
 
 Options:
   --cwd <path>
+  --scope <user|workspace>  Write config/model/secrets to user scope by default
   --provider <id>
   --model <model>
   --approval-mode <always-ask|auto-readonly|full-auto>
@@ -232,8 +260,9 @@ async function runPrompt({ prompt, cwd, settings }) {
   const events = new EventBus();
   const streamRenderer = createStreamingRenderer({
     writer: process.stdout,
-    width: process.stdout.columns ?? 80,
-    colorize: process.stdout.isTTY === true
+    width: terminalWidth(process.stdout),
+    colorize: supportsColor(process.stdout),
+    hyperlinks: resolveHyperlinks(settings?.ui?.hyperlinks, process.stdout)
   });
   streamRenderer.attach(events);
   events.on("assistant.message.completed", (event) => {
@@ -243,14 +272,18 @@ async function runPrompt({ prompt, cwd, settings }) {
         .filter((b) => b?.kind === "text" && typeof b.text === "string")
         .map((b) => b.text)
         .join("");
-      if (text) process.stdout.write(`${text}${text.endsWith("\n") ? "" : "\n"}`);
+      // Phase 3e: headless `-p` writes the model's text straight to stdout, so
+      // it needs the same escape neutralisation the REPL renderers apply.
+      const safe = sanitizeTerminalText(text);
+      if (safe) process.stdout.write(`${safe}${safe.endsWith("\n") ? "" : "\n"}`);
     }
   });
   try {
     await runAgent({ settings, prompt, cwd, events });
     process.exitCode = 0;
   } catch (error) {
-    console.error(error.message);
+    // Provider error bodies are external text — neutralise before printing.
+    console.error(sanitizeTerminalText(error.message));
     process.exitCode = 1;
   } finally {
     streamRenderer.detach();
@@ -262,38 +295,146 @@ async function runPrompt({ prompt, cwd, settings }) {
   }
 }
 
-async function runRepl({ cwd, settings }) {
-  const rl = readline.createInterface({
+/**
+ * Build the one stdin owner for an interactive run (P2-1).
+ *
+ * Everything that used to create its own readline / raw-mode reader —
+ * `runRepl`, `resumeSession`, `approval-prompt.mjs`, `session-picker.mjs`,
+ * `secret-input.mjs` — now goes through this controller instead.
+ */
+async function createReplInput({ cwd }) {
+  const history = createInputHistory();
+  await history.load();
+  const controller = createInputController({
     input,
     output,
-    completer: makeReplCompleter()
-  });
-  const session = await createReplSession({ cwd, settings, rl });
-  console.log("procway-code TUI");
-  console.log(`Session: ${session.sessionId}`);
-  if (session.planMode?.isActive()) console.log("Plan mode: ON (write tools will queue for end-of-turn approval)");
-  printReplCommands();
-  try {
-    await runConversationLoop({ rl, cwd, settings, session });
-  } finally {
-    rl.close();
-  }
+    completer: makeReplCompleter({ cwd }),
+    history
+  }).start();
+  return { controller, history };
 }
 
-async function createReplSession({ cwd, settings, sessionId, messages = [], title = null, rl = null, procwayMeta = null, pendingTaskCompletionReminder = false }) {
+/**
+ * Tools the environment could not provide (`web_browser` without a browser,
+ * `desktop_action` without an X display). Collected BEFORE the first session so
+ * the warning does not console.warn its way above the banner (P3b-3); the
+ * banner gets a dim one-liner and `/status` carries the reasons.
+ */
+let disabledToolNotes = [];
+
+function collectDisabledTools({ settings }) {
+  const lines = [];
+  const availability = primeDisplayToolAvailability({
+    settings,
+    logger: (line) => lines.push(line)
+  });
+  void lines; // the raw log line is replaced by the structured list below
+  return Object.entries(availability ?? {})
+    .filter(([, entry]) => entry?.available === false)
+    .map(([name, entry]) => ({ name, reason: entry?.reason ?? "unavailable" }));
+}
+
+async function runRepl({ cwd, settings }) {
+  const { controller, history } = await createReplInput({ cwd });
+  // Probe before the session so the "[tools] disabled …" warning is ours to
+  // place, not console.warn's (P3b-3).
+  disabledToolNotes = collectDisabledTools({ settings });
+  let session;
+  try {
+    session = await createReplSession({ cwd, settings, controller });
+  } catch (error) {
+    // stdin is already in raw mode at this point — hand the terminal back
+    // before the error propagates, or the user's shell is left unusable.
+    controller.dispose();
+    throw error;
+  }
+  printWelcomeBanner({ session, cwd, settings });
+  await runConversationLoop({ controller, history, cwd, settings, session });
+}
+
+function printWelcomeBanner({ session, cwd, settings }) {
+  const color = supportsColor(output);
+  const width = terminalWidth(output);
+  output.write(renderWelcome({
+    sessionId: session.sessionId,
+    cwd,
+    provider: settings.defaultProvider,
+    model: resolveActiveModel(settings),
+    approvalMode: settings.approvalMode,
+    width,
+    color
+  }));
+  output.write(renderDisabledToolNote(disabledToolNotes, { width, color }));
+}
+
+/**
+ * True for errors that are really UI events: an aborted prompt (Ctrl+C /
+ * Ctrl+D), use of a closed interface, or a cancelled hidden-secret prompt.
+ * These must never print a stack trace (P0-2).
+ */
+function isUiControlError(error) {
+  if (!error) return false;
+  const code = error.code ?? "";
+  const name = error.name ?? "";
+  const message = String(error.message ?? "");
+  return (
+    name === "AbortError" ||
+    code === "ABORT_ERR" ||
+    code === "ERR_USE_AFTER_CLOSE" ||
+    message === "Secret input cancelled" ||
+    message.startsWith("Aborted with Ctrl+")
+  );
+}
+
+async function createReplSession({ cwd, settings, sessionId, messages = [], title = null, controller = null, procwayMeta = null, pendingTaskCompletionReminder = false }) {
   const events = new EventBus();
+  // One hyperlink decision per session, shared by the live feed, the
+  // non-streaming fallback below and (through `printSessionRecap`) the replay
+  // routes — resolving it separately per renderer would let live and replayed
+  // output drift apart.
+  const hyperlinks = resolveHyperlinks(settings?.ui?.hyperlinks, output);
   const streamRenderer = createStreamingRenderer({
     writer: output,
-    width: output.columns ?? 80,
-    colorize: output.isTTY === true
+    width: terminalWidth(output),
+    colorize: supportsColor(output),
+    hyperlinks
   });
+  // P3b-2: the live feed writes through the input controller, so a spinner
+  // frame can never overwrite an approval prompt, and the transient row is
+  // cleared before any full line lands on it.
+  const colorize = supportsColor(output);
+  const renderer = createTimelineRenderer({
+    enabled: true,
+    writer: controller ? controller.writer : process.stderr,
+    isBusy: controller ? () => controller.isReading : null,
+    colorize
+  });
+  // Attach ORDER MATTERS, and the timeline renderer has to go first: both
+  // subscribe to `assistant.message.delta`, and its handler is what erases
+  // the half-drawn spinner row. Subscribed the other way round, the first
+  // Markdown block of a message landed on that row and the terminal showed
+  // `⠋ model waiting round=0 (0.0s)見出し`.
+  renderer.attach(events);
   streamRenderer.attach(events);
   events.on("assistant.message.completed", (event) => {
     if (streamRenderer.isStreaming() || streamRenderer.hadOutput()) return;
-    output.write(renderTranscript([{ role: "assistant", content: event.content }], { maxMessages: 1 }));
+    // Non-streaming providers land here. Render exactly what the streaming
+    // path would have written (Markdown, no role label) so live output does
+    // not depend on whether the provider streamed.
+    output.write(renderAssistantContent(event.content, {
+      width: terminalWidth(output),
+      colorize: supportsColor(output),
+      hyperlinks
+    }));
   });
-  const renderer = createTimelineRenderer({ enabled: true });
-  renderer.attach(events);
+  // P3b-8: the CLI used to be the only surface that dropped reasoning deltas.
+  const reasoningRenderer = createReasoningRenderer({
+    writer: controller ? controller.writer : output,
+    width: () => terminalWidth(output),
+    colorize,
+    enabled: settings?.ui?.thinking !== false
+  });
+  reasoningRenderer.attach(events);
   const session = await createAgentSession({
     settings,
     cwd,
@@ -304,21 +445,25 @@ async function createReplSession({ cwd, settings, sessionId, messages = [], titl
     procwayMeta,
     pendingTaskCompletionReminder
   });
-  attachApprovalPrompt({ session, input, output, rl });
-  attachTodoRenderer({ session, output });
+  // Every subscription this function makes is recorded so swapActiveSession()
+  // can tear the whole session down on /resume and /checkout (P1-7).
+  session.tuiDisposables = [
+    attachApprovalPrompt({ session, input, output, controller }),
+    attachTodoRenderer({ session, output: controller ? controller.writer : output, colorize })
+  ];
   session.timelineRenderer = renderer;
   session.streamingRenderer = streamRenderer;
+  session.reasoningRenderer = reasoningRenderer;
   return session;
 }
 
-function makeReplCompleter() {
-  const slashComplete = createSlashCompleter();
-  return function completer(line) {
-    if (!line.startsWith("/")) return [[], line];
-    const [matches, head] = slashComplete(line);
-    if (matches.length === 0) return [[], head];
-    return [matches, head];
-  };
+/**
+ * The REPL completer: slash commands plus `@path` file references (P2-7).
+ * Lives in adapters/tui/path-completion.mjs so it can be unit-tested without
+ * booting the CLI.
+ */
+function makeReplCompleter({ cwd = process.cwd() } = {}) {
+  return createReplCompleter({ cwd, slashCompleter: createSlashCompleter() });
 }
 
 async function handleConfigCommand({ args, cwd, settings, sources }) {
@@ -329,7 +474,13 @@ async function handleConfigCommand({ args, cwd, settings, sources }) {
   }
   if (subcommand === "set") {
     if (!key || value == null) throw new Error("Usage: procway-code config set <key> <value>");
-    console.log(JSON.stringify(await setWorkspaceSetting({ cwd, key, value }), null, 2));
+    console.log(JSON.stringify(await setSetting({ cwd, scope: configWriteScope(args), key, value }), null, 2));
+    return;
+  }
+  if (subcommand === "set-secret") {
+    if (!key || value != null) throw new Error("Usage: procway-code config set-secret <ENV_NAME> (the value is read securely from stdin)");
+    const secret = await readSecretInput({ input, output, prompt: `Enter ${key}: ` });
+    console.log(JSON.stringify(await setSecret({ cwd, scope: configWriteScope(args), key, value: secret }), null, 2));
     return;
   }
   throw new Error(`Unknown config command: ${subcommand}`);
@@ -346,85 +497,242 @@ async function handleModelCommand({ args, cwd, settings }) {
     const providerId = settings.defaultProvider;
     if (!providerId) throw new Error("model set requires defaultProvider to be configured");
     const key = `providers.${providerId}.defaultModel`;
-    console.log(JSON.stringify(await setWorkspaceSetting({ cwd, key, value: model }), null, 2));
+    console.log(JSON.stringify(await setSetting({ cwd, scope: configWriteScope(args), key, value: model }), null, 2));
     return;
   }
   throw new Error(`Unknown model command: ${subcommand}`);
 }
 
+function configWriteScope(args) {
+  const scope = args.scope ?? "user";
+  if (scope !== "user" && scope !== "workspace") {
+    throw new Error("--scope must be user or workspace");
+  }
+  return scope;
+}
+
 async function resumeSession({ cwd, settings, sessionId }) {
   await migrateLegacyFormatIfNeeded();
   const { sessions } = await listSessions({ cwd, limit: 200 });
-  const picked = sessionId ? sessions.find((session) => session.sessionId === sessionId) : await pickSession({ sessions, input, output });
+  // One controller for the whole command — the picker borrows it instead of
+  // flipping raw mode on its own (P2-1).
+  const { controller, history } = await createReplInput({ cwd });
+  const picked = sessionId
+    ? sessions.find((session) => session.sessionId === sessionId)
+    : await pickSession({ sessions, input, output, controller });
   const resolvedSessionId = picked?.sessionId ?? sessionId;
   if (!resolvedSessionId) {
     console.log(sessions.length === 0 ? "No sessions found." : "Resume cancelled.");
+    controller.dispose();
     return;
   }
   const { state } = await resumeCommand({ cwd, sessionId: resolvedSessionId });
-  const rl = readline.createInterface({ input, output, completer: makeReplCompleter() });
   const session = await createReplSession({
     cwd,
     settings,
     sessionId: resolvedSessionId,
     messages: state.messages ?? [],
     title: state.title,
-    rl
+    controller
   });
-  console.log(`Resumed session: ${resolvedSessionId}`);
-  printTranscript({ messages: session.messages, output, markdown: output.isTTY === true });
-  printReplCommands();
-  try {
-    await runConversationLoop({ rl, cwd, settings, session });
-  } finally {
-    rl.close();
-  }
+  printSessionRecap({ session, output, cwd, settings });
+  await runConversationLoop({ controller, history, cwd, settings, session });
 }
 
-async function runConversationLoop({ rl, cwd, settings, session }) {
+async function runConversationLoop({ controller, history = null, cwd, settings, session }) {
   let activeSession = session;
-  const interruptHandle = attachInterruptHandler({ session: activeSession, output: process.stderr });
+  // Single exit path (P2-5): save → reap children → give the terminal back →
+  // exit. Ctrl+C, /exit, Ctrl+D, EOF and SIGTERM all land here.
+  const shutdown = createShutdown({
+    getSession: () => activeSession,
+    controller,
+    shellManager: getSharedShellManager(),
+    output,
+    errorOutput: process.stderr,
+    onWarn: (message) => process.stderr.write(`[shutdown] ${message}\n`)
+  });
+  const saveHistory = async () => {
+    try { await history?.save?.(); } catch { /* history is best-effort */ }
+  };
+  const leave = async ({ code = 0, reason }) => {
+    await saveHistory();
+    await shutdown({ code, reason });
+  };
+  // getSession, not session: /resume and /checkout replace activeSession, and
+  // a value captured here would leave Ctrl+C aborting the session the user
+  // just left (P1-7).
+  const interruptHandle = attachInterruptHandler({
+    getSession: () => activeSession,
+    // Write around the prompt: a bare stderr write mid-edit would desync the
+    // editor's row bookkeeping from the terminal.
+    output: controller.writer,
+    isTurnRunning: () => activeSession?.runningTurn === true,
+    onIdleFirstPress: () => controller.clearInput(),
+    // shutdown() owns the real process.exit — it must save and reap first.
+    onExit: () => { void leave({ code: 130, reason: "sigint" }); },
+    exit: () => {}
+  });
+  controller.onInterrupt = () => interruptHandle.trigger();
+  controller.onEscape = () => interruptHandle.triggerEscape();
+  // EOF while a prompt is up resolves question() with null (handled below);
+  // EOF while a turn is running has no pending question, so route it here.
+  // shutdown() is idempotent, so the two paths cannot double-exit.
+  controller.onEof = () => { void leave({ code: 0, reason: "eof" }); };
+  const onSigterm = () => { void leave({ code: 143, reason: "sigterm" }); };
+  process.on("SIGTERM", onSigterm);
+  // P3b-11: a resized window must reflow the Markdown the streaming renderer
+  // produces (the prompt, panels and picker read `output.columns` per paint,
+  // and the input controller repaints its own region).
+  const onResize = () => {
+    activeSession?.streamingRenderer?.setWidth?.(terminalWidth(output));
+  };
+  output.on?.("resize", onResize);
+  const width = () => terminalWidth(output);
+  const color = () => supportsColor(output);
+  // One source for `/command` and `@path` candidates — the menu the prompt
+  // shows and the Tab completer agree because they share `createReplCompleter`.
+  const completionSource = createCompletionSource({ cwd, completer: makeReplCompleter({ cwd }) });
+  const sessionUsage = () => {
+    try { return activeSession?.usageTracker?.summary?.() ?? null; } catch { return null; }
+  };
   try {
     while (true) {
-      const line = await rl.question("> ");
+      let line;
+      try {
+        line = await controller.question({
+          prompt: renderPrompt({
+            cwd,
+            provider: activeSession.settings?.defaultProvider,
+            model: resolveActiveModel(activeSession.settings),
+            planMode: activeSession.planMode?.isActive(),
+            approvalMode: activeSession.settings?.approvalMode,
+            usage: sessionUsage(),
+            // P4b-2: renderPrompt has dropped segments from the right since
+            // P3b, but this call never passed a width, so its limit was
+            // Infinity and nothing was ever dropped — the header wrapped on
+            // every narrow terminal and desynced the editor's repaint.
+            width: width(),
+            color: color(),
+            tty: output.isTTY === true
+          }),
+          // P3b-7: typing `/` (or `@`) opens the candidate list under the
+          // input immediately — no Tab, no blind guessing — and ↑↓/Tab/Enter
+          // drive it. The same source serves both, so they feel identical.
+          completions: completionSource,
+          menuWidth: width()
+        });
+      } catch (error) {
+        // A disposed controller rejects its pending question with an
+        // AbortError. That is a normal way to leave the REPL, so exit quietly
+        // instead of surfacing a Node stack (P0-2).
+        if (isUiControlError(error)) break;
+        throw error;
+      }
+      // null = EOF (Ctrl+D on an empty buffer, or stdin closed).
+      if (line === null) {
+        await leave({ code: 0, reason: "eof" });
+        break;
+      }
       const trimmed = line.trim();
       if (!trimmed) continue;
       if (trimmed === "/exit") {
         await exitCommand();
+        // Without this the process used to hang after the goodbye line:
+        // undici's keep-alive pool and MCP stdio children keep the loop alive.
+        await leave({ code: 0, reason: "exit-command" });
         break;
+      }
+      if (trimmed === "/terminal-setup") {
+        await runTerminalSetupCommand({ controller });
+        continue;
+      }
+      if (trimmed === "/help") {
+        output.write(`${renderHeading("Commands", { color: color() })}\n`);
+        output.write(`${formatSlashHelp(undefined, { width: width() })}\n`);
+        continue;
+      }
+      if (trimmed === "/clear") {
+        clearTerminal(output);
+        // A cleared screen used to take the model name and session id with it
+        // (P3b-4) — the banner is what identifies the session, so re-print it.
+        printWelcomeBanner({ session: activeSession, cwd, settings: activeSession.settings ?? settings });
+        continue;
+      }
+      if (trimmed === "/status") {
+        output.write(renderStatus({
+          cwd,
+          sessionId: activeSession.sessionId,
+          provider: activeSession.settings?.defaultProvider,
+          model: resolveActiveModel(activeSession.settings),
+          approvalMode: activeSession.settings?.approvalMode,
+          planMode: activeSession.planMode?.isActive(),
+          usage: sessionUsage(),
+          disabledTools: disabledToolNotes,
+          thinking: activeSession.reasoningRenderer?.isEnabled?.() ?? null,
+          width: width(),
+          color: color()
+        }));
+        continue;
+      }
+      if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
+        const renderer = activeSession.reasoningRenderer;
+        const arg = trimmed.split(/\s+/)[1]?.toLowerCase() ?? "";
+        if (!renderer) {
+          output.write("Reasoning output is not available for this session.\n");
+          continue;
+        }
+        const next = arg === "on" ? true : arg === "off" ? false : !renderer.isEnabled();
+        renderer.setEnabled(next);
+        output.write(`Thinking output ${next ? "shown" : "hidden"}.\n`);
+        continue;
       }
       if (trimmed === "/config") {
         const result = await configCommand({ session: activeSession });
         console.log(JSON.stringify(result.settings, null, 2));
         continue;
       }
-      if (trimmed === "/model") {
-        const result = await modelCommand({ session: activeSession });
-        console.log(`${result.provider}:${result.model}`);
+      if (trimmed === "/config setup") {
+        try {
+          await configureProviderInTui({ controller, cwd, settings, session: activeSession });
+        } catch (error) {
+          // Ctrl+C inside the hidden token prompt throws "Secret input
+          // cancelled" — a user action, not a crash. Stay in the REPL.
+          if (!isUiControlError(error)) throw error;
+          output.write("Provider setup cancelled.\n");
+        }
         continue;
       }
+      if (trimmed === "/model") {
+        const result = await modelCommand({ session: activeSession });
+        output.write(renderModel(result, { color: color() }));
+        continue;
+      }
+      // welcome:false — /history replays the transcript of the session the
+      // banner already describes; re-printing the card was noise (P3b-12).
       if (trimmed === "/history") {
         const result = await historyCommand({ session: activeSession });
-        output.write(renderTranscript(messagesForRender(activeSession.messages)));
+        printSessionRecap({ session: activeSession, output, cwd, settings, welcome: false });
         void result;
         continue;
       }
       if (trimmed === "/usage") {
         const result = await usageCommand({ session: activeSession });
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderUsage(result, { width: width(), color: color() }));
         continue;
       }
       if (trimmed.startsWith("/compact")) {
         const result = await compactCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderCompact(result, { width: width(), color: color() }));
         continue;
       }
       if (trimmed === "/resume") {
-        const resumed = await pickAndCreateSession({ cwd, settings });
+        // The controller MUST be threaded through: the picker borrows its key
+        // stream and the new session's approval prompt asks through it, so
+        // stdin keeps exactly one owner across the swap (P2-1).
+        const resumed = await pickAndCreateSession({ cwd, settings, controller });
         if (resumed) {
-          activeSession = resumed;
-          console.log(`Resumed session: ${activeSession.sessionId}`);
-          printTranscript({ messages: activeSession.messages, output });
+          activeSession = swapActiveSession(activeSession, resumed);
+          printSessionRecap({ session: activeSession, output, cwd, settings });
         }
         continue;
       }
@@ -434,39 +742,36 @@ async function runConversationLoop({ rl, cwd, settings, session }) {
           console.log("Usage: /checkout <sessionId>");
           continue;
         }
-        const checkedOut = await checkoutSession({ cwd, settings, sessionId: targetId });
+        const checkedOut = await checkoutSession({ cwd, settings, sessionId: targetId, controller });
         if (checkedOut) {
-          activeSession = checkedOut;
-          console.log(`Checked out session: ${activeSession.sessionId}`);
-          printTranscript({ messages: activeSession.messages, output, markdown: output.isTTY === true });
+          activeSession = swapActiveSession(activeSession, checkedOut);
+          printSessionRecap({ session: activeSession, output, cwd, settings });
         }
         continue;
       }
       if (trimmed === "/context") {
         const result = await contextCommand({ cwd, settings });
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderContext(result, { width: width(), color: color(), cwd }));
         continue;
       }
       if (trimmed === "/plan" || trimmed.startsWith("/plan ")) {
         const result = await planCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderPlan(result, { width: width(), color: color() }));
         continue;
       }
       if (trimmed === "/todos") {
         const result = await todosCommand({ session: activeSession });
-        const summary = renderTodoSummary(result.todos ?? []);
-        if (summary) console.log(summary);
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderTodos(result, { width: width(), color: color() }));
         continue;
       }
       if (trimmed === "/memory") {
         const result = await memoryCommand({ session: activeSession });
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderMemory(result, { width: width(), color: color() }));
         continue;
       }
       if (trimmed.startsWith("/branch")) {
         const result = await branchCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
-        console.log(JSON.stringify(result, null, 2));
+        output.write(renderBranch(result, { width: width(), color: color(), cwd }));
         continue;
       }
       if (trimmed.startsWith("/") && !trimmed.includes(" ")) {
@@ -489,7 +794,7 @@ async function runConversationLoop({ rl, cwd, settings, session }) {
             continue;
           }
         }
-        const menu = formatMenu(trimmed, { width: output.columns ?? 80 });
+        const menu = formatMenu(trimmed, { width: width() });
         if (menu) {
           output.write(menu);
           continue;
@@ -502,30 +807,33 @@ async function runConversationLoop({ rl, cwd, settings, session }) {
             line: prompt,
             cwd,
             permissions: settings?.permissions ?? null,
-            approvalRequester: makeReplShellApprovalRequester({ rl })
+            approvalRequester: makeReplShellApprovalRequester({ controller })
           });
           if (expanded.attached.length > 0) {
             prompt = expanded.expanded;
             // Echo what was attached so the user can see it locally — the
             // expanded blocks are otherwise only visible to the LLM.
+            //
+            // P3b-10: this used to go to stderr, so `procway-code > log`
+            // dropped the very lines that explain what the model was given.
+            // It is REPL chrome, not diagnostics — it belongs on stdout with
+            // the rest of the conversation, including the command output.
             for (const item of expanded.attached) {
               if (item.kind === "file") {
                 const note = item.error
                   ? `[@${item.ref}: ${item.error}]`
                   : `[@${item.ref} attached (${item.bytes} bytes${item.truncated ? ", truncated" : ""})]`;
-                process.stderr.write(`${note}\n`);
+                output.write(`${color() ? style("muted", note) : note}\n`);
               } else if (item.kind === "shell") {
-                process.stderr.write(`[!${item.command} → exit ${item.exitCode}]\n`);
-                // Echo the actual command output so the user sees what the
-                // LLM is going to read. stdout → stdout, stderr → stderr to
-                // mirror normal shell semantics.
+                const head = `[!${item.command} → exit ${item.exitCode}]`;
+                output.write(`${color() ? style("muted", head) : head}\n`);
                 if (item.stdout) {
-                  process.stdout.write(item.stdout);
-                  if (!item.stdout.endsWith("\n")) process.stdout.write("\n");
+                  output.write(item.stdout);
+                  if (!item.stdout.endsWith("\n")) output.write("\n");
                 }
                 if (item.stderr) {
-                  process.stderr.write(item.stderr);
-                  if (!item.stderr.endsWith("\n")) process.stderr.write("\n");
+                  const text = color() ? style("danger", item.stderr.replace(/\n$/, "")) : item.stderr.replace(/\n$/, "");
+                  output.write(`${text}\n`);
                 }
               }
             }
@@ -537,36 +845,169 @@ async function runConversationLoop({ rl, cwd, settings, session }) {
       try {
         await activeSession.runTurn(prompt);
       } catch (error) {
-        printTurnError(error);
+        if (isUiControlError(error)) continue;
+        printTurnError(error, { width: width(), color: color() });
       }
     }
+  } catch (error) {
+    // Safety net: anything that reaches here and is really a UI event (an
+    // interface closed under us, a cancelled prompt) leaves the loop quietly.
+    if (!isUiControlError(error)) throw error;
   } finally {
     interruptHandle.dispose();
+    process.removeListener("SIGTERM", onSigterm);
+    output.removeListener?.("resize", onResize);
+    // The session that survived the loop still holds a spinner interval and
+    // event-bus subscriptions; the ones it replaced were torn down by
+    // swapActiveSession as they were swapped out.
+    disposeSessionRenderers(activeSession);
+    // Leaving by ANY route — including an exception on the way out — must give
+    // the terminal back: raw mode off, bracketed paste off, listeners removed.
+    // (shutdown() already did this on its path; dispose() is idempotent.)
+    await saveHistory();
+    controller.dispose();
   }
 }
 
-function messagesForRender(messages) {
-  return Array.isArray(messages) ? messages : [];
-}
-
-function makeReplShellApprovalRequester({ rl }) {
-  if (!rl) return null;
+function makeReplShellApprovalRequester({ controller }) {
+  if (!controller) return null;
   return async ({ summary }) => {
-    const answer = (await rl.question(`Run shell '${summary}'? [y/N] `)).trim().toLowerCase();
-    return answer === "y" || answer === "yes";
+    const answer = await controller.question({
+      prompt: `Run shell '${summary}'? [y/N] `,
+      level: 1,
+      history: false,
+      multiline: false
+    });
+    const normalized = (answer ?? "").trim().toLowerCase();
+    return normalized === "y" || normalized === "yes";
   };
 }
 
-function printTurnError(error) {
-  const status = error?.status ? ` (${error.status})` : "";
-  const retryHint = error?.retryable ? "\nThe request may succeed if you retry shortly or switch models/providers." : "";
-  console.error(`Turn failed${status}: ${error?.message ?? String(error)}${retryHint}`);
+/**
+ * `/terminal-setup` (P2-2b) — bind Shift+Enter to `ESC CR` in the host
+ * terminal. NOTHING is written before the user has seen the exact diff and
+ * answered `y`; existing bindings are left alone and modified files are backed
+ * up (see adapters/tui/terminal-setup.mjs).
+ */
+async function runTerminalSetupCommand({ controller }) {
+  const plan = await planTerminalSetup();
+  if (!plan.supported) {
+    output.write(`${plan.note}\n`);
+    return;
+  }
+  const writable = plan.targets.filter((target) => target.action !== "skip");
+  if (writable.length === 0) {
+    output.write(`${plan.note}\n`);
+    return;
+  }
+  output.write(`Detected terminal: ${plan.terminal}\nThe following changes will be made:\n\n`);
+  for (const target of writable) {
+    if (target.kind === "command") {
+      output.write(`  $ ${target.command.map((part) => (/\s/.test(part) ? JSON.stringify(part) : part)).join(" ")}\n`);
+      continue;
+    }
+    output.write(renderDiff({
+      filePath: target.path,
+      before: target.before,
+      after: target.after,
+      operation: target.action === "create" ? "create" : "update",
+      colorize: supportsColor(output)
+    }));
+    if (target.action === "update") output.write(`  (a backup is written to ${target.path}.procway-backup-<timestamp>)\n`);
+  }
+  let answer;
+  try {
+    answer = await controller.question({
+      prompt: "\nApply these changes? [y/N] ",
+      level: 1,
+      history: false,
+      multiline: false
+    });
+  } catch {
+    answer = null;
+  }
+  if (!/^y(es)?$/i.test((answer ?? "").trim())) {
+    output.write(`Cancelled — nothing was written. ${CTRL_J_ADVICE}\n`);
+    return;
+  }
+  const results = await applyTerminalSetup(plan);
+  for (const result of results) {
+    if (result.error) output.write(`  failed: ${result.path ?? result.command}: ${result.error}\n`);
+    else if (result.applied) output.write(`  wrote ${result.path ?? result.command}${result.backup ? " (backed up)" : ""}\n`);
+  }
+  output.write(`${plan.note}\n`);
 }
 
-function printReplCommands() {
-  console.log("Commands: /branch, /compact, /config, /context, /history, /memory, /model, /plan, /resume, /todos, /usage, /exit");
-  console.log("Inline:   @<path> attaches a file, !<command> attaches shell output");
-  console.log("Hint:     type / and press Tab to autocomplete a slash command");
+async function configureProviderInTui({ controller, cwd, settings, session }) {
+  const currentId = settings.defaultProvider ?? "openai-main";
+  const current = settings.providers?.[currentId] ?? {};
+  const providerId = (await questionWithDefault(controller, "Provider ID", currentId)).trim();
+  const selected = settings.providers?.[providerId] ?? current;
+  const type = (await questionWithDefault(controller, "Provider type", selected.type ?? "openai-compatible")).trim();
+  const apiKeyEnv = (await questionWithDefault(controller, "API key environment name", selected.apiKeyEnv ?? "OPENAI_API_KEY")).trim();
+  const baseUrl = (await questionWithDefault(controller, "Endpoint", selected.baseUrl ?? "https://api.openai.com/v1")).trim();
+  const model = (await questionWithDefault(controller, "Model", selected.defaultModel ?? "gpt-5.4")).trim();
+  const token = await questionHidden(controller, `API token for ${apiKeyEnv} (blank keeps the existing value): `);
+
+  const provider = { ...selected, type, apiKeyEnv, baseUrl, defaultModel: model };
+  const candidate = {
+    ...settings,
+    defaultProvider: providerId,
+    providers: { ...(settings.providers ?? {}), [providerId]: provider }
+  };
+  const errors = validateSettings(candidate);
+  if (errors.length > 0) {
+    console.error(`Settings were not saved:\n${errors.map((error) => `- ${error}`).join("\n")}`);
+    return;
+  }
+
+  await setSetting({ cwd, scope: "user", key: "defaultProvider", value: providerId });
+  await setSetting({ cwd, scope: "user", key: `providers.${providerId}`, value: JSON.stringify(provider) });
+  if (token) {
+    await setSecret({ cwd, scope: "user", key: apiKeyEnv, value: token });
+    process.env[apiKeyEnv] = token;
+  }
+  settings.defaultProvider = providerId;
+  settings.providers = candidate.providers;
+  if (session.settings !== settings) {
+    session.settings.defaultProvider = providerId;
+    session.settings.providers = candidate.providers;
+  }
+  console.log(`Saved ${providerId}:${model}. The next turn will use this provider.`);
+}
+
+async function questionWithDefault(controller, label, defaultValue) {
+  const answer = await controller.question({
+    prompt: `${label} [${defaultValue}]: `,
+    level: 1,
+    history: false,
+    multiline: false
+  });
+  return (answer ?? "").trim() || defaultValue;
+}
+
+/**
+ * P2-1: hidden input is a MODE of the one controller, not a second reader.
+ * `secret-input.mjs`'s trick of stripping readline's `data` listeners (and
+ * putting them back afterwards) exists only for the non-REPL
+ * `config set-secret` path now.
+ */
+async function questionHidden(controller, prompt) {
+  return (await controller.readSecret({ prompt })).trim();
+}
+
+/**
+ * P3b-10: a failed turn now says what to DO. `Missing API key environment
+ * variable: OPENROUTER_API_KEY` was true and useless; the panel points at
+ * `/config setup`. Rate limits, auth rejections, network failures and the idle
+ * watchdog each get their own guidance (adapters/tui/error-render.mjs).
+ *
+ * It goes to stdout because it is part of the conversation the user is
+ * reading — a turn that failed is a turn, and redirecting stdout must not
+ * silently swallow the reason.
+ */
+function printTurnError(error, { width = terminalWidth(output), color = supportsColor(output) } = {}) {
+  output.write(renderTurnError(error, { width, color }));
 }
 
 async function compactSessionFromCli({ cwd, settings, sessionId, compactOptions = {} }) {
@@ -591,7 +1032,7 @@ async function compactSessionFromCli({ cwd, settings, sessionId, compactOptions 
   console.log(JSON.stringify(result, null, 2));
 }
 
-async function checkoutSession({ cwd, settings, sessionId }) {
+async function checkoutSession({ cwd, settings, sessionId, controller = null }) {
   await migrateLegacyFormatIfNeeded();
   let state;
   try {
@@ -603,6 +1044,7 @@ async function checkoutSession({ cwd, settings, sessionId }) {
   return createReplSession({
     cwd,
     settings,
+    controller,
     sessionId,
     messages: state.messages ?? [],
     title: state.title,
@@ -611,14 +1053,14 @@ async function checkoutSession({ cwd, settings, sessionId }) {
   });
 }
 
-async function pickAndCreateSession({ cwd, settings }) {
+async function pickAndCreateSession({ cwd, settings, controller = null }) {
   await migrateLegacyFormatIfNeeded();
   const { sessions } = await listSessions({ cwd, limit: 200 });
   if (sessions.length === 0) {
     console.log("No sessions found.");
     return null;
   }
-  const picked = await pickSession({ sessions, input, output });
+  const picked = await pickSession({ sessions, input, output, controller });
   if (!picked) {
     console.log("Resume cancelled.");
     return null;
@@ -627,6 +1069,7 @@ async function pickAndCreateSession({ cwd, settings }) {
   return createReplSession({
     cwd,
     settings,
+    controller,
     sessionId: picked.sessionId,
     messages: state.messages ?? [],
     title: state.title,
@@ -711,11 +1154,38 @@ async function runServe({ cwd, repoRoot, settings, port, host }) {
   });
 }
 
+/**
+ * Interactive = a human is watching a terminal. Stacks are noise there; they
+ * are signal for `serve`, CI and piped runs (where the dashboard relays them).
+ * `PROCWAY_DEBUG=1` forces the verbose form back on.
+ */
+function isDebugMode() {
+  const value = process.env.PROCWAY_DEBUG;
+  return typeof value === "string" && value !== "" && value !== "0" && value !== "false";
+}
+
+function isInteractiveTerminal() {
+  return process.stdout.isTTY === true || process.stderr.isTTY === true;
+}
+
 // Surface fatal crashes as a structured stderr line the dashboard relays to
-// Sentry (ADR 0013 T1-16) — the container itself never talks to Sentry.
-installCrashHandlers();
+// Sentry (ADR 0013 T1-16) — the container itself never talks to Sentry. In an
+// interactive TUI the marker line still goes out (relay contract unchanged,
+// docs/host-contract.md) but without the stack, so users never see a raw
+// Node trace mid-session.
+installCrashHandlers({ includeStack: isDebugMode() || !isInteractiveTerminal() });
 
 main().catch((error) => {
-  console.error(error.stack ?? error.message);
+  if (isUiControlError(error)) {
+    // Ctrl+C / Ctrl+D during a prompt is a normal way to quit.
+    process.exitCode = 0;
+    return;
+  }
+  if (isInteractiveTerminal() && !isDebugMode()) {
+    console.error(error?.message ?? String(error));
+    console.error("Run with PROCWAY_DEBUG=1 for the full stack trace.");
+  } else {
+    console.error(error?.stack ?? error?.message ?? String(error));
+  }
   process.exitCode = 1;
 });

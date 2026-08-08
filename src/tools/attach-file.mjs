@@ -19,8 +19,12 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { uploadAttachmentBytes } from "../providers/image-hydration.mjs";
 
-/** Outbound attachment cap; aligned with the dashboard endpoint (20MB). */
-const MAX_ATTACH_BYTES = 20 * 1024 * 1024;
+/**
+ * Outbound attachment cap. Independent literal (ai-agent must not import from
+ * the monorepo — ADR 0030 D2), kept in sync with the dashboard's
+ * MAX_UPLOAD_ATTACHMENT_BYTES (50MB).
+ */
+const MAX_ATTACH_BYTES = 50 * 1024 * 1024;
 
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 

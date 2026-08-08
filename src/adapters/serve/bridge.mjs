@@ -133,8 +133,71 @@ export function attachBridge({
       if (logger) logger(`bridge: initial session.resumed replay failed ${error?.message ?? error}`);
     }
   }
+  // Same timing gap as the transcript above: AgentSession.initialize
+  // re-announces the persisted todo list via todos.updated, but that fires
+  // before this bridge attaches its forwarder. Replay it here or a page
+  // reload leaves the TODO panel empty even though the snapshot has the list.
+  replayTodos({ session: state.session, ws, logger });
+  // ADR 0037 D5: a page reload / WS reconnect wipes the client's approval cards
+  // and UIR widgets (session.resumed above resets them), but the worker may
+  // still be blocked on one right now. Replay the live coordinators' pending
+  // requests so the client rebuilds them — same timing gap as the transcript.
+  replayPendingRequests({ session: state.session, ws, logger });
 
   return { detach };
+}
+
+/**
+ * ADR 0037 D5: replay the session's still-pending approval requests to a
+ * (re)attached client — a reconnect wipes the client's approval cards, and
+ * without a replay a still-blocked worker would be unanswerable. Re-emitting
+ * the ORIGINAL event shape (`approval.requested`) lets the client's existing
+ * handler rebuild the cards (it dedupes by requestId, so racing a live event
+ * is harmless). Best-effort per request.
+ *
+ * UIR widgets are NOT replayed here any more: ADR 0037 D1 made every UIR
+ * record-and-return, so the durable pending_interactions row is the source of
+ * truth and the client re-hydrates from it (restorePendingInteractions) on
+ * session.resumed — there is no in-memory pending to replay.
+ */
+function replayPendingRequests({ session, ws, logger }) {
+  try {
+    // ADR 0037 D1: parked approvals (the checkpointed, snapshot-persisted
+    // form — survives Pod restarts) plus any legacy in-memory coordinator
+    // pendings (non-turn blocking round-trips). Disjoint sets by construction.
+    const parked = typeof session?.listParkedApprovals === "function"
+      ? session.listParkedApprovals()
+      : [];
+    const blocking = typeof session?.approvalCoordinator?.listPending === "function"
+      ? session.approvalCoordinator.listPending()
+      : [];
+    for (const a of [...parked, ...blocking]) {
+      ws.send(JSON.stringify(makeEvent({
+        type: "approval.requested",
+        sessionId: a.sessionId ?? session.sessionId,
+        requestId: a.requestId,
+        kind: a.kind,
+        summary: a.summary,
+        payload: a.payload ?? undefined
+      })));
+    }
+  } catch (error) {
+    if (logger) logger(`bridge: approval.requested replay failed ${error?.message ?? error}`);
+  }
+}
+
+function replayTodos({ session, ws, logger }) {
+  const todos = typeof session?.todoStore?.list === "function" ? session.todoStore.list() : [];
+  if (!Array.isArray(todos) || todos.length === 0) return;
+  try {
+    ws.send(JSON.stringify(makeEvent({
+      type: "todos.updated",
+      sessionId: session.sessionId,
+      todos: todos.map((todo) => ({ ...todo }))
+    })));
+  } catch (error) {
+    if (logger) logger(`bridge: todos.updated replay failed ${error?.message ?? error}`);
+  }
 }
 
 async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, eventForwarder, logger }) {
@@ -165,6 +228,18 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
           return;
         }
         const options = (args.options && typeof args.options === "object") ? { ...args.options } : {};
+        // Programmatic worker sessions (run-loop runner) have no approval-UI
+        // receiver — the ChatPanel is only wired to connected user sessions and
+        // Slack/Discord only to their own origin. If such a turn hit an approval
+        // gate it would block on the approval bus until the worker's timeout and
+        // fail the run. So default worker-origin turns to full-auto (restores the
+        // old runner template's `--approval-mode full-auto`). Dangerous ops are
+        // still guarded by permissions.deny, which wins regardless of mode
+        // (ApprovalCoordinator evaluates deny first). An explicit options.approvalMode
+        // from the caller always wins over this default.
+        if (state.session?.origin === "worker" && options.approvalMode == null) {
+          options.approvalMode = "full-auto";
+        }
         // Attachments may arrive at the top level (preferred) or nested in
         // options; normalize + validate either way before handing to runTurn.
         const attachments = normalizeRunTurnAttachments(args.attachments ?? options.attachments);
@@ -287,6 +362,13 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
         } catch (error) {
           if (logger) logger(`bridge: session.resumed broadcast failed ${error?.message ?? error}`);
         }
+        // session.resumed wipes the client's todo panel — re-announce the
+        // loaded session's persisted list right behind it (see attach-time
+        // replay above for the full why).
+        replayTodos({ session: next, ws, logger });
+        // …and replay the loaded session's still-pending approval / UIR requests
+        // (ADR 0037 D5) so a switch-to-another-session keeps its blocked widgets.
+        replayPendingRequests({ session: next, ws, logger });
         next.events.on("*", eventForwarder);
         ws.send(JSON.stringify(makeResponse({
           id,

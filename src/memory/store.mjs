@@ -21,10 +21,6 @@ export function getMemoryDir({ homeDir = os.homedir() } = {}) {
   return path.join(homeDir, ".procway", "ai-agent", "memory");
 }
 
-export function getMemoryIndexPath(args = {}) {
-  return path.join(getMemoryDir(args), "MEMORY.md");
-}
-
 /**
  * Read every memory file and the MEMORY.md index. Returns `null` if the
  * directory does not exist (no memory configured for this user).

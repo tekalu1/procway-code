@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { viewImage } from "../src/tools/view-image.mjs";
 import { executeToolCall, getToolDefinitions } from "../src/tools/registry.mjs";
 import { isToolResult } from "../src/core/types/tool-result.mjs";

@@ -149,6 +149,12 @@ function resolveAnywhere(cwd, targetPath) {
 }
 
 function resolveInsideCwd(cwd, targetPath) {
+  // Defense-in-depth: registry.validateToolArgs already rejects a missing
+  // filePath, but a non-string here (e.g. a direct caller) must fail with a
+  // clear message rather than the cryptic TypeError from path.isAbsolute(undefined).
+  if (typeof targetPath !== "string" || targetPath.length === 0) {
+    throw new Error(`Invalid file path: expected a non-empty string, got ${targetPath === null ? "null" : typeof targetPath}`);
+  }
   const root = path.resolve(cwd);
   const resolved = path.isAbsolute(targetPath) ? path.resolve(targetPath) : path.resolve(root, targetPath);
   if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {

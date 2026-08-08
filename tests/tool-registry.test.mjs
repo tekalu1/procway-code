@@ -41,6 +41,13 @@ describe("tool registry", () => {
     expect(byName.start_run.parameters.properties.ticket.type).toBe("string");
     expect(byName.start_run.parameters.properties.autoApprove.type).toBe("boolean");
     expect(byName.start_run.parameters.required).toEqual(["project", "ticket"]);
+    // ADR 0038 D1: the run ⇄ conversation attach is HOST-supplied (the dispatcher
+    // passes the owning AgentSession id). It must NOT be a model-writable tool
+    // argument — otherwise a model could attach its run to another conversation.
+    for (const name of ["start_run", "resume_run", "reply_run"]) {
+      expect(byName[name].parameters.properties, `${name} must not expose conversationId`)
+        .not.toHaveProperty("conversationId");
+    }
 
     expect(byName.get_run_status.parameters.properties.jobId.type).toBe("string");
     expect(byName.get_run_status.parameters.required).toEqual(["jobId"]);
@@ -56,6 +63,30 @@ describe("tool registry", () => {
 
     // run_shell is untouched (still present).
     expect(byName.run_shell).toBeTruthy();
+  });
+
+  // ADR 0038 D2 — the deterministic launch: the dashboard starts the run and the
+  // AI merely ACCOMPANIES it. attach_run is start_run minus the POST.
+  it("exposes attach_run (accompany an already-started run) taking only runId, classified read-only", () => {
+    const byName = Object.fromEntries(getToolDefinitions().map((tool) => [tool.function.name, tool.function]));
+
+    expect(byName.attach_run, "attach_run should be registered").toBeTruthy();
+    expect(byName.attach_run.parameters.properties.runId.type).toBe("string");
+    expect(byName.attach_run.parameters.required).toEqual(["runId"]);
+    // project / ticket come from the JOB, not from the model — and the attach is
+    // host-supplied, exactly like start_run's.
+    for (const key of ["project", "ticket", "conversationId", "command"]) {
+      expect(byName.attach_run.parameters.properties, `attach_run must not expose ${key}`)
+        .not.toHaveProperty(key);
+    }
+    // It starts nothing, so it is NOT a mutation: gating it would ask the user to
+    // approve watching a run they just launched themselves. The minutes-long
+    // await is a scheduling concern (turn-orchestrator budget), not an approval one.
+    expect(isMutationTool("attach_run")).toBe(false);
+
+    // start_run stays registered — the AI-driven launch is still a first-class
+    // path (ADR 0038 D3), attach_run does not replace it.
+    expect(byName.start_run).toBeTruthy();
   });
 
   it("runs safe shell commands without approval and returns a ToolResult", async () => {

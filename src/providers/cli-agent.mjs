@@ -1,14 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildMcpInjection } from "../mcp/host/inject-config.mjs";
 
 const ZERO_USAGE = Object.freeze({ inputTokens: 0, outputTokens: 0 });
 
-// Repo root inferred from this file: cli-agent.mjs lives at
-// `${repoRoot}/ai-agent/src/providers/cli-agent.mjs`, so we go up 4 levels.
-const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), "..", "..", "..", "..");
+// The MCP host CLI is resolved from THIS module's URL, not from a guessed repo
+// root. `${repoRoot}/ai-agent/src/mcp/host/cli.mjs` only exists inside the
+// monorepo checkout; when procway-code is installed from npm the package root
+// is `node_modules/procway-code`, and that path resolves to a file that is not
+// there — the sub-CLI would then start with an MCP server that never launches.
+const HOST_CLI_PATH = fileURLToPath(new URL("../mcp/host/cli.mjs", import.meta.url));
 
 /**
  * Detect sub-CLI flavor from `provider.command` so MCP injection can pick the
@@ -65,7 +67,7 @@ export async function runCliAgentProvider({
     const flavor = detectProviderFlavor(provider.command);
     const injection = buildMcpInjection({
       provider: flavor,
-      repoRoot: REPO_ROOT,
+      hostCli: HOST_CLI_PATH,
       cwd,
       disallowBuiltinMutations: provider.mcpHostKeepBuiltins !== true
     });

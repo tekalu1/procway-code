@@ -349,6 +349,150 @@ describe("MCP tool execution — Slack", () => {
   });
 });
 
+const DISCORD_CONN = {
+  discord: { kind: "bot-install", guildId: "900000000000000001", guildName: "Acme Guild",
+    botUserId: "900000000000000009", applicationId: "app1", savedAt: "x" },
+};
+
+const GUILD_CHANNELS = [
+  { id: "900000000000000101", name: "general", type: 0, position: 0, topic: "hello" },
+  { id: "900000000000000102", name: "dev", type: 0, position: 1, topic: null },
+  { id: "900000000000000103", name: "lobby", type: 2, position: 2 }, // voice — filtered out
+];
+
+describe("MCP tool execution — Discord (broker mode)", () => {
+  beforeEach(() => {
+    process.env.PROCWAY_DASHBOARD_URL = "http://dash.test:3000";
+    process.env.PROCWAY_PROXY_TOKEN = "ptok-123";
+  });
+  afterEach(() => {
+    delete process.env.PROCWAY_DASHBOARD_URL;
+    delete process.env.PROCWAY_PROXY_TOKEN;
+  });
+
+  it("registers the expected discord_* tools", () => {
+    const names = getToolDefinitions().map((t) => t.function.name);
+    expect(names).toEqual(expect.arrayContaining([
+      "discord_list_channels", "discord_read_channel", "discord_read_thread", "discord_post_message",
+    ]));
+  });
+
+  it("classifies discord reads as non-mutation, post as mutation", () => {
+    expect(isMutationTool("discord_list_channels")).toBe(false);
+    expect(isMutationTool("discord_read_channel")).toBe(false);
+    expect(isMutationTool("discord_read_thread")).toBe(false);
+    expect(isMutationTool("discord_post_message")).toBe(true);
+  });
+
+  it("discord_list_channels rides the dashboard broker with the proxy token and filters to text channels", async () => {
+    await writeConnections(DISCORD_CONN);
+    const fetchFn = mockFetch((url, init) => {
+      expect(url).toBe("http://dash.test:3000/api/integrations/discord/guilds/900000000000000001/channels");
+      expect(init.headers.Authorization).toBe("Bearer ptok-123");
+      return json(GUILD_CHANNELS);
+    });
+    const res = await exec("discord_list_channels", {});
+    expect(fetchFn).toHaveBeenCalled();
+    expect(res.data.count).toBe(2); // voice channel dropped
+    expect(res.data.results[0]).toMatchObject({ id: "900000000000000101", name: "general", type: "text", topic: "hello" });
+  });
+
+  it("discord_read_channel resolves #name via guild channels and returns oldest-first messages", async () => {
+    await writeConnections(DISCORD_CONN);
+    mockFetch((url) => {
+      if (url.includes("/guilds/")) return json(GUILD_CHANNELS);
+      expect(url).toContain("/channels/900000000000000102/messages");
+      expect(url).toContain("limit=20");
+      return json([
+        { id: "2", author: { id: "u2", username: "beta" }, content: "newer", timestamp: "t2" },
+        { id: "1", author: { id: "u1", username: "alpha" }, content: "older", timestamp: "t1" },
+      ]);
+    });
+    const res = await exec("discord_read_channel", { channel: "#dev" });
+    expect(res.data.channel).toBe("900000000000000102");
+    expect(res.data.messages.map((m) => m.content)).toEqual(["older", "newer"]);
+    expect(res.data.messages[0].author.username).toBe("alpha");
+  });
+
+  it("discord_read_thread reads the thread id as a channel", async () => {
+    await writeConnections(DISCORD_CONN);
+    mockFetch((url) => {
+      expect(url).toContain("/channels/900000000000000555/messages");
+      return json([
+        { id: "11", author: { id: "u1" }, content: "reply", timestamp: "t2" },
+        { id: "10", author: { id: "u1" }, content: "parent", timestamp: "t1" },
+      ]);
+    });
+    const res = await exec("discord_read_thread", { threadId: "900000000000000555" });
+    expect(res.data.threadId).toBe("900000000000000555");
+    expect(res.data.messages.map((m) => m.content)).toEqual(["parent", "reply"]);
+  });
+
+  it("discord_post_message splits >2000 chars into sequential chunked posts", async () => {
+    await writeConnections(DISCORD_CONN);
+    const posted = [];
+    mockFetch((url, init) => {
+      expect(url).toContain("/channels/900000000000000101/messages");
+      expect(init.method).toBe("POST");
+      posted.push(JSON.parse(init.body).content);
+      return json({ id: `m${posted.length}` });
+    });
+    const long = "line\n".repeat(500); // 2500 chars
+    const res = await exec("discord_post_message", { channel: "900000000000000101", text: long });
+    expect(posted).toHaveLength(2);
+    expect(posted[0].length).toBeLessThanOrEqual(2000);
+    expect(posted.join("\n").replace(/\n+/g, "\n")).toContain("line");
+    expect(res.data.messageId).toBe("m1");
+    expect(res.data.chunks).toBe(2);
+    expect(res.data.lastMessageId).toBe("m2");
+  });
+
+  it("discord_post_message posts into a thread when threadId is given", async () => {
+    await writeConnections(DISCORD_CONN);
+    mockFetch((url, init) => {
+      expect(url).toContain("/channels/900000000000000555/messages");
+      expect(JSON.parse(init.body).content).toBe("hi");
+      return json({ id: "m9" });
+    });
+    const res = await exec("discord_post_message", { threadId: "900000000000000555", text: "hi" });
+    expect(res.data.channel).toBe("900000000000000555");
+    expect(res.data.messageId).toBe("m9");
+  });
+
+  it("relays broker guild-scope rejections as PROVIDER_ERROR", async () => {
+    await writeConnections(DISCORD_CONN);
+    mockFetch(() => json({ error: { code: "CHANNEL_OUT_OF_SCOPE" } }, 403));
+    const res = await exec("discord_read_channel", { channel: "900000000000000999" });
+    expect(res.data.skipped).toBe(true);
+    expect(res.data.code).toBe("PROVIDER_ERROR");
+    expect(res.data.providerStatus).toBe(403);
+  });
+
+  it("returns NOT_CONNECTED when no discord credential is stored", async () => {
+    await writeConnections({});
+    const res = await exec("discord_list_channels", {});
+    expect(res.data.skipped).toBe(true);
+    expect(res.data.code).toBe("NOT_CONNECTED");
+    expect(res.data.connectionId).toBe("discord");
+  });
+});
+
+describe("MCP tool execution — Discord (standalone bot-token mode)", () => {
+  it("hits discord.com directly with the Bot token", async () => {
+    await writeConnections({
+      discord: { kind: "bot-token", botToken: "bot-secret", guildId: "900000000000000001", savedAt: "x" },
+    });
+    const fetchFn = mockFetch((url, init) => {
+      expect(url).toBe("https://discord.com/api/v10/guilds/900000000000000001/channels");
+      expect(init.headers.Authorization).toBe("Bot bot-secret");
+      return json(GUILD_CHANNELS);
+    });
+    const res = await exec("discord_list_channels", {});
+    expect(fetchFn).toHaveBeenCalled();
+    expect(res.data.count).toBe(2);
+  });
+});
+
 // Outbound file delivery to Slack moved off the runtime: files are attached via
 // the surface-agnostic attach_file tool (Phase 1-2) and reflected to Slack by
 // the dashboard mirror (Phase 3). The former slack_upload_file tool was

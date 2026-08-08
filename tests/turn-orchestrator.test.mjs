@@ -14,6 +14,7 @@ import {
   isToolRoundAllowed
 } from "../src/agent/turn-orchestrator.mjs";
 import { DEFAULT_SETTINGS } from "../src/config/default-settings.mjs";
+import { makeInvalidToolArgs } from "../src/providers/format/tool-args.mjs";
 
 const echoBin = fileURLToPath(new URL("./fixtures/cli-agent-echo.mjs", import.meta.url));
 
@@ -97,6 +98,53 @@ describe("turn orchestrator", () => {
       expect(completed).toHaveLength(1);
       expect(completed[0].ok, `tool failed: ${JSON.stringify(completed[0].result?.summary)}`).toBe(true);
       expect(completed[0].result?.data?.content ?? completed[0].result?.data?.text ?? "").toContain("hello");
+    } finally {
+      await session.cleanup();
+    }
+  });
+
+  it("item B: an invalid-args tool call executes as ok:false, but is recorded/emitted with sanitized {} args", async () => {
+    const session = await makeSession(); // real executeSingleToolCall chain → validateToolArgs runs
+    try {
+      const scheduled = [];
+      const completedEvents = [];
+      const toolResultEvents = [];
+      session.events.on("tool.call.scheduled", (e) => scheduled.push(e));
+      session.events.on("assistant.message.completed", (e) => completedEvents.push(e));
+      session.events.on("tool.call.completed", (e) => toolResultEvents.push(e));
+
+      // The marker is a live object reference shared with the toolCall used for
+      // execution; sanitizing the RECORD copies must not disturb it.
+      const marker = makeInvalidToolArgs({ truncated: true });
+      const toolResults = await executeToolsRound({
+        session,
+        round: 1,
+        toolCalls: [{ id: "call-bad", name: "write_file", args: marker }],
+        response: { usage: { inputTokens: 1, outputTokens: 1 } }
+      });
+
+      // (a) execution still saw the marker → clear ok:false result.
+      expect(toolResults).toHaveLength(1);
+      expect(toolResults[0].ok).toBe(false);
+      expect(toolResults[0].error).toMatch(/write_file could not run because its arguments were truncated/);
+      expect(toolResultEvents[0].ok).toBe(false);
+
+      // (b) the persisted assistant message records sanitized {} args — no marker.
+      const assistantMsg = session.messages.find((m) => m.role === "assistant");
+      const toolUse = assistantMsg.content.find((b) => b.kind === "tool_use");
+      expect(toolUse.args).toEqual({});
+      expect(JSON.stringify(session.messages)).not.toContain("__procwayInvalidToolArgs");
+
+      // (c) the emitted events carry sanitized args too — the marker never reaches the UI.
+      expect(scheduled[0].args).toEqual({});
+      const emittedToolUse = completedEvents[0].content.find((b) => b.kind === "tool_use");
+      expect(emittedToolUse.args).toEqual({});
+      expect(completedEvents[0].toolCalls[0].args).toEqual({});
+
+      // (d) the paired ok:false tool_result is recorded alongside → model recovers next round.
+      const toolMsg = session.messages.find((m) => m.role === "tool");
+      const toolResultBlock = toolMsg.content.find((b) => b.kind === "tool_result");
+      expect(toolResultBlock.ok).toBe(false);
     } finally {
       await session.cleanup();
     }
@@ -532,10 +580,147 @@ describe("turn orchestrator", () => {
       expect(session.messages).toHaveLength(2);
       expect(session.messages[0].role).toBe("assistant");
       expect(session.messages[1].role).toBe("user");
-      expect(session.messages[1].content[0].text).toContain("Call write_file or apply_patch now");
+      expect(session.messages[1].content[0].text).toContain("Call write_file, apply_patch, or Edit now");
       expect(promptEvents).toHaveLength(1);
     } finally {
       await session.cleanup();
+    }
+  });
+
+  it("fix 3: stops the file-mutation retry loop when the same tool keeps failing identically", async () => {
+    const session = await makeSession();
+    try {
+      const pushWriteFailure = () => session.messages.push({
+        role: "tool",
+        content: [{
+          kind: "tool_result",
+          ok: false,
+          result: { summary: "Error", data: { tool: "write_file", error: 'write_file requires "filePath" (string) but it was missing' } }
+        }]
+      });
+
+      const response = { message: { role: "assistant", content: "I'll write it." }, toolCalls: [], usage: { inputTokens: 0, outputTokens: 0 } };
+      const call = () => handleModelResponseWithoutTools({ session, response, needsFileMutation: true, turnStartIndex: 0, round: 3 });
+
+      // Round A: a deterministic write_file failure this turn, then the model
+      // ends without a successful write → first encounter injects the nudge.
+      pushWriteFailure();
+      expect((await call()).action).toBe("continue");
+      // Round C: the model retried write_file after the nudge and it failed the
+      // SAME way (a NEW failure recorded AFTER the injected retry prompt)...
+      pushWriteFailure();
+      // ...so the next text-only encounter aborts the loop.
+      const stopped = await call();
+      expect(stopped.action).toBe("stop");
+      expect(stopped.response.error.code).toBe("file_mutation_retry_exhausted");
+      expect(stopped.response.error.message).toContain("kept failing the same way");
+    } finally {
+      await session.cleanup();
+    }
+  });
+
+  it("fix 3: does NOT abort on a stale/unrelated failure across consecutive text-only rounds", async () => {
+    const session = await makeSession();
+    try {
+      // An unrelated, OLD failure (read_file — not a file-writing tool) recorded
+      // once at the top of the turn. The model then never actually attempts a
+      // write, ending two consecutive rounds with plain text. The stale-signature
+      // bug re-detected this old failure each round and aborted after a single
+      // nudge with a bogus reason ("read_file:..."). It must not: with no NEW
+      // write failure since the nudge, the loop is bounded only by the count cap.
+      session.messages.push({
+        role: "tool",
+        content: [{
+          kind: "tool_result",
+          ok: false,
+          result: { summary: "Error", data: { tool: "read_file", error: "ENOENT: missing.txt" } }
+        }]
+      });
+
+      const response = { message: { role: "assistant", content: "Let me think about the file." }, toolCalls: [], usage: { inputTokens: 0, outputTokens: 0 } };
+      const call = () => handleModelResponseWithoutTools({ session, response, needsFileMutation: true, turnStartIndex: 0, round: 3 });
+
+      // First three encounters keep nudging (no repeated write failure to bail on)...
+      expect((await call()).action).toBe("continue");
+      expect((await call()).action).toBe("continue");
+      expect((await call()).action).toBe("continue");
+      // ...and only the independent count cap ends it — never the same-failure path.
+      const stopped = await call();
+      expect(stopped.action).toBe("stop");
+      expect(stopped.response.error.message).not.toContain("read_file");
+      expect(stopped.response.error.message).toContain(`after ${3} attempts`);
+    } finally {
+      await session.cleanup();
+    }
+  });
+
+  it("fix 3: caps the file-mutation retry loop at an independent low limit", async () => {
+    const session = await makeSession();
+    try {
+      const response = { message: { role: "assistant", content: "I'll write it." }, toolCalls: [], usage: { inputTokens: 0, outputTokens: 0 } };
+      const call = () => handleModelResponseWithoutTools({ session, response, needsFileMutation: true, turnStartIndex: 0, round: 3 });
+
+      // No recorded tool failure → distinct (null) signatures, so the loop is
+      // bounded by the count cap (3) rather than the repeat detector.
+      expect((await call()).action).toBe("continue");
+      expect((await call()).action).toBe("continue");
+      expect((await call()).action).toBe("continue");
+      const stopped = await call();
+      expect(stopped.action).toBe("stop");
+      expect(stopped.response.error.code).toBe("file_mutation_retry_exhausted");
+    } finally {
+      await session.cleanup();
+    }
+  });
+
+  it("fix 3: a stop outcome ends runTurn normally — turn.failed emitted and runningTurn cleared", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "procway-code-stop-"));
+    try {
+      const events = new EventBus();
+      const failed = [];
+      events.on("turn.failed", (e) => failed.push(e));
+      const session = new AgentSession({
+        settings: {
+          defaultProvider: "scripted",
+          defaultModel: "m",
+          approvalMode: "auto",
+          tools: { maxToolRounds: 150, maxParallelTools: 1 },
+          providers: { scripted: { type: "openai-compatible" } },
+          session: { enabled: false },
+          agents: {}
+        },
+        cwd,
+        sessionId: "s-stop",
+        events
+      });
+      await session.initialize();
+
+      // Scripted model: every round the model claims it will write a file but
+      // emits a write_file call with NO filePath (truncated-args shape) — which
+      // registry validation fails identically each round. The prompt requests a
+      // file mutation, so the retry loop engages; the same-failure detector must
+      // abort it and end the turn cleanly.
+      let n = 0;
+      const runProviderImpl = async () => {
+        n += 1;
+        // Alternate: tool-call round (fails), then a no-tools text round that
+        // triggers handleModelResponseWithoutTools's retry decision.
+        if (n % 2 === 1) {
+          return { message: { role: "assistant" }, toolCalls: [{ id: `c${n}`, name: "write_file", args: { content: "x" } }], usage: {} };
+        }
+        return { message: { role: "assistant", content: "I'll create plan.md now." }, toolCalls: [], usage: {} };
+      };
+
+      const result = await session.runTurn("Please create plan.md with the outline.", { runProviderImpl });
+
+      expect(result.error.code).toBe("file_mutation_retry_exhausted");
+      expect(session.runningTurn).toBe(false);
+      expect(failed).toHaveLength(1);
+      expect(failed[0].error.code).toBe("file_mutation_retry_exhausted");
+      // Bounded well below maxToolRounds (150).
+      expect(n).toBeLessThan(12);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 

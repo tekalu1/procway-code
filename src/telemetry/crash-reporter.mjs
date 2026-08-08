@@ -16,15 +16,21 @@
 
 const CRASH_MARKER = '__procway_crash__'
 
-/** Emit one structured crash line the dashboard relay recognises by marker. */
-function emitCrash(kind, err) {
+/**
+ * Emit one structured crash line the dashboard relay recognises by marker.
+ *
+ * `includeStack: false` (interactive TUI) keeps the marker line — the relay
+ * contract in docs/host-contract.md only requires the marker + message — but
+ * drops the stack so a raw Node trace never lands in the user's terminal.
+ */
+function emitCrash(kind, err, { includeStack = true } = {}) {
   const payload = {
     [CRASH_MARKER]: true,
     level: 'fatal',
     app: 'ai-agent',
     kind,
     message: err && err.message ? String(err.message) : String(err),
-    stack: err && err.stack ? String(err.stack) : null,
+    stack: includeStack && err && err.stack ? String(err.stack) : null,
     session_id: process.env.PROCWAY_SESSION_ID || null,
     ts: new Date().toISOString(),
   }
@@ -40,19 +46,23 @@ let installed = false
 /**
  * Install process-level handlers for fatal errors. Idempotent. Re-throws after
  * emitting so the existing exit path (non-zero exit code) is preserved.
+ *
+ * @param {{ includeStack?: boolean }} [options] `includeStack: false` for the
+ *   interactive TUI — the marker line stays (dashboard relay contract) but the
+ *   stack is omitted so users never see a raw Node trace.
  */
-export function installCrashHandlers() {
+export function installCrashHandlers({ includeStack = true } = {}) {
   if (installed) return
   installed = true
 
   process.on('uncaughtException', (err) => {
-    emitCrash('uncaughtException', err)
+    emitCrash('uncaughtException', err, { includeStack })
     // Preserve fail-loud: a corrupted process should exit, not limp on.
     process.exitCode = 1
   })
 
   process.on('unhandledRejection', (reason) => {
-    emitCrash('unhandledRejection', reason instanceof Error ? reason : new Error(String(reason)))
+    emitCrash('unhandledRejection', reason instanceof Error ? reason : new Error(String(reason)), { includeStack })
   })
 }
 

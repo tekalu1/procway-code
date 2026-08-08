@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,36 @@ export function getUserSecretsPath(homeDir = os.homedir()) {
 
 export function getWorkspaceSecretsPath(workspaceDir) {
   return path.join(workspaceDir, ".procway", "ai-agent", "secrets.json");
+}
+
+export function getSecretsPath({ cwd = process.cwd(), homeDir = os.homedir(), scope = "user" } = {}) {
+  if (scope === "user") return getUserSecretsPath(homeDir);
+  if (scope === "workspace") return getWorkspaceSecretsPath(path.resolve(cwd));
+  throw new Error("secrets scope must be user or workspace");
+}
+
+export async function setSecret({ cwd = process.cwd(), homeDir = os.homedir(), scope = "user", key, value }) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key ?? "")) {
+    throw new Error("secret name must be a valid environment variable name");
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("secret value must not be empty");
+  }
+
+  const filePath = getSecretsPath({ cwd, homeDir, scope });
+  const current = await readSecretsFile(filePath, (_file, error) => { throw error; });
+  const next = { ...current, [key]: value };
+  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  await writeFile(tempPath, JSON.stringify(next, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  await rename(tempPath, filePath);
+  await chmod(filePath, 0o600);
+  return { path: filePath, scope, key, stored: true };
+}
+
+export async function setWorkspaceSecret({ cwd = process.cwd(), key, value }) {
+  const { scope: _scope, ...result } = await setSecret({ cwd, scope: "workspace", key, value });
+  return result;
 }
 
 function sanitize(parsed) {

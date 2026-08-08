@@ -21,16 +21,21 @@ const SERVER_NAME = "procway";
 /**
  * @param {object} opts
  * @param {"codex"|"claude"} opts.provider — sub-CLI flavor
- * @param {string} opts.repoRoot — absolute path of the procway repo root
+ * @param {string} [opts.repoRoot] — absolute path of the procway repo root
  *   (the dir containing `ai-agent/`, `dashboard/`, etc.). The host CLI is at
- *   `${repoRoot}/${HOST_CLI_REL}`.
+ *   `${repoRoot}/${HOST_CLI_REL}`. Only used when `hostCli` is omitted.
+ * @param {string} [opts.hostCli] — absolute path of the MCP host CLI. Prefer
+ *   this: `repoRoot` bakes in the monorepo layout, which does not exist once
+ *   the package is installed from npm (the package root is
+ *   `node_modules/procway-code`, not `<repo>/ai-agent`). Callers inside the
+ *   package resolve `src/mcp/host/cli.mjs` from their own module URL instead.
  * @param {string} opts.cwd — workspace dir to pass to the host child
  * @param {boolean} [opts.disallowBuiltinMutations] — when true, append flags
  *   that block sub-CLI built-in writes/shell so MCP becomes the only path.
  *   Default: true.
  */
-export function buildMcpInjection({ provider, repoRoot, cwd, disallowBuiltinMutations = true }) {
-  const hostCli = path.resolve(repoRoot, HOST_CLI_REL);
+export function buildMcpInjection({ provider, repoRoot, hostCli: hostCliOverride, cwd, disallowBuiltinMutations = true }) {
+  const hostCli = hostCliOverride ?? path.resolve(repoRoot, HOST_CLI_REL);
   if (provider === "codex") {
     return buildForCodex({ hostCli, cwd, disallowBuiltinMutations });
   }

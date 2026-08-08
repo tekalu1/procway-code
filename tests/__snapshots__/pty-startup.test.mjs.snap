@@ -1,0 +1,31 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`pty: startup > falls back to 80 columns in a pty that reports columns === 0 1`] = `
+"[paste-on][accent]╭─[/color][accentStrong][bold] procway-code [/intensity][/color][accent]───────────────────────────────────────────────────────────────╮[/color]
+[accent]│[/color][muted] workspace  [/color]<workspace-row>
+[accent]│[/color][muted] model      [/color]openai-main:gpt-test                                              [accent]│[/color]
+[accent]│[/color][muted] approval   [/color]auto-readonly                                                     [accent]│[/color]
+[accent]│[/color][muted] session    [/color]<session-id>                                          [accent]│[/color]
+[accent]╰──────────────────────────────────────────────────────────────────────────────╯[/color]
+[success][bold]Tip[/intensity][/color] [accentStrong]/help[/color] commands  [accentStrong]/config setup[/color] provider  [accentStrong]Ctrl+J[/color] newline  [accentStrong]Ctrl+C[/color] interrupt
+[muted]<n> tools unavailable here: <names> — /status for why[/color]
+
+[CR][erase-below][accent]╭─[/color] [bold]workspace[/intensity][muted] · [/color][muted]openai-main:gpt-test[/color][muted] · [/color][muted]auto-readonly[/color][CR]
+[accentStrong][bold]╰─❯[/intensity][/color] [CR][csi:4C][CR]
+[paste-off][CR][clear-line]"
+`;
+
+exports[`pty: startup > paints the banner, the tip line and the unavailable-tools note 1`] = `
+"[paste-on][accent]╭─[/color][accentStrong][bold] procway-code [/intensity][/color][accent]───────────────────────────────────────────────────────────────╮[/color]
+[accent]│[/color][muted] workspace  [/color]<workspace-row>
+[accent]│[/color][muted] model      [/color]openai-main:gpt-test                                              [accent]│[/color]
+[accent]│[/color][muted] approval   [/color]auto-readonly                                                     [accent]│[/color]
+[accent]│[/color][muted] session    [/color]<session-id>                                          [accent]│[/color]
+[accent]╰──────────────────────────────────────────────────────────────────────────────╯[/color]
+[success][bold]Tip[/intensity][/color] [accentStrong]/help[/color] commands  [accentStrong]/config setup[/color] provider  [accentStrong]Ctrl+J[/color] newline  [accentStrong]Ctrl+C[/color] interrupt
+[muted]<n> tools unavailable here: <names> — /status for why[/color]
+
+[CR][erase-below][accent]╭─[/color] [bold]workspace[/intensity][muted] · [/color][muted]openai-main:gpt-test[/color][muted] · [/color][muted]auto-readonly[/color][CR]
+[accentStrong][bold]╰─❯[/intensity][/color] [CR][csi:4C][CR]
+[paste-off][CR][clear-line]"
+`;

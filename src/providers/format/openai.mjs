@@ -12,6 +12,7 @@
  * fully migrated.
  */
 import { isInlineImageBlock, imageBlockToDataUrl } from "../image-hydration.mjs";
+import { parseToolArgs, stripInvalidToolArgs } from "./tool-args.mjs";
 
 /**
  * Convert internal Message[] (or legacy raw messages) into the OpenAI
@@ -189,9 +190,12 @@ function toOpenAiMessage(message, opts = {}) {
           type: "function",
           function: {
             name: toolUse.name,
+            // Never re-send the invalid-args marker (e.g. from parseToolArgs on
+            // broken legacy `arguments`, or a pre-fix persisted session) — record
+            // it as an empty object so the model sees `{}` + the ok:false result.
             arguments: typeof toolUse.arguments === "string"
               ? toolUse.arguments
-              : JSON.stringify(toolUse.args ?? toolUse.arguments ?? {})
+              : JSON.stringify(stripInvalidToolArgs(toolUse.args ?? toolUse.arguments ?? {}))
           }
         })),
         ...(reasoning ? { reasoning_content: reasoning } : {})
@@ -240,34 +244,35 @@ function toOpenAiImagePart(block) {
  * canonical `{ id, name, args }` shape used internally.
  *
  * @param {object} toolCall
+ * @param {{ truncated?: boolean }} [opts] `truncated` when the response
+ *   finished on `length` (max output tokens), so unparseable args are the
+ *   likely victim of a cut-off.
  * @returns {{ id: string, name: string, args: object } | null}
  */
-export function fromOpenAiToolCall(toolCall) {
+export function fromOpenAiToolCall(toolCall, { truncated = false } = {}) {
   if (!toolCall || typeof toolCall !== "object") return null;
-  const rawArgs = toolCall.function?.arguments ?? "{}";
-  let args;
-  try {
-    args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
-  } catch {
-    args = {};
-  }
   const id = toolCall.id;
   const name = toolCall.function?.name;
   if (!id || !name) return null;
-  return { id, name, args };
+  // parseToolArgs handles all cases: "" / undefined → {} (a no-arg call),
+  // valid JSON → object, unparseable → invalid-args marker. An empty-string
+  // arguments (how the streaming aggregator initializes a no-arg call) must NOT
+  // be flagged invalid — only genuinely malformed/truncated JSON is.
+  return { id, name, args: parseToolArgs(toolCall.function?.arguments, { truncated }) };
 }
 
 /**
  * Normalize a list of OpenAI tool calls.
  *
  * @param {Array<object> | null | undefined} toolCalls
+ * @param {{ truncated?: boolean }} [opts]
  * @returns {Array<{ id: string, name: string, args: object }>}
  */
-export function normalizeOpenAiToolCalls(toolCalls) {
+export function normalizeOpenAiToolCalls(toolCalls, { truncated = false } = {}) {
   if (!Array.isArray(toolCalls)) return [];
   const out = [];
   for (const toolCall of toolCalls) {
-    const normalized = fromOpenAiToolCall(toolCall);
+    const normalized = fromOpenAiToolCall(toolCall, { truncated });
     if (normalized) out.push(normalized);
   }
   return out;

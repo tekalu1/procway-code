@@ -73,7 +73,7 @@ export { summarizeUsage, createUsageTracker } from "../usage-tracker.mjs";
  *
  * Headless usage:
  * ```js
- * import { createAgentSession } from "procway-code/core";
+ * import { createAgentSession } from "procway-code";
  * const session = await createAgentSession({ settings, cwd, sessionId });
  * await session.runTurn("hello");
  * ```

@@ -284,7 +284,7 @@ async function selectDroppedImageRefs(messages, { cwd, stat, maxTotalBytes }) {
   for (let i = refs.length - 1; i >= 0; i -= 1) {
     const ref = refs[i];
     const resolved = path.isAbsolute(ref.path) ? ref.path : path.resolve(cwd, ref.path);
-    let size = 0;
+    let size;
     try { size = (await stat(resolved)).size; } catch { size = 0; }
     // Always keep at least the single newest image, even if it alone exceeds
     // the budget — dropping the very thing the model just asked to look at is

@@ -51,11 +51,11 @@ async function main() {
   const fsmod = await import("node:fs");
   const pathmod = await import("node:path");
   const logPath = pathmod.join(opts.cwd, ".procway", "mcp-host.log");
-  try { fsmod.mkdirSync(pathmod.dirname(logPath), { recursive: true }); } catch {}
+  try { fsmod.mkdirSync(pathmod.dirname(logPath), { recursive: true }); } catch { /* the log file is a diagnostic aid, never a hard requirement */ }
   const trace = (...m) => {
     const line = `[${new Date().toISOString()}] [procway-mcp-host] ${m.join(" ")}\n`;
     process.stderr.write(line);
-    try { fsmod.appendFileSync(logPath, line); } catch {}
+    try { fsmod.appendFileSync(logPath, line); } catch { /* stderr above already carried the line */ }
   };
   trace("starting", "cwd=" + opts.cwd, "prefix=" + opts.prefix, "pid=" + process.pid);
 

@@ -16,9 +16,10 @@ function makeFakeDriver(opts = {}) {
   let cbs = null;
   const driver = {
     kind: "fake",
-    start(spec, { onEvent, onYield }) {
+    start(spec, { onEvent, onYield, signal }) {
       calls.start += 1;
       calls.spec = spec;
+      calls.signal = signal;
       cbs = { onEvent, onYield };
       if (opts.throwOnStart) throw new Error("driver boom");
       if (opts.autoYield) onYield(opts.autoYield);
@@ -151,6 +152,49 @@ describe("DelegatedJobRegistry", () => {
     expect(res).toEqual({ killed: true });
   });
 
+  it("spawnJob hands the driver a live (unfired) AbortSignal", () => {
+    const reg = new DelegatedJobRegistry();
+    const fake = makeFakeDriver();
+    reg.spawnJob({ kind: "fake", spec: {}, driver: fake.driver });
+    expect(fake.calls.signal).toBeInstanceOf(AbortSignal);
+    expect(fake.calls.signal.aborted).toBe(false);
+  });
+
+  it("abortJob (#136) fires the job's AbortSignal and calls driver.kill", () => {
+    const reg = new DelegatedJobRegistry();
+    const fake = makeFakeDriver();
+    const { jobId } = reg.spawnJob({ kind: "fake", spec: {}, driver: fake.driver });
+    let aborted = false;
+    fake.calls.signal.addEventListener("abort", () => { aborted = true; });
+    const res = reg.abortJob(jobId);
+    expect(aborted).toBe(true);
+    expect(fake.calls.signal.aborted).toBe(true);
+    expect(fake.calls.kill).toBe(1); // fallback for signal-agnostic drivers
+    expect(res).toEqual({ jobId, status: "running" }); // not force-settled
+  });
+
+  it("abortJob is idempotent and unknown-job safe", () => {
+    const reg = new DelegatedJobRegistry();
+    const fake = makeFakeDriver();
+    const { jobId } = reg.spawnJob({ kind: "fake", spec: {}, driver: fake.driver });
+    reg.abortJob(jobId);
+    reg.abortJob(jobId); // second abort must not throw
+    expect(fake.calls.signal.aborted).toBe(true);
+    expect(reg.abortJob("nope")).toBeNull();
+  });
+
+  it("listJobs returns every live job's state", () => {
+    const reg = new DelegatedJobRegistry();
+    const a = makeFakeDriver();
+    const b = makeFakeDriver();
+    const { jobId: idA } = reg.spawnJob({ kind: "fake", spec: {}, driver: a.driver, meta: { project: "p", ticket: "T1" } });
+    const { jobId: idB } = reg.spawnJob({ kind: "fake", spec: {}, driver: b.driver, meta: { project: "p", ticket: "T2" } });
+    const ids = reg.listJobs().map((j) => j.jobId).sort();
+    expect(ids).toEqual([idA, idB].sort());
+    const t2 = reg.listJobs().find((j) => j.meta?.ticket === "T2");
+    expect(t2.jobId).toBe(idB);
+  });
+
   it("a throwing driver.start settles the job as failed (no crash)", () => {
     const reg = new DelegatedJobRegistry();
     const fake = makeFakeDriver({ throwOnStart: true });
@@ -180,7 +224,7 @@ describe("DelegatedJobRegistry", () => {
   it("awaiting-input is NOT scheduled for eviction (resumable pause)", () => {
     let scheduled = 0;
     const reg = new DelegatedJobRegistry({
-      setTimeoutImpl: (fn) => { scheduled += 1; return { unref() {} }; },
+      setTimeoutImpl: (_fn) => { scheduled += 1; return { unref() {} }; },
       clearTimeoutImpl: () => {},
     });
     const fake = makeFakeDriver();

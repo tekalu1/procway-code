@@ -171,7 +171,7 @@ function compileRegex(pattern, { caseInsensitive }) {
   try {
     return new RegExp(pattern, flags);
   } catch (error) {
-    throw new TypeError(`Grep: invalid regex /${pattern}/: ${error.message}`);
+    throw new TypeError(`Grep: invalid regex /${pattern}/: ${error.message}`, { cause: error });
   }
 }
 

@@ -57,7 +57,7 @@ export class IntegrationApiError extends Error {
  * Returns the absolute path even when the file doesn't exist — the
  * caller checks readability separately.
  */
-function resolveConnectionsPath(cwd) {
+export function resolveConnectionsPath(cwd) {
   const envUri = process.env.PROCWAY_WORKSPACE_URI?.trim();
   if (envUri) {
     const dir = parseLocalUri(envUri);
@@ -99,7 +99,7 @@ function parseLocalUri(uri) {
  * writes this file with chmod 600; ai-agent runs as the same user
  * inside the runtime container so the read permission carries over.
  */
-async function readConnectionsFile(cwd) {
+export async function readConnectionsFile(cwd) {
   const path = resolveConnectionsPath(cwd);
   try {
     const raw = await readFile(path, "utf8");
@@ -124,6 +124,7 @@ export async function resolveAuthForConnection(cwd, id) {
     case "jira": return buildJiraAuth(stored);
     case "confluence": return buildConfluenceAuth(stored);
     case "slack": return buildSlackAuth(stored);
+    case "discord": return buildDiscordAuth(stored);
     default:
       throw new Error(`Integration auth not implemented for "${id}"`);
   }
@@ -236,6 +237,59 @@ function buildSlackAuth(stored) {
   };
 }
 
+function buildDiscordAuth(stored) {
+  // Two modes (ADR 0031 §D2):
+  //
+  // `bot-install` — the procway-managed shape. Discord's bot token is
+  // application-global (it would open every tenant's guild), so the
+  // dashboard never mirrors it into the workspace snapshot; the payload
+  // carries only the guild binding. Calls go to the dashboard's
+  // guild-scope broker, authenticated with the same session-scoped
+  // PROCWAY_PROXY_TOKEN the LLM proxy uses. The broker URL is derived
+  // from PROCWAY_DASHBOARD_URL (in-cluster service — reachable with a
+  // PLAIN fetch, not the egress proxy, same as attach-file/run-control),
+  // hence `directFetch`.
+  //
+  // `bot-token` — standalone procway-code escape hatch: a self-hosted
+  // single-tenant user writes their own app's bot token into
+  // .procway-connections.json by hand and we hit discord.com directly.
+  if (stored.kind === "bot-install") {
+    const dashboardUrl = process.env.PROCWAY_DASHBOARD_URL?.trim();
+    if (!dashboardUrl) {
+      throw new Error(
+        "Discord (bot-install) requires PROCWAY_DASHBOARD_URL to reach the dashboard broker. "
+        + "For standalone use, store a `bot-token` credential in .procway-connections.json instead."
+      );
+    }
+    const proxyToken = process.env.PROCWAY_PROXY_TOKEN?.trim();
+    return {
+      baseUrl: `${dashboardUrl.replace(/\/+$/, "")}/api/integrations/discord`,
+      headers: {
+        ...(proxyToken ? { Authorization: `Bearer ${proxyToken}` } : {}),
+        Accept: "application/json",
+        "User-Agent": UA
+      },
+      directFetch: true,
+      meta: { kind: stored.kind, mode: "broker", guildId: stored.guildId, guildName: stored.guildName, botUserId: stored.botUserId }
+    };
+  }
+  if (stored.kind === "bot-token") {
+    if (!stored.botToken || !stored.guildId) {
+      throw new Error("Discord bot-token credential needs botToken and guildId.");
+    }
+    return {
+      baseUrl: "https://discord.com/api/v10",
+      headers: {
+        Authorization: `Bot ${stored.botToken}`,
+        Accept: "application/json",
+        "User-Agent": UA
+      },
+      meta: { kind: stored.kind, mode: "direct", guildId: stored.guildId, guildName: stored.guildName ?? null, botUserId: stored.botUserId ?? null }
+    };
+  }
+  throw new Error(`Unsupported Discord credential kind: ${stored.kind}`);
+}
+
 function buildUrl(base, path, query) {
   const sep = path.startsWith("/") ? "" : "/";
   let url = `${base}${sep}${path}`;
@@ -266,7 +320,9 @@ export async function callApi({ cwd, id, method = "GET", path, query, body, fetc
   }
   // Proxy-aware default: api.atlassian.com etc. are only reachable through
   // the egress proxy inside the session Pod (see safety/proxy-fetch.mjs).
-  const fetcher = fetchImpl ?? getProxyAwareFetch();
+  // `directFetch` auths (the Discord broker) target the dashboard's
+  // in-cluster service instead — that hop must NOT ride the egress proxy.
+  const fetcher = fetchImpl ?? (auth.directFetch ? fetch : getProxyAwareFetch());
   const res = await fetcher(url, { method, headers, body: serialized });
   if (!res.ok) {
     const text = await res.text().catch(() => "");

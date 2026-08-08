@@ -1,4 +1,10 @@
-import { renderMarkdown } from "./markdown-render.mjs";
+import {
+  renderMarkdown,
+  renderMarkdownBlocks,
+  splitReadyBlocks,
+  trimTrailingNewlines
+} from "./markdown-render.mjs";
+import { supportsColor, terminalWidth } from "./ansi.mjs";
 
 /**
  * StreamingRenderer — accumulates `assistant.message.delta` chunks and writes
@@ -7,39 +13,70 @@ import { renderMarkdown } from "./markdown-render.mjs";
  * key invariant that prevents the spinner/streaming race that caused
  * hotfix 294f143.
  *
- * Phase 5 §2.4: code-block ranges are buffered until the closing fence is
- * seen, since rendering a half-finished ``` block would emit truncated ANSI
- * colour runs.
+ * ## Live output === replayed output (Phase 3c)
+ *
+ * The renderer used to cut its buffer at the last newline and hand each
+ * fragment to `renderMarkdown()`. That function renders a *whole document*
+ * (it emits block separators and the trailing blank of the phantom final
+ * line), so every fragment added blank lines: a heading + a two-item list
+ * streamed with one blank line per chunk boundary, while the same message
+ * replayed by `procway-code resume` had none. Same text, two renderings.
+ *
+ * Now the split happens on *block* boundaries (`splitReadyBlocks`) and the
+ * blocks are rendered with `renderMarkdownBlocks` — the very function
+ * `renderMarkdown` is built from. Because blocks render independently,
+ * emitting a prefix now and the rest later is byte-identical to one shot, so
+ * for any chunking of any message:
+ *
+ *   live output === trimTrailingNewlines(renderMarkdown(fullText)) + "\n\n"
+ *
+ * and the right-hand side is exactly what `renderTranscriptNode` writes for
+ * the `assistant` node on every replay route (plus its "Assistant:" label).
+ * The trailing "\n\n" is the one blank line that separates the message from
+ * the next prompt — the same separator the transcript uses between nodes.
+ *
+ * A consequence worth stating: a block only reaches the screen once it cannot
+ * change any more. Paragraphs, tables, quotes and open ``` fences therefore
+ * wait for the line that closes them (that last one is the Phase 5 §2.4 rule:
+ * rendering a half-finished fence emits truncated ANSI runs). Headings,
+ * rules, closed fences and *individual list items* flush immediately, so the
+ * perceived latency is unchanged from the old newline-cut behaviour — model
+ * output arrives one line at a time anyway.
  *
  * Usage:
  *   const renderer = createStreamingRenderer({ writer: process.stdout, width });
  *   renderer.attach(events);
  *   ... session.runTurn(...)
  *   renderer.detach();
- *
- * The renderer is also a no-op when `writer.isTTY === false` and
- * `colorize !== true`, which keeps headless / CI runs clean.
  */
 export function createStreamingRenderer({
   writer = process.stdout,
-  width = writer?.columns ?? 80,
-  colorize = writer?.isTTY === true
+  width = terminalWidth(writer),
+  // P1-3: one colour decision for the whole TUI. `supportsColor` folds in
+  // NO_COLOR / FORCE_COLOR / TERM=dumb on top of the isTTY check.
+  colorize = supportsColor(writer),
+  // P3d-3: OSC 8 links. Resolved once by the caller (`resolveHyperlinks`) and
+  // handed to BOTH the live and the replay renderer — deciding per-renderer
+  // would break the byte-for-byte parity asserted below.
+  hyperlinks = false
 } = {}) {
-  return new StreamingRenderer({ writer, width, colorize });
+  return new StreamingRenderer({ writer, width, colorize, hyperlinks });
 }
 
 export class StreamingRenderer {
-  constructor({ writer, width, colorize }) {
+  constructor({ writer, width, colorize, hyperlinks = false }) {
     this.writer = writer;
     this.width = width;
     this.colorize = colorize;
+    this.hyperlinks = hyperlinks;
     this.bus = null;
     this.subscriptions = [];
     this.buffer = "";
-    this.codeBlockOpen = false;
     this.streaming = false;
     this.firstWrite = true;
     this.producedOutput = false;
+    /** Did this message already put a rendered block on screen? */
+    this.wroteBody = false;
   }
 
   attach(bus) {
@@ -63,6 +100,13 @@ export class StreamingRenderer {
   subscribe(type, handler) {
     this.bus.on(type, handler);
     this.subscriptions.push({ type, handler });
+  }
+
+  /** SIGWINCH (P3b-11): reflow the Markdown at the new terminal width. */
+  setWidth(width) {
+    const next = Number(width);
+    if (Number.isFinite(next) && next > 0) this.width = next;
+    return this.width;
   }
 
   isStreaming() {
@@ -90,17 +134,35 @@ export class StreamingRenderer {
     this.#flushReadyBlocks();
   }
 
+  /**
+   * End of message. Whatever is left in the buffer is a complete document
+   * tail, so it goes through `renderMarkdown` — and its trailing blank line
+   * is trimmed, because the replayed transcript node is trimmed too. The one
+   * remaining "\n" is the blank line before the next prompt.
+   */
   #onCompleted() {
     if (!this.streaming) return;
-    this.#flushReadyBlocks({ final: true });
-    if (this.buffer.length > 0) {
-      this.#writeRendered(this.buffer);
-      this.buffer = "";
+    this.#flushReadyBlocks();
+    const tail = trimTrailingNewlines(
+      renderMarkdown(this.buffer, {
+        width: this.width,
+        color: this.colorize,
+        hyperlinks: this.hyperlinks
+      })
+    );
+    this.buffer = "";
+    if (tail.length > 0) {
+      this.producedOutput = true;
+      this.wroteBody = true;
+      this.writer.write(`${tail}\n`);
     }
-    if (this.streaming) this.writer.write("\n");
+    // A message that rendered to nothing at all (whitespace only) still owes
+    // the "block end" newline, or the invariant above would not hold for it.
+    if (!this.wroteBody) this.writer.write("\n");
+    this.writer.write("\n");
     this.streaming = false;
     this.firstWrite = true;
-    this.codeBlockOpen = false;
+    this.wroteBody = false;
   }
 
   #onTurnEnd() {
@@ -111,74 +173,19 @@ export class StreamingRenderer {
     }
   }
 
-  /**
-   * Drain whole "renderable units" out of `this.buffer`:
-   *
-   * - When we are NOT inside a code block: every fully-terminated newline
-   *   chunk before an unclosed ``` is rendered immediately.
-   * - When we hit ```: stop flushing, mark `codeBlockOpen` and wait for the
-   *   matching fence. On close, render the whole code block at once.
-   * - On `final: true` we render whatever remains.
-   */
-  #flushReadyBlocks({ final = false } = {}) {
-    while (this.buffer.length > 0) {
-      if (!this.codeBlockOpen) {
-        const fenceIndex = this.buffer.indexOf("```");
-        if (fenceIndex === -1) {
-          const lastNewline = this.buffer.lastIndexOf("\n");
-          if (lastNewline === -1) {
-            if (final) {
-              this.#writeRendered(this.buffer);
-              this.buffer = "";
-            }
-            return;
-          }
-          const head = this.buffer.slice(0, lastNewline + 1);
-          const tail = this.buffer.slice(lastNewline + 1);
-          this.#writeRendered(head);
-          this.buffer = tail;
-          if (!final) return;
-          if (this.buffer.length > 0) {
-            this.#writeRendered(this.buffer);
-            this.buffer = "";
-          }
-          return;
-        }
-        if (fenceIndex > 0) {
-          const head = this.buffer.slice(0, fenceIndex);
-          this.#writeRendered(head);
-          this.buffer = this.buffer.slice(fenceIndex);
-        }
-        this.codeBlockOpen = true;
-        continue;
-      }
-      // Inside a code block — look for the closing fence after the opener.
-      const closeIndex = this.buffer.indexOf("\n```", 3);
-      if (closeIndex === -1) {
-        if (final) {
-          this.#writeRendered(this.buffer);
-          this.buffer = "";
-          this.codeBlockOpen = false;
-        }
-        return;
-      }
-      const fenceEnd = this.buffer.indexOf("\n", closeIndex + 1);
-      const cutEnd = fenceEnd === -1 ? this.buffer.length : fenceEnd + 1;
-      const block = this.buffer.slice(0, cutEnd);
-      this.#writeRendered(block);
-      this.buffer = this.buffer.slice(cutEnd);
-      this.codeBlockOpen = false;
-    }
-  }
-
-  #writeRendered(chunk) {
-    if (!chunk) return;
+  /** Drain every block that can no longer change out of `this.buffer`. */
+  #flushReadyBlocks() {
+    const { blocks, rest } = splitReadyBlocks(this.buffer);
+    this.buffer = rest;
+    if (blocks.length === 0) return;
+    const rendered = renderMarkdownBlocks(blocks, {
+      width: this.width,
+      color: this.colorize,
+      hyperlinks: this.hyperlinks
+    });
+    if (rendered.length === 0) return;
     this.producedOutput = true;
-    if (!this.colorize) {
-      this.writer.write(chunk);
-      return;
-    }
-    const rendered = renderMarkdown(chunk, { width: this.width, color: true });
+    this.wroteBody = true;
     this.writer.write(rendered);
   }
 }

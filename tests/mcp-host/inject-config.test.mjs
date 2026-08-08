@@ -1,7 +1,6 @@
 import { describe, expect, it, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { buildMcpInjection } from "../../src/mcp/host/inject-config.mjs";
 
 const REPO_ROOT = "/fake/repo";

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { SLASH_COMMANDS, createSlashCompleter, describeCommand, formatMenu, findSkillMd, isBuiltinSlashCommand, slashCommandName } from "../src/adapters/tui/slash-completion.mjs";
+import { SLASH_COMMANDS, createSlashCompleter, describeCommand, formatMenu, formatSlashHelp, slashCommandNames, findSkillMd, isBuiltinSlashCommand, slashCommandName } from "../src/adapters/tui/slash-completion.mjs";
 
 describe("slash completion", () => {
   it("lists the canonical commands and includes Phase 7 additions", () => {
@@ -31,6 +31,25 @@ describe("slash completion", () => {
   it("describeCommand returns the entry by name", () => {
     expect(describeCommand("/plan")?.description).toMatch(/plan mode/i);
     expect(describeCommand("/missing")).toBeNull();
+  });
+
+  it("registers /help as a builtin command", () => {
+    expect(describeCommand("/help")?.description).toMatch(/slash command/i);
+    expect(isBuiltinSlashCommand("/help")).toBe(true);
+  });
+
+  it("slashCommandNames returns every command name from the single source", () => {
+    expect(slashCommandNames()).toEqual(SLASH_COMMANDS.map((entry) => entry.name));
+  });
+
+  it("formatSlashHelp lists every slash command with its description", () => {
+    const help = formatSlashHelp(undefined, { width: 200 });
+    for (const entry of SLASH_COMMANDS) {
+      expect(help).toContain(entry.name);
+      expect(help).toContain(entry.description);
+    }
+    // one row per command
+    expect(help.split("\n")).toHaveLength(SLASH_COMMANDS.length);
   });
 });
 

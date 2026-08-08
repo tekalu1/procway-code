@@ -1,25 +1,27 @@
-# Public CI for the procway-code repo — injected by scripts/publish-sync.mjs
-# (do not edit in the public repo; the next sync overwrites it).
+# Lint + tests + a secret scan, on every pull request and every push to main.
 #
-# procway-code is standalone: single-importer pnpm lockfile at the repo root,
-# runtime dependency = undici only. `pnpm install && pnpm test` is the whole story.
-name: ci
+# procway-code is a standalone repository: `pnpm-lock.yaml` sits at the root
+# with a single importer and `undici` as the only runtime dependency, so
+# `pnpm install --frozen-lockfile` resolves with no workspace context. Every
+# path below is repository-root relative for the same reason.
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch: {}
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # Secret scan over the checked-out tree. Pinned binary + checksum — needs no
-  # secrets, runs on a fresh public runner. Config: .gitleaks.toml (repo root,
-  # synced from the monorepo's ai-agent/.gitleaks.toml).
+  # secrets, runs on a fresh public runner. Config: .gitleaks.toml at the root.
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
@@ -35,21 +37,43 @@ jobs:
         run: /tmp/gitleaks dir . --config .gitleaks.toml --no-banner --redact --verbose
 
   test:
-    name: lint + vitest (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    name: lint + vitest (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        node: [20, 22]
+        os: [ubuntu-latest]
+        # `engines.node` is ">=20", so every supported major is exercised.
+        node: ["20", "22", "24"]
+        include:
+          # procway-code is a terminal program people also run on macOS, and
+          # several paths branch on the platform: the OS keychain, the ulimit
+          # sandbox prefix, and the iTerm2/WezTerm writers behind
+          # `/terminal-setup`. One macOS job covers them without tripling the
+          # bill. The pty scenarios skip there — they need util-linux
+          # `script(1)`, whose BSD namesake takes different arguments.
+          - os: macos-latest
+            node: "22"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        # Version comes from `packageManager` in package.json.
+        uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - name: Install pnpm
-        run: npm install -g pnpm@9.15.4 && pnpm --version
-      - name: Install deps
-        run: pnpm install --frozen-lockfile
-      - name: Lint
-        run: pnpm lint
-      - name: Tests
-        run: pnpm test
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm test
+
+      - name: Exports with no runtime caller (advisory)
+        # Report only, never fails the build: it exists so a reviewer can see
+        # in the log when something was exported, unit-tested, and then never
+        # called by the program — the way `renderToolCall` once was.
+        run: pnpm lint:exports

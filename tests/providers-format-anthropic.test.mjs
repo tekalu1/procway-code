@@ -6,8 +6,37 @@ import {
   toAnthropicTools
 } from "../src/providers/format/anthropic.mjs";
 import { createMessage } from "../src/core/types/message.mjs";
+import { makeInvalidToolArgs } from "../src/providers/format/tool-args.mjs";
 
 describe("providers/format/anthropic", () => {
+  it("item B: never re-sends an invalid-args marker as tool_use.input (strips it to {})", () => {
+    const sessionId = "s-marker";
+    // A tool_use block whose args still carry the marker (a pre-fix persisted
+    // session). The outgoing request must show `{}`, not the internal marker.
+    const { anthropicMessages } = toAnthropicMessages([
+      createMessage({
+        role: "assistant",
+        sessionId,
+        content: [{ kind: "tool_use", toolCallId: "tu-m", name: "write_file", args: makeInvalidToolArgs({ truncated: true }) }]
+      }),
+      createMessage({ role: "user", sessionId, content: [{ kind: "text", text: "continue" }] })
+    ]);
+    const toolUse = anthropicMessages[0].content[0];
+    expect(toolUse.type).toBe("tool_use");
+    expect(toolUse.input).toEqual({});
+    expect(JSON.stringify(anthropicMessages)).not.toContain("__procwayInvalidToolArgs");
+  });
+
+  it("item B: a broken legacy tool_calls arguments string (parseJsonArgs → marker) is stripped to {} on re-send", () => {
+    const { anthropicMessages } = toAnthropicMessages([
+      { role: "assistant", tool_calls: [{ id: "tc-legacy", function: { name: "write_file", arguments: "{\"filePath\":" } }] },
+      { role: "user", content: "continue" }
+    ]);
+    const toolUse = anthropicMessages[0].content[0];
+    expect(toolUse.type).toBe("tool_use");
+    expect(toolUse.input).toEqual({});
+    expect(JSON.stringify(anthropicMessages)).not.toContain("__procwayInvalidToolArgs");
+  });
   it("splits the system prompt and translates Message[] into Anthropic messages", () => {
     const sessionId = "s-1";
     const messages = [

@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { getShellProfile } from "../platform/shell-profile.mjs";
+import { SUPPORTS_PROCESS_GROUPS, killProcessTree } from "./process-tree.mjs";
 
 const RING_BUFFER_BYTES = 1024 * 1024;
 
@@ -60,11 +61,15 @@ export class ShellManager {
       throw new TypeError("ShellManager.start: command is required");
     }
     const profile = getShellProfile();
+    // detached: the bg shell leads its own process group, so kill()/closeAll()
+    // can take down the grandchildren too. Without it a `pnpm dev` (bash → node
+    // → nuxt) survived every SIGTERM we sent and kept the port bound.
     const child = this.spawnImpl(profile.shell, [...profile.args, command], {
       cwd: path.resolve(cwd),
       env: { ...env, ...(profile.env ?? {}) },
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      detached: SUPPORTS_PROCESS_GROUPS
     });
     const shellId = this.idFactory();
     const stdout = new RingBuffer();
@@ -76,6 +81,10 @@ export class ShellManager {
       label,
       pid: child.pid ?? null,
       child,
+      // Only signal a process GROUP for children we really spawned detached.
+      // An injected spawnImpl (tests) may hand back a stub whose `pid` belongs
+      // to nothing — `process.kill(-pid)` on that could hit an unrelated group.
+      detached: SUPPORTS_PROCESS_GROUPS && child instanceof ChildProcess,
       stdout,
       stderr,
       startedAt: this.now(),
@@ -158,7 +167,7 @@ export class ShellManager {
       return { shellId, killed: false, exitCode: entry.exitCode, alreadyExited: true };
     }
     try {
-      entry.child.kill(signal);
+      killProcessTree(entry.child, signal, { group: entry.detached });
     } catch (error) {
       entry.error = error?.message ?? String(error);
     }
@@ -166,7 +175,7 @@ export class ShellManager {
       await waitFor(() => entry.status === "exited", { timeoutMs: graceMs });
       if (entry.status !== "exited") {
         try {
-          entry.child.kill("SIGKILL");
+          killProcessTree(entry.child, "SIGKILL", { group: entry.detached });
         } catch (error) {
           entry.error = error?.message ?? String(error);
         }
@@ -195,7 +204,9 @@ export class ShellManager {
       const entry = this.shells.get(id);
       if (!entry || entry.status === "exited") continue;
       try {
-        entry.child.kill("SIGTERM");
+        // Group kill: the immediate bash child is rarely the thing holding the
+        // port / the pipes — its grandchildren are.
+        killProcessTree(entry.child, "SIGTERM", { group: entry.detached });
       } catch {
         // ignored
       }
@@ -209,7 +220,7 @@ export class ShellManager {
     for (const entry of this.shells.values()) {
       if (entry.status !== "exited") {
         try {
-          entry.child.kill("SIGKILL");
+          killProcessTree(entry.child, "SIGKILL", { group: entry.detached });
         } catch {
           // ignored
         }
@@ -228,11 +239,6 @@ let SHARED_INSTANCE = null;
 
 export function getSharedShellManager() {
   if (!SHARED_INSTANCE) SHARED_INSTANCE = new ShellManager();
-  return SHARED_INSTANCE;
-}
-
-export function resetSharedShellManagerForTests() {
-  SHARED_INSTANCE = new ShellManager();
   return SHARED_INSTANCE;
 }
 

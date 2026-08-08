@@ -6,8 +6,23 @@ import {
   toOpenAiMessages
 } from "../src/providers/format/openai.mjs";
 import { createMessage } from "../src/core/types/message.mjs";
+import { makeInvalidToolArgs } from "../src/providers/format/tool-args.mjs";
 
 describe("providers/format/openai", () => {
+  it("item B: never re-sends an invalid-args marker as tool_calls.arguments (strips it to {})", () => {
+    const sessionId = "s-marker";
+    const out = toOpenAiMessages([
+      createMessage({
+        role: "assistant",
+        sessionId,
+        content: [{ kind: "tool_use", toolCallId: "call-m", name: "write_file", args: makeInvalidToolArgs({ truncated: true }) }]
+      }),
+      createMessage({ role: "user", sessionId, content: [{ kind: "text", text: "continue" }] })
+    ]);
+    const assistant = out.find((m) => m.role === "assistant");
+    expect(assistant.tool_calls[0].function.arguments).toBe("{}");
+    expect(JSON.stringify(out)).not.toContain("__procwayInvalidToolArgs");
+  });
   it("converts internal Message[] into OpenAI request shape", () => {
     const sessionId = "s-1";
     const messages = [
@@ -211,7 +226,16 @@ describe("providers/format/openai", () => {
     expect(fromOpenAiToolCall({ id: "x" })).toBeNull();
   });
 
-  it("normalizes a list of tool calls", () => {
+  it("treats empty-string / missing arguments as {} (no-arg call), not invalid", () => {
+    // Regression: "" fell through `?? \"{}\"` and JSON.parse(\"\") threw, so a
+    // no-arg tool call was wrongly flagged invalid.
+    expect(fromOpenAiToolCall({ id: "e", function: { name: "list_files", arguments: "" } }))
+      .toEqual({ id: "e", name: "list_files", args: {} });
+    expect(fromOpenAiToolCall({ id: "m", function: { name: "list_files" } }))
+      .toEqual({ id: "m", name: "list_files", args: {} });
+  });
+
+  it("normalizes a list of tool calls, marking unparseable args instead of swallowing them", () => {
     const list = normalizeOpenAiToolCalls([
       { id: "a", function: { name: "list_files", arguments: "{}" } },
       { id: "b", function: { name: "read_file", arguments: "not-json" } },
@@ -219,8 +243,20 @@ describe("providers/format/openai", () => {
     ]);
     expect(list).toEqual([
       { id: "a", name: "list_files", args: {} },
-      { id: "b", name: "read_file", args: {} }
+      { id: "b", name: "read_file", args: { __procwayInvalidToolArgs: { reason: "parse_error", truncated: false } } }
     ]);
+  });
+
+  it("flags unparseable args as truncated when the response finished on length", () => {
+    const call = fromOpenAiToolCall(
+      { id: "c", function: { name: "write_file", arguments: "{\"filePath\":\"a.txt\",\"conte" } },
+      { truncated: true }
+    );
+    expect(call).toEqual({
+      id: "c",
+      name: "write_file",
+      args: { __procwayInvalidToolArgs: { reason: "parse_error", truncated: true } }
+    });
   });
 
   it("normalizes assorted assistant content shapes into text", () => {

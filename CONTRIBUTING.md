@@ -38,15 +38,23 @@ Requires Node.js >= 20 and pnpm (pinned via `packageManager` in
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm lint     # eslint over src/core
-pnpm test     # vitest
+pnpm lint          # eslint over src/ and tests/
+pnpm test          # vitest
+pnpm lint:exports  # advisory: exports with no runtime caller
 ```
 
-CI runs exactly these on Node 20 and 22 (see `.github/workflows/ci.yml`),
-plus a secret scan (gitleaks, config in `.gitleaks.toml`) — do not commit
-credentials, even fake-looking ones.
+CI runs these on Node 20, 22 and 24 plus one macOS job (see
+`.github/workflows/ci.yml`), along with a secret scan (gitleaks, config in
+`.gitleaks.toml`) — do not commit credentials, even fake-looking ones.
 
 Notes:
+
+- `tests/pty-*.test.mjs` drive the real CLI inside a pseudo-terminal to catch
+  the things a fake writer cannot: cursor arithmetic, box alignment, Ctrl+C /
+  Ctrl+D handling, and terminals that report a width of zero. They need
+  util-linux `script(1)` and skip themselves everywhere else (macOS included),
+  so run them on Linux before touching the terminal UI. Their snapshots are
+  ANSI-as-placeholders (`[bold]…[/intensity]`) and are meant to be read.
 
 - `src/auth/oauth/` is vendored from `@earendil-works/pi-ai` (MIT) — its
   `LICENSE.md` and file headers must not be modified or removed (see
@@ -59,6 +67,24 @@ Notes:
 - One logical change per PR; include tests for behavior changes.
 - `pnpm lint` and `pnpm test` pass locally.
 - Fill in the PR template, including the CLA acknowledgement.
+
+## Releases (maintainers)
+
+`prepublishOnly` runs `pnpm test && pnpm lint`, so a broken tree cannot be
+published by accident. Two rules beyond that:
+
+- **Pre-release versions go under a pre-release dist-tag.** While
+  `package.json` says `-alpha`, publish with `npm publish --tag alpha`. Without
+  the flag npm would move `latest` to a pre-release, and every
+  `npm install procway-code` would get it.
+- **`files` is an allowlist, and the tests treat it as one.**
+  `tests/package-manifest.test.mjs` asserts that entry points, licence files
+  and the `web/` assets `serve` loads from the install root are all covered.
+  Anything else the program reads relative to its own package root has to be
+  added to `files` *and* to that test — a local run cannot tell the difference,
+  but an installed copy can.
+
+Check what would ship with `npm pack --dry-run` before publishing.
 
 ## Reporting issues
 

@@ -1,4 +1,5 @@
 import { applyPromptCacheBreakpoints, fromAnthropicContent, toAnthropicMessages, toAnthropicTools } from "./format/anthropic.mjs";
+import { parseToolArgs } from "./format/tool-args.mjs";
 import { parseSseStream } from "./sse.mjs";
 import { reasoningEffortToAnthropicBudget } from "./reasoning.mjs";
 
@@ -11,7 +12,11 @@ export async function runAnthropicProvider({
   tools,
   prompt,
   fetchImpl = globalThis.fetch,
-  stream = true
+  stream = true,
+  // The turn's AbortSignal (session.abort() / idle watchdog). Threaded into the
+  // fetch AND the SSE read loop so a Stop tears the HTTP request down instead
+  // of leaving the model streaming (and billing) to nobody.
+  signal
 }) {
   if (!fetchImpl) throw new Error("fetch is not available in this Node.js runtime");
   // anthropic-via-proxy (ADR 0008 §F7c) talks to the dashboard credential
@@ -63,16 +68,17 @@ export async function runAnthropicProvider({
   };
 
   if (stream && provider.stream !== false) {
-    return runStreaming({ endpoint, headers, body, fetchImpl });
+    return runStreaming({ endpoint, headers, body, fetchImpl, signal });
   }
-  return runNonStreaming({ endpoint, headers, body, fetchImpl });
+  return runNonStreaming({ endpoint, headers, body, fetchImpl, signal });
 }
 
-async function runNonStreaming({ endpoint, headers, body, fetchImpl }) {
+async function runNonStreaming({ endpoint, headers, body, fetchImpl, signal }) {
   const response = await fetchImpl(endpoint, {
     method: "POST",
     headers,
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    ...(signal ? { signal } : {})
   });
   const text = await response.text();
   if (!response.ok) {
@@ -99,11 +105,12 @@ async function runNonStreaming({ endpoint, headers, body, fetchImpl }) {
   };
 }
 
-async function runStreaming({ endpoint, headers, body, fetchImpl }) {
+async function runStreaming({ endpoint, headers, body, fetchImpl, signal }) {
   const response = await fetchImpl(endpoint, {
     method: "POST",
     headers,
-    body: JSON.stringify({ ...body, stream: true })
+    body: JSON.stringify({ ...body, stream: true }),
+    ...(signal ? { signal } : {})
   });
   if (!response.ok) {
     const errText = typeof response.text === "function" ? await response.text() : "";
@@ -119,7 +126,7 @@ async function runStreaming({ endpoint, headers, body, fetchImpl }) {
 
   const consumePromise = (async () => {
     try {
-      for await (const sse of parseSseStream(response.body)) {
+      for await (const sse of parseSseStream(response.body, { signal })) {
         sseEvents.push(sse);
         if (sse?.type === "content_block_delta" && typeof sse?.delta?.type === "string") {
           // Extended-thinking deltas stream as `thinking_delta` (text in
@@ -234,6 +241,10 @@ function normalizeUsage(usage) {
 function aggregateAnthropicSseEvents(sseEvents) {
   const blocks = [];
   let usage = null;
+  // stop_reason arrives on the terminal message_delta, AFTER every
+  // content_block_stop — so tool_use input buffers are parsed in a second pass
+  // below, once we know whether the turn was truncated (max_tokens).
+  let stopReason = null;
   for (const event of sseEvents) {
     if (!event || typeof event !== "object") continue;
     if (event.type === "content_block_start") {
@@ -264,25 +275,25 @@ function aggregateAnthropicSseEvents(sseEvents) {
       continue;
     }
     if (event.type === "content_block_stop") {
-      const index = event.index ?? blocks.length - 1;
-      const target = blocks[index];
-      if (target && target.type === "tool_use" && typeof target.input_buffer === "string") {
-        try {
-          target.input = target.input_buffer.length === 0 ? {} : JSON.parse(target.input_buffer);
-        } catch {
-          target.input = {};
-        }
-        delete target.input_buffer;
-      }
+      // Defer input_buffer parsing to the post-loop pass (stopReason not known yet).
       continue;
     }
-    if (event.type === "message_delta" && event.usage) {
-      usage = { ...(usage ?? {}), ...event.usage };
+    if (event.type === "message_delta") {
+      if (event.usage) usage = { ...(usage ?? {}), ...event.usage };
+      if (typeof event.delta?.stop_reason === "string") stopReason = event.delta.stop_reason;
       continue;
     }
     if (event.type === "message_start" && event.message?.usage) {
       usage = { ...(usage ?? {}), ...event.message.usage };
     }
+  }
+  // Second pass: finalize tool_use inputs now that stop_reason is known. A
+  // buffer that fails to parse is marked invalid (truncated when the turn hit
+  // max_tokens) rather than silently coerced to `{}`.
+  for (const block of blocks) {
+    if (!block || block.type !== "tool_use" || typeof block.input_buffer !== "string") continue;
+    block.input = parseToolArgs(block.input_buffer, { truncated: stopReason === "max_tokens" });
+    delete block.input_buffer;
   }
   return {
     contentBlocks: blocks.filter(Boolean),

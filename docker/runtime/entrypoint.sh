@@ -232,6 +232,56 @@ if [ "${nvm_seeded}" != "1" ] && [ -s "${NVM_SNAPSHOT}/nvm.sh" ]; then
   seed_nvm_background &
 fi
 
+# ----- 1b. Profile setup script (ADR 0033 §D3) -------------------------------
+# PROCWAY_SETUP_SCRIPT_B64 carries the profile-resolved setup script (base64).
+# Runs in the BACKGROUND after serve (off the cold-start critical path), ONCE
+# per PVC: the marker under $HOME/.procway (home-dotprocway PVC subPath) is
+# keyed by the script's sha256, so a suspend→resume Pod recreation skips it
+# while a CHANGED script re-runs. Everything is fail-soft — a broken script
+# logs into setup-script.log (also on the PVC) and the session lives on. The
+# script runs with the same privileges as any AI-executed command (same trust
+# boundary), so no new attack surface.
+run_setup_script_background() {
+  local b64="${PROCWAY_SETUP_SCRIPT_B64:-}"
+  [ -n "$b64" ] || return 0
+  local state_dir="${HOME:-/home/procway}/.procway"
+  if ! mkdir -p "$state_dir" 2>/dev/null; then
+    log "warn: setup-script skipped ($state_dir not writable)"
+    return 0
+  fi
+  local script_file hash marker log_file
+  script_file="$(mktemp /tmp/procway-setup.XXXXXX.sh 2>/dev/null)" || {
+    log "warn: setup-script skipped (mktemp failed)"; return 0; }
+  if ! printf '%s' "$b64" | base64 -d > "$script_file" 2>/dev/null; then
+    log "warn: setup-script skipped (base64 decode failed)"
+    rm -f "$script_file"; return 0
+  fi
+  hash="$(sha256sum "$script_file" 2>/dev/null | cut -c1-12)"
+  marker="${state_dir}/setup-script.${hash:-unknown}.done"
+  log_file="${state_dir}/setup-script.log"
+  if [ -f "$marker" ]; then
+    log "setup-script: already ran for hash ${hash} (skip)"
+    rm -f "$script_file"; return 0
+  fi
+  local timeout_s="${PROCWAY_SETUP_SCRIPT_TIMEOUT:-600}"
+  log "setup-script: running (hash ${hash}, timeout ${timeout_s}s, log ${log_file})"
+  {
+    echo "=== setup-script start $(date -Is 2>/dev/null) hash=${hash} ==="
+    if timeout "$timeout_s" bash "$script_file"; then
+      echo "=== setup-script OK $(date -Is 2>/dev/null) ==="
+      : > "$marker" 2>/dev/null || true
+      log "setup-script: completed (hash ${hash})"
+    else
+      echo "=== setup-script FAILED (exit $?) $(date -Is 2>/dev/null) ==="
+      log "warn: setup-script failed (hash ${hash}) — see ${log_file}"
+    fi
+  } >> "$log_file" 2>&1
+  rm -f "$script_file"
+}
+if [ -n "${PROCWAY_SETUP_SCRIPT_B64:-}" ]; then
+  run_setup_script_background &
+fi
+
 # ----- 2. Xvfb --------------------------------------------------------------
 # -nolisten tcp keeps X11 socket-only (defense in depth).
 # +extension RANDR enables resolution change at runtime (future Phase A.next).

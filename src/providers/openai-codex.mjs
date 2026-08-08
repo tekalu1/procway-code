@@ -5,6 +5,7 @@ import { ProviderRequestError, isRetryableNetworkError } from "./openai-compatib
 import { normalizeReasoningEffort } from "./reasoning.mjs";
 import { isInlineImageBlock, imageBlockToDataUrl } from "./image-hydration.mjs";
 import { llmFetch } from "./llm-fetch.mjs";
+import { parseToolArgs } from "./format/tool-args.mjs";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CLIENT_VERSION = "0.0.1";
@@ -191,6 +192,10 @@ function createAggregator() {
     reasoningSummary: "",
     usage: null,
     lastError: null,
+    // Responses API truncation: response.status "incomplete" with
+    // incomplete_details.reason "max_output_tokens" means output was cut off —
+    // a tool call's arguments JSON is the likely casualty.
+    truncated: false,
     // SSE emits each output item by `output_index`. A single response may
     // produce text + one or more function_calls — keep them keyed by index
     // so deltas land on the right item.
@@ -265,6 +270,10 @@ function applyEvent(state, event) {
     case "response.done": {
       const u = event.response?.usage;
       if (u) state.usage = u;
+      if (event.response?.status === "incomplete"
+        && event.response?.incomplete_details?.reason === "max_output_tokens") {
+        state.truncated = true;
+      }
       // Fallback: a response that streamed NO output_text.delta (e.g. a long
       // reasoning turn that emitted only keepalive + a final message) carries
       // its text on the completed frame's response.output[]. Without this the
@@ -297,7 +306,7 @@ function buildFinalResult(state) {
     .map(([, entry]) => ({
       id: entry.id,
       name: entry.name,
-      args: parseToolArgs(entry.argumentsRaw)
+      args: parseToolArgs(entry.argumentsRaw, { truncated: state.truncated })
     }));
 
   if (toolCalls.length > 0) {
@@ -410,16 +419,6 @@ function runStreaming(response) {
       return buildFinalResult(state);
     }
   };
-}
-
-function parseToolArgs(rawArgs) {
-  if (typeof rawArgs !== "string" || rawArgs.length === 0) return {};
-  try {
-    const parsed = JSON.parse(rawArgs);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
 }
 
 /**

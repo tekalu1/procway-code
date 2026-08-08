@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { transcriptFromMessages } from "../src/tui/transcript.mjs";
+import { transcriptFromMessages } from "../src/core/projections/transcript.mjs";
 import { stripSystemReminders } from "../src/core/projections/transcript.mjs";
 import { createMessage } from "../src/core/types/message.mjs";
 

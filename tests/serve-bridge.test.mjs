@@ -115,6 +115,58 @@ describe("serve bridge", () => {
     expect(transcript).toContain("assistant");
   });
 
+  it("defaults a worker-origin runTurn to full-auto approval mode", async () => {
+    const session = await createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId: "bridge-worker",
+      events: new EventBus()
+    });
+    session.origin = "worker";
+    const seen = [];
+    session.runTurn = async (prompt, options) => { seen.push({ prompt, options }); };
+    const ws = fakeWs();
+    attachBridge({ session, ws });
+    ws.emit("message", JSON.stringify({ kind: "command", command: "runTurn", id: "W1", args: { prompt: "do work" } }));
+    await waitFor(() => ws.sent.some((s) => JSON.parse(s).id === "W1"));
+    expect(seen).toHaveLength(1);
+    expect(seen[0].options.approvalMode).toBe("full-auto");
+  });
+
+  it("lets an explicit approvalMode win over the worker-origin default", async () => {
+    const session = await createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId: "bridge-worker-explicit",
+      events: new EventBus()
+    });
+    session.origin = "worker";
+    const seen = [];
+    session.runTurn = async (prompt, options) => { seen.push({ prompt, options }); };
+    const ws = fakeWs();
+    attachBridge({ session, ws });
+    ws.emit("message", JSON.stringify({ kind: "command", command: "runTurn", id: "W2", args: { prompt: "do work", options: { approvalMode: "always-ask" } } }));
+    await waitFor(() => ws.sent.some((s) => JSON.parse(s).id === "W2"));
+    expect(seen[0].options.approvalMode).toBe("always-ask");
+  });
+
+  it("does not inject an approval mode for non-worker sessions", async () => {
+    const session = await createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId: "bridge-user-origin",
+      events: new EventBus()
+    });
+    // origin defaults to null (user session)
+    const seen = [];
+    session.runTurn = async (prompt, options) => { seen.push({ prompt, options }); };
+    const ws = fakeWs();
+    attachBridge({ session, ws });
+    ws.emit("message", JSON.stringify({ kind: "command", command: "runTurn", id: "W3", args: { prompt: "hi" } }));
+    await waitFor(() => ws.sent.some((s) => JSON.parse(s).id === "W3"));
+    expect(seen[0].options.approvalMode).toBeUndefined();
+  });
+
   it("returns ok=false when the command shape is invalid", async () => {
     const events = new EventBus();
     const session = await createAgentSession({
@@ -339,6 +391,104 @@ describe("serve bridge — loadSession dispatch", () => {
     const response = all[responseIdx];
     expect(response.ok).toBe(true);
     expect(response.result).toEqual({ sessionId: "old", messageCount: 2, eventCount: resumed.event.eventCount });
+  });
+
+  it("replays the persisted todo list as todos.updated on attach, after session.resumed", async () => {
+    const session = await createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId: "todos-attach",
+      events: new EventBus(),
+      messages: [
+        { role: "user", content: "hi", id: "m1", sessionId: "todos-attach" },
+        { role: "assistant", content: "hello", id: "m2", sessionId: "todos-attach" }
+      ]
+    });
+    session.todoStore.set([
+      { id: "t1", content: "step one", status: "completed", activeForm: "doing step one" },
+      { id: "t2", content: "step two", status: "in_progress", activeForm: "doing step two" }
+    ]);
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws });
+    const all = ws.sent.map((s) => JSON.parse(s));
+    const resumedIdx = all.findIndex((m) => m.kind === "event" && m.event?.type === "session.resumed");
+    const todosIdx = all.findIndex((m) => m.kind === "event" && m.event?.type === "todos.updated");
+    expect(resumedIdx).toBeGreaterThanOrEqual(0);
+    // The client wipes its todo panel when session.resumed lands, so the
+    // replay must arrive after it or the list is cleared right back out.
+    expect(todosIdx).toBeGreaterThan(resumedIdx);
+    expect(all[todosIdx].event.sessionId).toBe("todos-attach");
+    expect(all[todosIdx].event.todos).toEqual([
+      expect.objectContaining({ id: "t1", content: "step one", status: "completed" }),
+      expect.objectContaining({ id: "t2", content: "step two", status: "in_progress" })
+    ]);
+    await bridge.detach();
+  });
+
+  it("does not send todos.updated on attach when the session has no todos", async () => {
+    const session = await createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId: "todos-empty",
+      events: new EventBus()
+    });
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws });
+    const events = ws.sent.map((s) => JSON.parse(s)).filter((m) => m.kind === "event").map((m) => m.event.type);
+    expect(events).not.toContain("todos.updated");
+    await bridge.detach();
+  });
+
+  it("re-announces the loaded session's todos after loadSession's session.resumed", async () => {
+    await saveSessionState({
+      sessionId: "old-todos",
+      state: {
+        title: "previous",
+        cwd,
+        provider: "p",
+        model: "m",
+        updatedAt: "2026-05-01T00:00:00.000Z",
+        messages: [
+          { role: "user", content: "hi", id: "m1", sessionId: "old-todos" },
+          { role: "assistant", content: "hello", id: "m2", sessionId: "old-todos" }
+        ],
+        eventCount: 4
+      }
+    });
+    const liveSession = await createAgentSession({ settings: settingsForCliAgent(), cwd, sessionId: "live-todos", events: new EventBus() });
+    const ws = fakeWs();
+    attachBridge({
+      session: liveSession,
+      ws,
+      cwd,
+      settings: settingsForCliAgent(),
+      sessionFactory: async ({ sessionId }) => {
+        const state = await loadSessionState({ sessionId });
+        const next = await createAgentSession({
+          settings: settingsForCliAgent(),
+          cwd,
+          sessionId,
+          messages: state.messages ?? [],
+          title: state.title,
+          events: new EventBus()
+        });
+        next.todoStore.todos = [
+          { id: "t9", content: "restored step", status: "pending", activeForm: "restoring step" }
+        ];
+        return next;
+      }
+    });
+    ws.emit("message", JSON.stringify({ kind: "command", command: "loadSession", id: "R2", args: { sessionId: "old-todos" } }));
+    await waitFor(() => ws.sent.some((s) => JSON.parse(s).id === "R2"));
+    const all = ws.sent.map((s) => JSON.parse(s));
+    const resumedIdx = all.findIndex((m) => m.kind === "event" && m.event?.type === "session.resumed");
+    const todosIdx = all.findIndex((m) => m.kind === "event" && m.event?.type === "todos.updated");
+    expect(resumedIdx).toBeGreaterThanOrEqual(0);
+    expect(todosIdx).toBeGreaterThan(resumedIdx);
+    expect(all[todosIdx].event.sessionId).toBe("old-todos");
+    expect(all[todosIdx].event.todos).toEqual([
+      expect.objectContaining({ id: "t9", content: "restored step", status: "pending" })
+    ]);
   });
 
   it("rejects a runTurn command while a turn is already in flight (turn_in_progress)", async () => {

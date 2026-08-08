@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentSession } from "../src/agent/conversation.mjs";
 import { isToolResult } from "../src/core/types/tool-result.mjs";
+import { makeInvalidToolArgs } from "../src/providers/format/tool-args.mjs";
 
 describe("AgentSession MCP integration", () => {
   it("merges MCP tools when starting a new session", async () => {
@@ -70,6 +71,31 @@ describe("AgentSession MCP integration", () => {
         tool: "mcp__local__echo",
         response: { content: [{ type: "text", text: "ok" }] }
       }));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fix 6: rejects an invalid-args MCP call before approval or the MCP server sees it", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "procway-code-"));
+    const mcpRegistry = createFakeMcpRegistry();
+    const approvalRequester = vi.fn(async () => true);
+
+    try {
+      const session = await new AgentSession({
+        settings: baseSettings(),
+        cwd,
+        mcpRegistry,
+        approvalRequester
+      }).initialize();
+
+      await expect(
+        session.executeSingleToolCall({ name: "mcp__local__echo", args: makeInvalidToolArgs({ reason: "parse_error" }) })
+      ).rejects.toThrow(/mcp__local__echo could not run because its arguments were not valid JSON/);
+
+      // The marker never reaches the approval payload nor the external server.
+      expect(approvalRequester).not.toHaveBeenCalled();
+      expect(mcpRegistry.callTool).not.toHaveBeenCalled();
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

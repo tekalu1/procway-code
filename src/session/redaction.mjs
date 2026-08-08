@@ -15,8 +15,8 @@ const REDACTION_PLACEHOLDER = "[REDACTED]";
 
 export const DEFAULT_REDACTION_PATTERNS = Object.freeze([
   /AKIA[0-9A-Z]{16}/g,
-  /sk-or-v1-[A-Za-z0-9_\-]{40,}/g,
-  /sk-[A-Za-z0-9_\-]{40,}/g,
+  /sk-or-v1-[A-Za-z0-9_-]{40,}/g,
+  /sk-[A-Za-z0-9_-]{40,}/g,
   /(ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{36,}/g,
   /\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi
 ]);

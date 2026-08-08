@@ -62,7 +62,20 @@ export async function writeSnapshot({ homeDir = os.homedir(), sessionId, snapsho
     todos: Array.isArray(snapshot?.todos) ? snapshot.todos.map(normalizeTodo) : [],
     planMode: snapshot?.planMode ? normalizePlanMode(snapshot.planMode) : undefined,
     usageEvents: Array.isArray(snapshot?.usageEvents) ? snapshot.usageEvents : [],
-    alwaysAllow: Array.isArray(snapshot?.alwaysAllow) ? snapshot.alwaysAllow : []
+    alwaysAllow: Array.isArray(snapshot?.alwaysAllow) ? snapshot.alwaysAllow : [],
+    // Deferred-tool tier (loadedTools — the write half that was missing; the
+    // restore side already read snapshot.loadedTools) + ADR 0037 D4 delegated
+    // jobs. Omitted when empty so pre-existing snapshot shapes stay stable.
+    ...(Array.isArray(snapshot?.loadedTools) && snapshot.loadedTools.length > 0
+      ? { loadedTools: snapshot.loadedTools }
+      : {}),
+    ...(Array.isArray(snapshot?.delegatedJobs) && snapshot.delegatedJobs.length > 0
+      ? { delegatedJobs: snapshot.delegatedJobs }
+      : {}),
+    // ADR 0037 D1: parked tool approvals (checkpoint for approve-after-restart).
+    ...(Array.isArray(snapshot?.parkedApprovals) && snapshot.parkedApprovals.length > 0
+      ? { parkedApprovals: snapshot.parkedApprovals }
+      : {})
   };
   if (encryptionKey) {
     const buffer = encryptJson({ data: payload, key: encryptionKey });

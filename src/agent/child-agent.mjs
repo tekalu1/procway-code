@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { fork } from "node:child_process";
+import { anySignal } from "./abort.mjs";
 
 /**
  * Global semaphore for child agent concurrency.
@@ -60,11 +61,17 @@ export function createChildAgentManager({ settings, cwd, runAgentImpl, forkImpl 
     // behavior is byte-identical to before. The agent-kind delegated-job driver
     // threads them through so a sub-agent gains the unified lifecycle + progress
     // streaming + kill the registry contract provides.
-    async run({ task, childCwd = cwd, depth = 0, onEvent, signal }) {
+    async run({ task, childCwd = cwd, depth = 0, onEvent, signal, parentSignal }) {
       const maxDepth = settings?.agents?.maxDepth ?? 3;
       if (depth >= maxDepth) {
         throw new Error(`Child agent max depth exceeded: ${maxDepth}`);
       }
+      // Two independent kill switches reach a child: the delegated-job
+      // registry's handle (`signal`, wired by agent-driver) and the PARENT
+      // turn's Stop (`parentSignal`, wired by conversation.mjs). Either one
+      // must tear the child down — a Ctrl+C in the parent that left the child
+      // running kept burning tokens invisibly.
+      const effectiveSignal = anySignal([signal, parentSignal]);
       await acquireGlobal();
       try {
         const resolvedCwd = resolveChildCwd(cwd, childCwd);
@@ -77,7 +84,7 @@ export function createChildAgentManager({ settings, cwd, runAgentImpl, forkImpl 
             forkImpl,
             entryPath,
             onEvent,
-            signal
+            signal: effectiveSignal
           });
         }
         const result = await runAgentImpl({
@@ -87,7 +94,7 @@ export function createChildAgentManager({ settings, cwd, runAgentImpl, forkImpl 
           depth: depth + 1,
           childAgentManager: this,
           onEvent,
-          signal
+          signal: effectiveSignal
         });
         return {
           cwd: resolvedCwd,

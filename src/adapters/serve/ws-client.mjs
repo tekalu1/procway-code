@@ -141,6 +141,15 @@ export function openWsClient({ host, port, path: urlPath = "/ws", token = "", qu
     closed = true;
     try { socket.end(); } catch { /* ignore */ }
     void code; void reason; // close frame omitted; server sees connection close
+    // #136: an explicit close() MUST still notify listeners. socket.end() only
+    // half-closes (waits for the peer's FIN), so through an idle proxy the
+    // underlying 'close' can be arbitrarily delayed — and even when it lands,
+    // the socket.on('close') handler above is guarded by `closed` (set here)
+    // and won't re-emit. Without this, a caller awaiting 'close' after close()
+    // (serve-client's abort path → exit 143) hangs forever and the run never
+    // finalizes. Emit on a microtask so `ws.on('close')` handlers registered
+    // right after openWsClient() still fire, and listeners see async semantics.
+    queueMicrotask(() => emitter.emit("close"));
   };
   emitter.socket = socket;
 

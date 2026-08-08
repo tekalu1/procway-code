@@ -15,18 +15,6 @@ function makeFailingSpawn() {
   };
 }
 
-// A stand-in for spawn() that returns a child whose process never exits.
-// Used to exercise the timeout safety net in ripgrepSearch.
-function makeHangingSpawn({ onKill } = {}) {
-  return () => {
-    const child = new EventEmitter();
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
-    child.kill = (signal) => { onKill?.(signal); /* deliberately don't emit close */ };
-    return child;
-  };
-}
-
 // A spawn impl that lets us drive stdout/stderr/close manually and verifies
 // the consumer attached a stderr drain.
 function makeProgrammableSpawn() {

@@ -58,6 +58,9 @@ describe("streaming HTTP abort partialContent (phase5 carryover)", () => {
   it("does not attach partialContent when the stream throws before any delta", async () => {
     const { session, observed } = makeSession();
     const runProviderImpl = async () => ({
+      // The point of this fake is a stream that fails before it ever
+      // produces a delta, so it never yields.
+      // eslint-disable-next-line require-yield
       deltaStream: (async function* () {
         throw new FakeProviderError("immediate failure");
       })(),

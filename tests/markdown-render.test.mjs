@@ -1,51 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { renderTranscript, renderMarkdown, __test } from "../src/adapters/tui/markdown-render.mjs";
+import { renderMarkdown, __test } from "../src/adapters/tui/markdown-render.mjs";
 import { stripAnsi } from "../src/adapters/tui/ansi.mjs";
 
-describe("markdown-render adapter — transcript layer", () => {
-  it("renders user / assistant / tool projections with role labels", () => {
-    const text = renderTranscript([
-      { role: "system", content: "ignored" },
-      { role: "user", content: "hello" },
-      { role: "assistant", content: "hi" },
-      { role: "tool", content: "{\"path\":\"README.md\"}" }
-    ]);
-    expect(text).not.toContain("ignored");
-    expect(text).toContain("You: hello");
-    expect(text).toContain("Assistant: hi");
-    expect(text).toContain("Tool: {\"path\":\"README.md\"}");
-  });
-
-  it("returns the no-history sentinel when projection is empty", () => {
-    expect(renderTranscript([])).toBe("(no prior conversation)\n");
-  });
-
-  it("does not truncate by default", () => {
-    const longText = "x".repeat(2000);
-    const text = renderTranscript([{ role: "assistant", content: longText }]);
-    expect(text).toContain(longText);
-    expect(text).not.toContain("[truncated]");
-  });
-
-  it("truncates when maxChars is provided", () => {
-    const text = renderTranscript([{ role: "assistant", content: "abcdef" }], { maxChars: 3 });
-    expect(text).toContain("abc\n...[truncated]");
-  });
-
-  it("collapses tool_calls into a [tool calls: name] line", () => {
-    const text = renderTranscript([
-      { role: "assistant", content: null, tool_calls: [{ function: { name: "read_file" } }] }
-    ]);
-    expect(text).toContain("Assistant: [tool calls: read_file]");
-  });
-});
-
 describe("markdown-render adapter — Markdown blocks", () => {
-  it("renders headings with bold + per-level colour", () => {
+  // P3a-2: the `#` markers are dropped when colour is available — hierarchy is
+  // carried by weight/colour, as in a rendered document.
+  it("renders headings with bold + per-level colour and no '#' markers", () => {
     const out = renderMarkdown("# Title\n\n## Sub\n");
-    expect(stripAnsi(out)).toContain("# Title");
-    expect(stripAnsi(out)).toContain("## Sub");
+    expect(stripAnsi(out)).toContain("Title");
+    expect(stripAnsi(out)).toContain("Sub");
+    expect(stripAnsi(out)).not.toContain("#");
     expect(out).toContain("\x1b[1m"); // bold
+  });
+
+  it("keeps the '#' markers when colour is disabled", () => {
+    const plain = renderMarkdown("# Title\n\n## Sub\n", { color: false });
+    expect(plain).toContain("# Title");
+    expect(plain).toContain("## Sub");
   });
 
   it("renders unordered lists with bullets", () => {
@@ -76,19 +47,24 @@ describe("markdown-render adapter — Markdown blocks", () => {
     expect(plain).toContain("(streaming)");
   });
 
-  it("renders inline code with a colour pair", () => {
+  // Styles close with their specific off-code (SGR 22/23/24/39/49) instead of
+  // a blanket reset so nesting survives — see ansi.mjs `wrap`.
+  // P3a-3: inline code no longer paints a background (the grey/brightYellow
+  // pill was unreadable on light themes) — foreground accent only.
+  it("renders inline code with a foreground accent and no background fill", () => {
     const out = renderMarkdown("Use `npm install` to set up.");
-    expect(out).toMatch(/\x1b\[\d+m.*npm install.*\x1b\[0m/);
+    expect(out).toContain("\x1b[38;5;141mnpm install\x1b[39m");
+    expect(out).not.toContain("\x1b[49m");
   });
 
   it("renders bold emphasis", () => {
     const out = renderMarkdown("This is **important**.");
-    expect(out).toContain("\x1b[1mimportant\x1b[0m");
+    expect(out).toContain("\x1b[1mimportant\x1b[22m");
   });
 
   it("renders italic emphasis", () => {
     const out = renderMarkdown("This is *subtle*.");
-    expect(out).toContain("\x1b[3msubtle\x1b[0m");
+    expect(out).toContain("\x1b[3msubtle\x1b[23m");
   });
 
   it("renders links with underline + url annotation", () => {

@@ -81,7 +81,11 @@ export async function runProvider({ settings, prompt, messages, tools, cwd = pro
       prompt,
       messages: hydratedMessages,
       tools,
-      stream
+      stream,
+      // Without this the user's Stop reached the orchestrator but never the
+      // socket: the model kept streaming (and billing) to a turn nobody was
+      // listening to any more.
+      signal
     });
   }
   if (provider.type === "openai-codex" || provider.type === "openai-codex-via-proxy") {
@@ -106,7 +110,8 @@ export async function runProvider({ settings, prompt, messages, tools, cwd = pro
       prompt,
       messages: hydratedMessages,
       tools,
-      stream
+      stream,
+      signal
     });
   }
   throw new Error(`Provider type is configured but not implemented yet: ${provider.type}`);

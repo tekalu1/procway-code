@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { runProvider } from "../providers/index.mjs";
 import { isMutationTool, filterToolDefinitionsForSettings, selectToolDefinitions } from "../tools/registry.mjs";
+import { stripInvalidToolArgs } from "../providers/format/tool-args.mjs";
 import { condenseStaleToolResults, resolveStaleToolResultSettings } from "../providers/stale-tool-results.mjs";
 import { isLongRunningCommand, DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS } from "../safety/command-classifier.mjs";
 
@@ -38,7 +39,8 @@ function toolCallBudgetMs(toolCall, session) {
     const base = Number.isFinite(args.waitMs) ? args.waitMs : 600000;
     return base + 30000;
   }
-  if (toolCall?.name === "start_run" || toolCall?.name === "resume_run" || toolCall?.name === "reply_run") {
+  if (toolCall?.name === "start_run" || toolCall?.name === "attach_run"
+    || toolCall?.name === "resume_run" || toolCall?.name === "reply_run") {
     // ADR 0029 await-yield: these tools poll the run-loop job until it pauses for
     // input or finishes — minutes, not seconds. Without a budget the shared 60s
     // tool timeout would SIGTERM the await mid-flight. Grant the same relaxed
@@ -59,18 +61,10 @@ function toolCallBudgetMs(toolCall, session) {
     const base = Number.isFinite(childDeadline) ? Math.max(lr, Number(childDeadline)) : lr;
     return base + 30000;
   }
-  if (toolCall?.name === "request_user_action" && args.blocking !== false) {
-    // A blocking UIR waits for a HUMAN. Its own InteractionCoordinator timeout
-    // governs (PROCWAY_UIR_TIMEOUT_MS, default 15min; 0 = wait indefinitely) —
-    // keep this constant in sync with runtime/interaction.mjs. Without a budget
-    // the shared 60s tool timeout would kill the tool ("Tool timed out after
-    // 60000ms") long before the user could answer. Give the scheduler a budget
-    // just past the coordinator so the coordinator resolves first (returning
-    // {timedOut:true}); 0 → effectively unbounded (24h) so it never wins.
-    const raw = Number(process.env.PROCWAY_UIR_TIMEOUT_MS);
-    const uir = Number.isFinite(raw) && raw >= 0 ? raw : 900000;
-    return uir > 0 ? uir + 30000 : 24 * 60 * 60 * 1000;
-  }
+  // request_user_action needs no special budget any more: ADR 0037 D1 made it
+  // record-and-return (the coordinator emits and resolves immediately; the turn
+  // winds down and the user's answer arrives as a NEW turn), so the shared
+  // tool timeout never races a human.
   return null;
 }
 import {
@@ -81,8 +75,76 @@ import {
 import { runToolCalls } from "./scheduler.mjs";
 import { createEvent } from "../core/events/types.mjs";
 import { createMessage } from "../core/types/message.mjs";
+import {
+  USER_INTERRUPT_CODE,
+  USER_INTERRUPT_MESSAGE,
+  isAbortError,
+  isUserInterruptAbort
+} from "./abort.mjs";
 
-const FILE_MUTATION_RETRY_PROMPT = "You said you would create or update a file, but no file-writing tool call was made. Call write_file or apply_patch now. Do not provide a final answer until the file tool succeeds.";
+export {
+  USER_INTERRUPT_CODE,
+  USER_INTERRUPT_MESSAGE,
+  createUserInterruptAbort,
+  isAbortError,
+  isUserInterruptAbort
+} from "./abort.mjs";
+
+const FILE_MUTATION_RETRY_PROMPT = "You said you would create or update a file, but no file-writing tool call was made. Call write_file, apply_patch, or Edit now. Do not provide a final answer until the file tool succeeds.";
+
+// The file-mutation retry (below) re-injects a "you didn't write the file" nudge
+// each round the model ends without a successful write. Left unbounded it could
+// spin to maxToolRounds (150) — and if the write fails DETERMINISTICALLY (a
+// truncated/invalid write_file that keeps failing the same way) the whole turn
+// wedged, holding runningTurn true and blocking every new message on the bridge.
+// A low independent cap, plus an early bail-out when the SAME tool fails the
+// SAME way twice in a row, ends the turn cleanly instead.
+const FILE_MUTATION_RETRY_LIMIT = 3;
+
+// The retry nudge is about FILE writes, so only these tools' failures count as
+// a "repeated write failure". A failed read_file/run_shell earlier in the turn
+// must not masquerade as one and trip the bail-out.
+const FILE_MUTATION_TOOL_NAMES = new Set(["write_file", "apply_patch", "Edit"]);
+
+/**
+ * Index just after the most recent injected FILE_MUTATION_RETRY_PROMPT this
+ * turn (or turnStartIndex if none injected yet). Failures BEFORE this point are
+ * stale — they predate the last nudge and must not be re-counted as a fresh
+ * repeat, or a single old write failure would trip the bail-out on two
+ * consecutive text-only rounds even when the model never retried the write.
+ */
+function lastRetryPromptBoundary(messages, turnStartIndex) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= turnStartIndex; i -= 1) {
+    const message = list[i];
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    if (message.content.some((block) => block?.kind === "text" && block.text === FILE_MUTATION_RETRY_PROMPT)) {
+      return i + 1;
+    }
+  }
+  return turnStartIndex;
+}
+
+/**
+ * Signature (`${tool}:${error}`) of the most recent FAILED file-mutation tool
+ * result at or after `sinceIndex`, else null. Used to detect a deterministic
+ * write failure the retry nudge can never clear (it would re-fail identically).
+ */
+function newFileMutationFailureSignature(messages, sinceIndex) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = list.length - 1; i >= sinceIndex; i -= 1) {
+    const message = list[i];
+    if (!message || message.role !== "tool" || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block?.kind !== "tool_result" || block.ok !== false) continue;
+      const tool = block.result?.data?.tool;
+      if (!FILE_MUTATION_TOOL_NAMES.has(tool)) continue;
+      const error = block.result?.data?.error ?? block.result?.summary ?? "error";
+      return `${tool}:${error}`;
+    }
+  }
+  return null;
+}
 
 const KNOWN_TOOL_KINDS_BY_NAME = new Set([
   "list_files",
@@ -225,6 +287,16 @@ export async function executeModelRound({ session, round, turnMessageId, signal,
     // offer a retry. partialContent is only meaningful when we did start.
     const partialContent = started && partialText.length > 0 ? [{ kind: "text", text: partialText }] : [];
     const { message: failMessage, code: failCode } = describeTurnAbort(session, error);
+    // S-6: an ABORTED turn commits whatever the assistant already said. The
+    // streaming renderer flushes its buffer on turn.failed, so without this the
+    // user sees text on screen that session.messages (and therefore the next
+    // request + every resume/replay) never had — Claude Code keeps it.
+    // Consistency rule: we commit TEXT ONLY. tool_calls are never partially
+    // committed here (the aggregated tool_calls only exist after finalize(),
+    // which an abort skips), so no tool_call is left without its tool result.
+    if (partialContent.length > 0 && isAbortError(error)) {
+      commitPartialAssistantMessage({ session, messageId, content: partialContent });
+    }
     session.events.emit(createEvent("turn.failed", {
       sessionId: session.sessionId,
       round,
@@ -240,12 +312,37 @@ export async function executeModelRound({ session, round, turnMessageId, signal,
 }
 
 /**
- * Map a turn abort to a clear message/code. The turn-idle watchdog aborts with a
- * tagged reason ({ name:'IdleWatchdogAbort', idleMs }) — turn it into a
- * retryable "model went silent" message + 'idle_timeout' code instead of leaking
- * the raw DOMException "This operation was aborted" into the chat, and keep it
- * distinct from a user Stop ("Turn interrupted by user"). Non-idle errors pass
- * through unchanged.
+ * Persist the assistant text streamed before an abort as a real message, and
+ * announce it with `assistant.message.completed` so the event-log projection
+ * (core/projections/messages.mjs) reconstructs it on resume/replay exactly like
+ * a normal message. Emitted BEFORE turn.failed, which is what the TUI streaming
+ * renderer needs to flush once (its turn.failed handler then no-ops).
+ */
+function commitPartialAssistantMessage({ session, messageId, content }) {
+  try {
+    const assistantMessage = createMessage({
+      id: messageId,
+      role: "assistant",
+      sessionId: session.sessionId,
+      content
+    });
+    session.messages.push(assistantMessage);
+    session.events.emit(createEvent("assistant.message.completed", {
+      sessionId: session.sessionId,
+      messageId: assistantMessage.id,
+      content: assistantMessage.content
+    }));
+  } catch { /* committing the partial must never mask the original failure */ }
+}
+
+/**
+ * Map a turn abort to a clear message/code. Two tagged reasons matter:
+ *   - the turn-idle watchdog ({ name:'IdleWatchdogAbort', idleMs }) → a
+ *     retryable "model went silent" message + 'idle_timeout' code;
+ *   - a user Stop (createUserInterruptAbort) → the unified
+ *     "Interrupted by user" / 'interrupted' pair, regardless of whether the
+ *     turn was between rounds, mid-stream, or mid-tool when it landed.
+ * Everything else passes through unchanged.
  */
 export function describeTurnAbort(session, error) {
   // The watchdog's tagged reason / turnIdleAborted flag is authoritative — the
@@ -254,12 +351,19 @@ export function describeTurnAbort(session, error) {
   const reason = session?.turnAbortController?.signal?.reason;
   const idleAbort = reason?.name === "IdleWatchdogAbort" || session?.turnIdleAborted === true;
   if (!idleAbort) {
-    return { idleAbort: false, message: error?.message ?? String(error), code: error?.code };
+    // A user Stop wins over whatever error the abort surfaced as. Checking the
+    // session flag (not just the reason) also covers a provider that swallowed
+    // the abort and threw its own error while the interrupt was pending.
+    if (isUserInterruptAbort(reason) || isUserInterruptAbort(error) || session?.interruptRequested === true) {
+      return { idleAbort: false, userAbort: true, message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE };
+    }
+    return { idleAbort: false, userAbort: false, message: error?.message ?? String(error), code: error?.code };
   }
   const idleSec = Math.round((reason?.idleMs ?? 0) / 1000);
   return {
     idleAbort: true,
-    message: `モデルが ${idleSec || "—"} 秒応答せず中断しました（reasoning の長考が原因の可能性。PROCWAY_TURN_IDLE_TIMEOUT_MS で調整可）。`,
+    // English, like every other user-facing string in this CLI (P3b-10).
+    message: `The model sent nothing for ${idleSec || "—"}s, so the turn was aborted (a long reasoning phase is the usual cause; tune it with PROCWAY_TURN_IDLE_TIMEOUT_MS, 0 disables).`,
     code: "idle_timeout"
   };
 }
@@ -311,6 +415,34 @@ export async function handleModelResponseWithoutTools({
       ...(reasoningContent ? { reasoningContent } : {})
     }));
     emitUsageRecorded({ session, response, round });
+
+    // Independent, low retry cap + deterministic-failure bail-out (see
+    // FILE_MUTATION_RETRY_LIMIT). State lives on the session and is reset per
+    // turn in runTurn.
+    const retryState = session.fileMutationRetry ?? (session.fileMutationRetry = { count: 0, lastSignature: null });
+    // Only consider write failures NEW since the last nudge (see the helpers) so
+    // a stale/unrelated failure can't trip the deterministic-failure bail-out.
+    const boundary = lastRetryPromptBoundary(session.messages, turnStartIndex);
+    const failureSignature = newFileMutationFailureSignature(session.messages, boundary);
+    const sameFailureRepeated = failureSignature != null && failureSignature === retryState.lastSignature;
+    retryState.count += 1;
+    retryState.lastSignature = failureSignature;
+
+    if (retryState.count > FILE_MUTATION_RETRY_LIMIT || sameFailureRepeated) {
+      const reason = sameFailureRepeated
+        ? `the file-writing tool kept failing the same way (${failureSignature})`
+        : `the file write did not succeed after ${FILE_MUTATION_RETRY_LIMIT} attempts`;
+      return {
+        action: "stop",
+        response: {
+          error: {
+            message: `Stopped the turn: ${reason}. The requested file was not written.`,
+            code: "file_mutation_retry_exhausted"
+          }
+        }
+      };
+    }
+
     const retryMessage = createMessage({
       role: "user",
       sessionId: session.sessionId,
@@ -380,9 +512,15 @@ export async function handleModelResponseWithoutTools({
   return { action: "return", response };
 }
 
-export async function executeToolsRound({ session, round, toolCalls, messageId, response = null }) {
+export async function executeToolsRound({ session, round, toolCalls, messageId, response = null, signal = null }) {
   const reasoningContent = extractReasoningContentFromResponse(response);
   const reasoningMeta = buildReasoningMeta(response);
+  // Args recorded in history / emitted to the UI must NOT carry the invalid-args
+  // marker — it is an execution-layer signal only. Record `{}` for a marked
+  // call (paired with its ok:false tool_result). The ORIGINAL toolCall objects
+  // are used unchanged for execution below, so validateToolArgs still sees the
+  // marker and returns the clear, retryable error.
+  const recordArgs = (toolCall) => stripInvalidToolArgs(toolCall.args ?? {});
   const assistantMessage = createMessage({
     id: messageId,
     role: "assistant",
@@ -391,7 +529,7 @@ export async function executeToolsRound({ session, round, toolCalls, messageId, 
       kind: "tool_use",
       toolCallId: toolCall.id,
       name: toolCall.name,
-      args: toolCall.args ?? {}
+      args: recordArgs(toolCall)
     })),
     ...(reasoningMeta ? { meta: reasoningMeta } : {})
   });
@@ -409,7 +547,7 @@ export async function executeToolsRound({ session, round, toolCalls, messageId, 
       sessionId: session.sessionId,
       toolCallId: toolCall.id,
       name: toolCall.name,
-      args: toolCall.args ?? {},
+      args: recordArgs(toolCall),
       mutation
     }));
   }
@@ -421,7 +559,7 @@ export async function executeToolsRound({ session, round, toolCalls, messageId, 
     toolCalls: toolCalls.map((toolCall) => ({
       toolCallId: toolCall.id,
       name: toolCall.name,
-      args: toolCall.args ?? {}
+      args: recordArgs(toolCall)
     })),
     ...(reasoningContent ? { reasoningContent } : {})
   }));
@@ -468,7 +606,7 @@ export async function executeToolsRound({ session, round, toolCalls, messageId, 
           }));
         };
         try {
-          const result = await session.executeSingleToolCall(toolCall, { onProgress });
+          const result = await session.executeSingleToolCall(toolCall, { onProgress, signal });
           session.events.emit(createEvent("activity.stopped", {
             sessionId: session.sessionId,
             activityId,
@@ -489,7 +627,12 @@ export async function executeToolsRound({ session, round, toolCalls, messageId, 
 
   const toolResults = await runToolCalls(scheduledCalls, {
     maxParallel: session.settings.tools?.maxParallelTools ?? 8,
-    timeoutMs: session.settings.tools?.toolTimeoutMs ?? 60_000
+    timeoutMs: session.settings.tools?.toolTimeoutMs ?? 60_000,
+    // S-2: a user Stop settles every still-running call as `interrupted` and
+    // stops the scheduler from STARTING the queued ones. Every scheduled call
+    // still produces a result, so the assistant tool_use blocks pushed above
+    // are never left without their paired tool message.
+    signal
   });
   for (const toolResult of toolResults) {
     await appendToolResult({ session, round, toolResult });
@@ -530,6 +673,20 @@ function emitUsageRecorded({ session, response, round }) {
 }
 
 async function appendToolResult({ session, round, toolResult }) {
+  const toolMessage = buildToolMessage({ session, round, toolResult });
+  session.messages.push(toolMessage);
+}
+
+/**
+ * Build (and event-announce) the tool message for a settled tool call. Split
+ * out of appendToolResult so the ADR 0037 approval resume path can REPLACE a
+ * parked placeholder tool_result in place with the real execution result —
+ * emitting the same tool.call.completed / attachment.produced events — instead
+ * of appending a second tool message for the same toolCallId (which providers
+ * reject). Exported for conversation.mjs.
+ */
+export function buildToolMessage({ session, round, toolResult }) {
+  void round;
   const toolKind = toolNameToKind(toolResult.name);
   const okPayload = toolResult.ok ? toolResult.result : null;
   const failPayload = toolResult.ok ? null : {
@@ -589,7 +746,7 @@ async function appendToolResult({ session, round, toolResult }) {
     }));
   }
 
-  const toolMessage = createMessage({
+  return createMessage({
     role: "tool",
     sessionId: session.sessionId,
     toolCallId: toolResult.id,
@@ -604,7 +761,6 @@ async function appendToolResult({ session, round, toolResult }) {
       ...outboundRefBlocks
     ]
   });
-  session.messages.push(toolMessage);
 }
 
 function extractReasoningContentFromResponse(response) {

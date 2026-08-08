@@ -109,6 +109,60 @@ describe("ApprovalCoordinator", () => {
     expect(requested).toHaveLength(0);
   });
 
+  it("deny rule wins over full-auto mode (deny always wins)", async () => {
+    const events = new EventBus();
+    const requested = [];
+    events.on("approval.requested", (event) => requested.push(event));
+    const coordinator = new ApprovalCoordinator({
+      events,
+      settings: { permissions: { deny: ["run_shell:rm -rf*"] } }
+    });
+
+    await expect(coordinator.request({
+      kind: "run_shell",
+      summary: "rm -rf /",
+      mutation: true,
+      approvalMode: "full-auto"
+    })).resolves.toBe("deny");
+    expect(requested).toHaveLength(0);
+  });
+
+  it("deny rule wins over always-ask mode (no roundtrip)", async () => {
+    const events = new EventBus();
+    const requested = [];
+    events.on("approval.requested", (event) => requested.push(event));
+    const coordinator = new ApprovalCoordinator({
+      events,
+      settings: { permissions: { deny: ["write_file:secret*"] } }
+    });
+
+    await expect(coordinator.request({
+      kind: "write_file",
+      summary: "secret.env",
+      mutation: true,
+      approvalMode: "always-ask"
+    })).resolves.toBe("deny");
+    expect(requested).toHaveLength(0);
+  });
+
+  it("full-auto allows a non-denied call without emitting an event", async () => {
+    const events = new EventBus();
+    const requested = [];
+    events.on("approval.requested", (event) => requested.push(event));
+    const coordinator = new ApprovalCoordinator({
+      events,
+      settings: { permissions: { deny: ["run_shell:rm -rf*"] } }
+    });
+
+    await expect(coordinator.request({
+      kind: "write_file",
+      summary: "safe.txt",
+      mutation: true,
+      approvalMode: "full-auto"
+    })).resolves.toBe("allow");
+    expect(requested).toHaveLength(0);
+  });
+
   it("remembers always-allow decisions for the rest of the session", async () => {
     const events = new EventBus();
     const coordinator = new ApprovalCoordinator({ events, settings: {} });
@@ -200,6 +254,68 @@ describe("ApprovalCoordinator", () => {
 
     expect(allowed).toBe(false);
     handler.dispose();
+  });
+
+  it("per-turn activeApprovalMode override lets the session requester auto-allow without an approvalMode arg", async () => {
+    const { AgentSession } = await import("../src/agent/conversation.mjs");
+    const session = new AgentSession({
+      settings: { approvalMode: "always-ask", session: { enabled: false }, agents: {}, tools: {} },
+      sessionId: "approval-override",
+      cwd: process.cwd()
+    });
+    await session.initialize();
+    const requested = [];
+    session.events.on("approval.requested", (event) => requested.push(event));
+
+    // Simulate a runTurn having set the per-turn override to full-auto.
+    session.activeApprovalMode = "full-auto";
+    const allowed = await session.approvalRequester({
+      kind: "write_file",
+      summary: "x.txt",
+      mutation: true
+      // no approvalMode arg → override should win over settings.always-ask
+    });
+    expect(allowed).toBe(true);
+    expect(requested).toHaveLength(0);
+
+    // Cleared override → always-ask settings take over and would roundtrip.
+    session.activeApprovalMode = null;
+    session.events.on("approval.requested", (event) => {
+      setImmediate(() => session.approve(event.requestId, "deny"));
+    });
+    const afterClear = await session.approvalRequester({
+      kind: "write_file",
+      summary: "y.txt",
+      mutation: true
+    });
+    expect(afterClear).toBe(false);
+    expect(requested).toHaveLength(1);
+  });
+
+  it("deny rule still wins under a full-auto per-turn override", async () => {
+    const { AgentSession } = await import("../src/agent/conversation.mjs");
+    const session = new AgentSession({
+      settings: {
+        approvalMode: "always-ask",
+        permissions: { deny: ["run_shell:rm -rf*"] },
+        session: { enabled: false },
+        agents: {},
+        tools: {}
+      },
+      sessionId: "approval-override-deny",
+      cwd: process.cwd()
+    });
+    await session.initialize();
+    const requested = [];
+    session.events.on("approval.requested", (event) => requested.push(event));
+    session.activeApprovalMode = "full-auto";
+    const allowed = await session.approvalRequester({
+      kind: "run_shell",
+      summary: "rm -rf /",
+      mutation: true
+    });
+    expect(allowed).toBe(false);
+    expect(requested).toHaveLength(0);
   });
 
   it("emits approval.requested via session.approve roundtrip on AgentSession", async () => {

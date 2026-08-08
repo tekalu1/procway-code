@@ -1,6 +1,6 @@
 import { resolveContext } from "../context/context-resolver.mjs";
 import { buildSystemMessage, refreshSystemMessageSkills, refreshSystemMessageRules } from "./prompt-builder.mjs";
-import { executeToolCall, getToolDefinitions, isMutationTool, DEFERRED_TOOL_NAMES } from "../tools/registry.mjs";
+import { executeToolCall, getToolDefinitions, isMutationTool, validateToolArgs, DEFERRED_TOOL_NAMES } from "../tools/registry.mjs";
 import { createSessionId, saveSessionState } from "../session/store.mjs";
 import { EventLog, readEventLog } from "../session/event-log.mjs";
 import { writeArchivedSnapshot, readSnapshot, SnapshotThrottle } from "../session/snapshot.mjs";
@@ -14,12 +14,15 @@ import {
   buildTaskCompletionRetryPrompt
 } from "./intent.mjs";
 import { McpToolRegistry } from "../mcp/registry.mjs";
-import { ApprovalCoordinator, requestApproval } from "../safety/approval.mjs";
+import { loadConnectionsMcpServers } from "../mcp/connections-servers.mjs";
+import { getProxyAwareFetch } from "../safety/proxy-fetch.mjs";
+import { ApprovalCoordinator, ApprovalParkSignal, requestApproval } from "../safety/approval.mjs";
 import { InteractionCoordinator } from "../runtime/interaction.mjs";
 import { compactMessages, getCompactConfig, getCompactStatus, resolveTailStart, shouldAutoCompact } from "../session/compactor.mjs";
 import { combinePatterns } from "../session/redaction.mjs";
 import { getEncryptionKey } from "../session/encryption.mjs";
 import {
+  buildToolMessage,
   createToolLoopExceededResponse,
   describeTurnAbort,
   executeModelRound,
@@ -28,6 +31,8 @@ import {
   hasToolCalls,
   isToolRoundAllowed
 } from "./turn-orchestrator.mjs";
+import { USER_INTERRUPT_CODE, USER_INTERRUPT_MESSAGE, createUserInterruptAbort } from "./abort.mjs";
+import { randomUUID } from "node:crypto";
 import { EventBus } from "../core/events/bus.mjs";
 import { createEvent } from "../core/events/types.mjs";
 import { createMessage, messageContentToText } from "../core/types/message.mjs";
@@ -38,10 +43,19 @@ import { createUsageTracker } from "../usage-tracker.mjs";
 import { PlanMode, buildDeferredToolResult } from "./plan-mode.mjs";
 import { TodoStore } from "../todos/store.mjs";
 import { resolveActiveModel } from "../config/active-model.mjs";
-import { loadMemoryIndex } from "../memory/store.mjs";
 import { HookRunner } from "../hooks/runner.mjs";
 import { compactMessagesLlm } from "../compactor/llm-summary.mjs";
 import { runProvider } from "../providers/index.mjs";
+import { getSharedJobRegistry } from "../jobs/delegated-jobs.mjs";
+
+// ADR 0037 D1 (Phase 2): EVERY blocking UIR — approval kind included — is a
+// terminal turn action (record the widget → wind the turn down → the user's
+// answer resumes the conversation as a NEW turn). Issue #134 Phase A deferred
+// only the info-gathering kinds (survey / env_vars) behind a kill-switch;
+// Phase 2 generalizes the same record-and-return to all kinds and all
+// surfaces (chat / Slack / Discord), so the per-kind allowlist and the
+// PROCWAY_UIR_INFO_DEFER kill-switch are gone. Only an explicit
+// `blocking: false` request stays a fire-and-forget nudge (no wind-down).
 
 /**
  * AgentSession — runs a single agent conversation session.
@@ -74,20 +88,15 @@ export class AgentSession {
     // session. true only for serve-hosted sessions (chat / Slack); false for
     // one-shot `procway-code -p` run-loop workers and the TUI, which have no
     // interaction surface. When false, request_user_action returns a `skipped`
-    // result immediately instead of stalling on the 15-min coordinator fallback
+    // result immediately instead of recording a request nobody can ever answer
     // (the worker then falls back to prose elicitation per the task SKILLs).
     interactive = false,
-    // Run-loop hearing return mode (§6 rework). When true, a `request_user_action`
-    // does NOT block the turn on the InteractionCoordinator: it records the
-    // request (emits interaction.requested so the dashboard persists it into
-    // pending_interactions), then resolves the tool IMMEDIATELY and asks the
-    // model to end its turn. Control returns to the run loop, which returns
-    // `awaiting-user-input` with the interaction details; the user answers via a
-    // widget, the answer is saved, and `run loop resume` re-opens THIS session
-    // (resume from the saved transcript) with the answer injected as a message.
-    // This replaces the Phase 5 "block + live cross-session resolve" path for
-    // run-loop workers. AI CHAT sessions (a human is co-present) keep the
-    // blocking behaviour — only run-loop-spawned worker sessions set this.
+    // Run-loop hearing return mode (§6 rework). Historically this made ONLY
+    // run-loop workers record-and-return on request_user_action; ADR 0037 D1
+    // (Phase 2) made record-and-return the universal semantics, so the flag no
+    // longer changes UIR behaviour. It is kept as a session tag (sticky across
+    // resume, threaded from serve's ?hearingMode=return) because the serve /
+    // run-loop plumbing still reads it to describe the session.
     hearingReturnMode = false,
     pendingTaskCompletionReminder = false
   }) {
@@ -131,11 +140,23 @@ export class AgentSession {
     this.mcpStarted = false;
     this.approvalCoordinator = approvalCoordinator
       ?? new ApprovalCoordinator({ events, settings, defaultMode: settings?.approvalMode ?? "auto-readonly" });
-    this.approvalRequester = approvalRequester ?? createSessionApprovalRequester({
-      coordinator: this.approvalCoordinator,
-      settings: this.settings,
-      sessionId: this.sessionId
-    });
+    // ADR 0037 D1 — parked tool approvals. A mid-turn "ask" verdict no longer
+    // blocks a Promise on the coordinator: the requester registers an entry
+    // here (persisted in the snapshot — the checkpoint), throws
+    // ApprovalParkSignal so the tool settles as a "parked" placeholder, and
+    // runTurn winds the turn down. `resolveParkedApproval` later re-drives the
+    // tool and the remaining rounds. Map<requestId, ParkedApproval>.
+    this.parkedApprovals = new Map();
+    // requestIds parked DURING THE CURRENT round — the turn wind-down trigger
+    // (mirror of pausedForInput). Reset at every turn/continuation start.
+    this.pausedForApproval = null;
+    // The current/most-recent turn's user-message id — parked entries carry it
+    // so the continuation's lifecycle events reference the right turn.
+    this.currentTurnMessageId = null;
+    // The most recent turn's provider seam (tests script rounds through it) so
+    // a parked continuation stays on the same provider. Null in production.
+    this.turnRunProviderImpl = null;
+    this.approvalRequester = approvalRequester ?? createParkingApprovalRequester({ session: this });
     // UIR (User Interaction Request) coordinator — generic, non-gated round-trip
     // for request_user_action. Separate from approvals (which keep their 3-value
     // gate semantics). Shares the same EventBus.
@@ -175,6 +196,13 @@ export class AgentSession {
     // offers the model and #executeUnhookedToolCall skips any mutation tool
     // as defense-in-depth. Reset to null in runTurn's finally.
     this.activeToolPolicy = null;
+    // Per-turn approval-mode override supplied via runTurn options. Takes
+    // precedence over settings.approvalMode for the duration of the turn (used
+    // by the run-loop worker path to force "full-auto" — a programmatic worker
+    // session has no approval-UI receiver, so blocking on approval would freeze
+    // the turn until timeout). Reset to null in runTurn's finally. deny rules
+    // still win regardless (ApprovalCoordinator evaluates deny first).
+    this.activeApprovalMode = null;
     // A caller-supplied system-prompt addendum (e.g. the setup wizard's
     // persona) is folded into the session's system message exactly once.
     this.systemPromptAppendApplied = false;
@@ -345,6 +373,27 @@ export class AgentSession {
       // tools it used before the restart).
       this.loadedTools = snapshot.loadedTools.filter((name) => typeof name === "string");
     }
+    if (Array.isArray(snapshot.parkedApprovals) && snapshot.parkedApprovals.length > 0) {
+      // ADR 0037 D1: restore parked tool approvals so a decision arriving
+      // after a Pod restart still finds its checkpoint. The serve bridge
+      // replays approval.requested from listParkedApprovals() on attach, so
+      // reconnecting clients rebuild their cards too.
+      for (const entry of snapshot.parkedApprovals) {
+        if (entry && typeof entry.requestId === "string" && entry.requestId.length > 0) {
+          this.parkedApprovals.set(entry.requestId, { ...entry });
+        }
+      }
+    }
+    if (Array.isArray(snapshot.delegatedJobs) && snapshot.delegatedJobs.length > 0) {
+      // ADR 0037 D4: rehydrate this session's delegated jobs (background
+      // run_shell / spawn_agent) into the shared registry so shell_job /
+      // status queries after a Pod restart answer truthfully — a job that was
+      // 'running' is restored as failed ("lost to an agent restart") instead
+      // of vanishing into "unknown shellId". Id-collision-safe (live wins).
+      try {
+        getSharedJobRegistry().rehydrateJobs(snapshot.delegatedJobs);
+      } catch { /* best-effort: job rehydration must never block resume */ }
+    }
     if (Array.isArray(snapshot.usageEvents) && snapshot.usageEvents.length > 0) {
       // Re-create usage tracker with saved events so cumulative totals are correct
       if (typeof this.usageTracker?.dispose === "function") {
@@ -391,8 +440,254 @@ export class AgentSession {
     return this.interactionCoordinator.resolveInteraction(requestId, response, { sessionId: this.sessionId });
   }
 
+  /**
+   * Session-level UIR requester wired into executeToolCall on interactive
+   * sessions. ADR 0037 D1 (Phase 2): EVERY blocking request_user_action —
+   * every kind, every surface — is record-and-return: it records the request
+   * (emits interaction.requested for the surface to persist/render), captures
+   * the requestId, stamps `pausedForInput` so runTurn deterministically winds
+   * the turn down, and returns a deferred marker instructing the model to stop
+   * — the surface resumes the conversation in a NEW turn once the user
+   * answers (chat/Slack/Discord inject the answer; run-loop workers resume via
+   * `run loop resume`). Only an explicit `blocking: false` call remains a
+   * fire-and-forget nudge (emit + continue, no wind-down). Not #private so it
+   * is unit-testable in isolation.
+   */
+  async requestUserInteraction({ kind, summary, spec, blocking } = {}) {
+    if (blocking === false) {
+      // Fire-and-forget nudge: record + continue the turn.
+      return this.interactionCoordinator.request({
+        kind, summary, spec, blocking: false, sessionId: this.sessionId
+      });
+    }
+    const r = await this.interactionCoordinator.request({
+      kind, summary, spec, blocking: false, sessionId: this.sessionId
+    });
+    const requestId = r && typeof r === "object" ? r.requestId : null;
+    this.pausedForInput = {
+      requestId,
+      kind,
+      ...(summary ? { summary } : {}),
+      ...(spec && typeof spec === "object" ? { spec } : {})
+    };
+    return { requestId, blocking: false, deferred: true };
+  }
+
   approve(requestId, decision) {
+    // ADR 0037 D1: a parked approval (mid-turn ask that folded the turn)
+    // resolves through the checkpoint/park machinery — apply the decision,
+    // re-drive the tool, and continue the turn's remaining rounds detached.
+    if (this.parkedApprovals?.has?.(requestId)) {
+      return this.resolveParkedApproval(requestId, decision);
+    }
+    // Legacy blocking round-trip (non-turn contexts: TUI pre-gates, ad-hoc).
     return this.approvalCoordinator.resolve(requestId, decision, { sessionId: this.sessionId });
+  }
+
+  /**
+   * ADR 0037 D5: snapshot descriptors of every parked approval so the serve
+   * bridge can replay `approval.requested` to a (re)attaching client — this is
+   * what restores approval cards across reload AND Pod restart (the entries
+   * themselves are restored from the session snapshot).
+   */
+  listParkedApprovals() {
+    return [...this.parkedApprovals.values()].map((e) => ({
+      requestId: e.requestId,
+      kind: e.kind,
+      summary: e.summary ?? "",
+      payload: e.payload,
+      sessionId: this.sessionId
+    }));
+  }
+
+  /**
+   * Resolve a parked tool approval (ADR 0037 D1 — the resume half of
+   * checkpoint/park). Applies the decision NOW (entry consumed, always-allow
+   * recorded, approval.resolved broadcast) and re-drives the tool + the
+   * turn's remaining rounds DETACHED — the caller (bridge `approve` command /
+   * TUI prompt) gets a prompt accepted/rejected answer while the continuation
+   * streams as normal session events.
+   *
+   * Returns false when the requestId is unknown (already resolved / never
+   * parked here) or a turn is currently running (the continuation cannot
+   * safely interleave — the caller retries once the turn settles).
+   */
+  resolveParkedApproval(requestId, decision) {
+    const entry = this.parkedApprovals.get(requestId);
+    if (!entry) return false;
+    if (this.runningTurn) return false;
+    const normalized = decision === "allow" || decision === "always-allow" || decision === "deny"
+      ? decision
+      : "deny";
+    this.parkedApprovals.delete(requestId);
+    if (normalized === "always-allow") this.approvalCoordinator.alwaysAllow.add(entry.kind);
+    this.events.emit(createEvent("approval.resolved", {
+      sessionId: this.sessionId,
+      requestId,
+      decision: normalized
+    }));
+    // Detached: the tool re-drive + remaining rounds can run for minutes; the
+    // resolver must answer promptly. Errors surface as turn.failed inside.
+    void this.#resumeParkedApproval(entry, normalized).catch((error) => {
+      console.warn(`[approval] parked resume failed (${requestId}): ${error?.message ?? error}`);
+    });
+    return true;
+  }
+
+  /**
+   * Re-drive a parked tool call after the user's decision, then continue the
+   * folded turn's remaining rounds. allow/always-allow executes the tool for
+   * real (per-call full-auto — the user just approved THIS call; deny rules
+   * still win inside evaluate()); deny settles it as the standard skipped
+   * result so the model can adapt. Either way the parked placeholder
+   * tool_result is REPLACED IN PLACE (a second tool message for the same
+   * toolCallId would be a provider-invalid transcript).
+   */
+  async #resumeParkedApproval(entry, decision) {
+    if (!this.initialized) await this.initialize();
+    // plan_apply parks have no tool message — they gate the plan queue itself.
+    if (entry.kind === "plan_apply") {
+      if (decision === "deny") {
+        this.planMode.discard("user-rejected");
+      } else {
+        await this.planMode.apply({
+          executeImpl: async (planEntry) => this.executeSingleToolCall({
+            id: planEntry.entryId,
+            name: planEntry.name,
+            args: planEntry.args
+          })
+        });
+      }
+      await this.save({ force: true });
+      return;
+    }
+
+    const located = this.#findParkedToolCall(entry.requestId);
+    if (!located) {
+      // The placeholder vanished (compaction ate it / foreign snapshot edit /
+      // a tool that swallowed the park signal and settled with its own error
+      // result). Nothing to re-drive, but the turn is still folded — persist
+      // the consumed entry and, when no other park holds it, continue the
+      // rounds so the conversation doesn't dangle (the model adapts to
+      // whatever result the transcript actually carries).
+      await this.save({ force: true });
+      if (this.parkedApprovals.size === 0) {
+        await this.#continueParkedRounds(entry.turnMessageId ?? null);
+      }
+      return;
+    }
+    const { toolMessage, toolUse } = located;
+    const toolCall = { id: toolUse.toolCallId, name: toolUse.name, args: toolUse.args ?? {} };
+
+    let toolResult;
+    if (decision === "deny") {
+      toolResult = {
+        id: toolCall.id,
+        name: toolCall.name,
+        ok: true,
+        result: {
+          kind: entry.kind === "mcp" ? "mcp" : (toolCall.name === "run_shell" ? "run_shell" : "write_file"),
+          summary: `Skipped (user denied approval): ${toolCall.name}`,
+          data: { skipped: true, tool: toolCall.name, error: "User denied approval", approvalRequestId: entry.requestId }
+        }
+      };
+    } else {
+      // Per-call grant: the user approved THIS tool call, so run it under
+      // full-auto for the duration of the replay (deny rules still win —
+      // evaluate() checks them first regardless of mode).
+      const prevMode = this.activeApprovalMode;
+      this.activeApprovalMode = "full-auto";
+      this.events.emit(createEvent("tool.call.started", {
+        sessionId: this.sessionId,
+        toolCallId: toolCall.id,
+        name: toolCall.name
+      }));
+      try {
+        const result = await this.executeSingleToolCall(toolCall);
+        toolResult = { id: toolCall.id, name: toolCall.name, ok: true, result };
+      } catch (error) {
+        toolResult = { id: toolCall.id, name: toolCall.name, ok: false, error: error?.message ?? String(error) };
+      } finally {
+        this.activeApprovalMode = prevMode ?? null;
+      }
+    }
+
+    // In-place replacement: build the real tool message (same event side
+    // effects as the normal append path) and swap its content onto the parked
+    // placeholder message so transcript position + toolCallId pairing hold.
+    const replacement = buildToolMessage({ session: this, toolResult });
+    toolMessage.content = replacement.content;
+    await this.save({ force: true });
+
+    // Other approvals from the same round still parked → stay folded until the
+    // last decision lands; the final resolve drives the continuation.
+    if (this.parkedApprovals.size > 0) return;
+    await this.#continueParkedRounds(entry.turnMessageId ?? null);
+  }
+
+  /**
+   * Locate the parked placeholder tool message (by its approvalRequestId
+   * marker) and the paired assistant tool_use block carrying name+args.
+   */
+  #findParkedToolCall(requestId) {
+    for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+      const message = this.messages[i];
+      if (message?.role !== "tool" || !Array.isArray(message.content)) continue;
+      const block = message.content.find((b) => b?.kind === "tool_result"
+        && b.result?.data?.parked === true
+        && b.result?.data?.approvalRequestId === requestId);
+      if (!block) continue;
+      const toolCallId = block.toolCallId ?? message.toolCallId;
+      for (let j = i - 1; j >= 0; j -= 1) {
+        const candidate = this.messages[j];
+        if (candidate?.role !== "assistant" || !Array.isArray(candidate.content)) continue;
+        const toolUse = candidate.content.find((b) => b?.kind === "tool_use" && b.toolCallId === toolCallId);
+        if (toolUse) return { toolMessage: message, toolUse };
+      }
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * Continue a parked turn's remaining rounds from the checkpoint (the saved
+   * transcript now ending with the real tool result). Same lifecycle discipline
+   * as runTurn — re-entrancy guard, fresh abort controller, idle watchdog —
+   * but no new user message: the model round simply resumes where the fold
+   * happened, so the user sees one continuous turn.
+   */
+  async #continueParkedRounds(turnMessageId) {
+    if (this.runningTurn) return;
+    this.pausedForInput = null;
+    this.pausedForApproval = null;
+    this.resetInterrupt();
+    this.turnAbortController = new AbortController();
+    this.runningTurn = true;
+    this.turnIdleAborted = false;
+    const watchdog = this.#startIdleWatchdog();
+    try {
+      this.fileMutationRetry = { count: 0, lastSignature: null };
+      await this.#runRounds({
+        turnUserMessageId: turnMessageId ?? undefined,
+        maxToolRounds: this.settings.tools?.maxToolRounds ?? 150,
+        needsFileMutation: false,
+        requiresTaskComplete: this.procwayMeta != null,
+        procwayMeta: this.procwayMeta,
+        turnStartIndex: this.messages.length,
+        // Same provider seam the parked turn ran with (test-scripted rounds
+        // continue scripted; production is always null → real runProvider).
+        ...(this.turnRunProviderImpl ? { runProviderImpl: this.turnRunProviderImpl } : {})
+      });
+    } catch (error) {
+      // #runRounds already emitted turn.failed; a detached continuation has no
+      // caller to rethrow to.
+      console.warn(`[approval] parked continuation failed: ${error?.message ?? error}`);
+    } finally {
+      watchdog.clear();
+      this.runningTurn = false;
+      this.activeToolPolicy = null;
+      this.activeApprovalMode = null;
+    }
   }
 
   /**
@@ -406,7 +701,11 @@ export class AgentSession {
     if (this.interruptRequested) return false;
     this.interruptRequested = true;
     try {
-      this.turnAbortController?.abort();
+      // Abort with a TAGGED reason: undici rejects the in-flight fetch with it,
+      // the scheduler settles running tools with it, and run_shell kills its
+      // process group on it — so every layer reports the same
+      // "Interrupted by user" instead of a raw DOMException.
+      this.turnAbortController?.abort(createUserInterruptAbort());
     } catch { /* ignore double-aborts */ }
     return true;
   }
@@ -418,7 +717,25 @@ export class AgentSession {
 
   async startMcpTools() {
     if (!this.mcpRegistry) {
-      this.mcpRegistry = new McpToolRegistry({ settings: this.settings, cwd: this.cwd });
+      // Dashboard-distributed remote MCP servers (connections snapshot) merge
+      // UNDER settings.mcpServers — an explicit local settings entry wins on
+      // id collision. In SaaS Pods the settings snapshot never carries
+      // mcpServers, so real collisions only occur in standalone use.
+      const derived = await loadConnectionsMcpServers(this.cwd);
+      for (const id of Object.keys(derived)) {
+        if (this.settings?.mcpServers?.[id]) {
+          console.warn(`[mcp] Connection-distributed server "${id}" is shadowed by settings.mcpServers.${id}`);
+        }
+      }
+      const mcpServers = { ...derived, ...(this.settings?.mcpServers ?? {}) };
+      this.mcpRegistry = new McpToolRegistry({
+        settings: { ...this.settings, mcpServers },
+        cwd: this.cwd,
+        // Session Pods can only egress via the proxy (undici's global fetch
+        // ignores HTTPS_PROXY) — remote MCP servers are unreachable without
+        // the proxy-aware dispatcher. No-op outside the Pod.
+        fetchImpl: getProxyAwareFetch()
+      });
     }
     if (!this.mcpStarted && typeof this.mcpRegistry.start === "function") {
       await this.mcpRegistry.start();
@@ -453,9 +770,17 @@ export class AgentSession {
     }
   }
 
-  async executeSingleToolCall(toolCall, { onProgress = null } = {}) {
+  async executeSingleToolCall(toolCall, { onProgress = null, signal = null } = {}) {
+    // Callers that predate the abort plumbing (plan apply, parked-approval
+    // replay) pass no signal — fall back to the live turn's controller so a
+    // Stop still reaches the tool.
+    const abortSignal = signal ?? this.turnAbortController?.signal ?? null;
     this.#noteDeferredTools(toolCall);
     if (this.planMode?.shouldDefer(toolCall.name, toolCall.args)) {
+      // Validate BEFORE queuing: a truncated/invalid write must fail the model
+      // now (ok:false, retryable) instead of being queued as a pending plan
+      // entry that only throws later at apply time, past the point of recovery.
+      validateToolArgs(toolCall.name, toolCall.args);
       const summary = describeToolForPlan(toolCall);
       this.planMode.enqueue({
         name: toolCall.name,
@@ -475,7 +800,21 @@ export class AgentSession {
         };
       }
     }
-    const result = await this.#executeUnhookedToolCall(toolCall, { onProgress });
+    let result;
+    try {
+      result = await this.#executeUnhookedToolCall(toolCall, { onProgress, signal: abortSignal });
+    } catch (error) {
+      // ADR 0037 D1: a mid-turn "ask" verdict parks the tool instead of
+      // blocking. The requester already registered the parked entry + emitted
+      // approval.requested; settle THIS call as a placeholder result carrying
+      // the requestId marker (resolveParkedApproval finds and replaces it in
+      // place after the user decides). runTurn folds the turn after the round.
+      if (error instanceof ApprovalParkSignal) {
+        result = this.#buildParkedToolResult(toolCall, error);
+      } else {
+        throw error;
+      }
+    }
     if (this.hooksRunner) {
       await this.hooksRunner.runPostToolUse({
         toolName: toolCall.name,
@@ -487,7 +826,29 @@ export class AgentSession {
     return result;
   }
 
-  async #executeUnhookedToolCall(toolCall, { onProgress = null } = {}) {
+  /**
+   * The placeholder ToolResult a parked tool call settles with (ADR 0037 D1).
+   * `data.parked` + `data.approvalRequestId` are the resume markers; the
+   * `note` tells the model the turn is folding so it doesn't improvise around
+   * the missing result.
+   */
+  #buildParkedToolResult(toolCall, signal) {
+    const kind = toolCall.name === "run_shell" || toolCall.name === "shell_job"
+      ? "run_shell"
+      : (this.mcpRegistry?.isMcpTool?.(toolCall.name) ? "mcp" : "write_file");
+    return {
+      kind,
+      summary: `Approval pending: ${toolCall.name}`,
+      data: {
+        parked: true,
+        approvalRequestId: signal.requestId,
+        tool: toolCall.name,
+        note: "This tool call is awaiting the user's approval and was NOT executed. Your turn is ending now; when the user approves it will run automatically and the conversation will continue with its real result. Do NOT retry it and do NOT assume an outcome."
+      }
+    };
+  }
+
+  async #executeUnhookedToolCall(toolCall, { onProgress = null, signal = null } = {}) {
     // Read-only turns (e.g. the setup wizard's repo-analysis phase) must not
     // run mutation tools even if the model tries. executeModelRound already
     // hides them from the tool list; this is the enforcement backstop and
@@ -500,11 +861,17 @@ export class AgentSession {
       };
     }
     if (this.mcpRegistry?.isMcpTool(toolCall.name)) {
+      // MCP tools skip registry.executeToolCall, so run the same arg check here
+      // — otherwise an invalid-args marker (truncated/malformed JSON) would be
+      // sent verbatim to the external MCP server AND shown in the approval
+      // payload. No schema for MCP tools, so only the marker guard fires; the
+      // throw becomes an ok:false result the model can retry.
+      validateToolArgs(toolCall.name, toolCall.args);
       const allowed = await this.approvalRequester({
         kind: "mcp",
         summary: toolCall.name,
         mutation: true,
-        approvalMode: this.settings?.approvalMode,
+        approvalMode: this.activeApprovalMode ?? this.settings?.approvalMode,
         permissions: this.settings?.permissions,
         payload: { tool: toolCall.name, args: toolCall.args }
       });
@@ -529,6 +896,12 @@ export class AgentSession {
       name: toolCall.name,
       args: toolCall.args,
       approvalRequester: this.approvalRequester,
+      // Per-turn approval-mode override (run-loop worker forces full-auto).
+      // executeToolCall's internal `gate` and safe-fetch read this instead of
+      // settings.approvalMode directly, so the override reaches EVERY tool's
+      // approval decision — not just requester-direct paths. deny rules still
+      // win (ApprovalCoordinator evaluates deny first, mode-independent).
+      approvalMode: this.activeApprovalMode ?? this.settings?.approvalMode,
       // Only wire the requester when a surface can answer (serve: chat/Slack).
       // For non-interactive sessions (`-p` run-loop worker, TUI) leave it null
       // so the registry returns a `skipped` result at once instead of blocking
@@ -540,31 +913,25 @@ export class AgentSession {
       // dashboard persists it) and return a non-blocking marker so the registry
       // resolves the tool at once and instructs the model to end the turn.
       interactionRequester: this.interactive
-        ? ({ kind, summary, spec, blocking }) => {
-            if (this.hearingReturnMode) {
-              // Force non-blocking: emit interaction.requested for the surface to
-              // record, capture the requestId, mark the session paused so the
-              // turn winds down. The model gets a result telling it to stop.
-              const res = this.interactionCoordinator.request({
-                kind, summary, spec, blocking: false, sessionId: this.sessionId
-              });
-              return Promise.resolve(res).then((r) => {
-                const requestId = r && typeof r === "object" ? r.requestId : null;
-                this.pausedForInput = {
-                  requestId,
-                  kind,
-                  ...(summary ? { summary } : {}),
-                  ...(spec && typeof spec === "object" ? { spec } : {})
-                };
-                return { requestId, blocking: false, deferred: true };
-              });
-            }
-            return this.interactionCoordinator.request({ kind, summary, spec, blocking, sessionId: this.sessionId });
-          }
+        ? (req) => this.requestUserInteraction(req)
         : null,
-      childAgentRunner: (childArgs) => this.childAgentManager.run({ ...childArgs, depth: this.depth }),
+      // S-4: `childArgs.signal` is the delegated-job registry's own kill switch
+      // (agent-driver). `parentSignal` adds THIS turn's Stop, so interrupting
+      // the parent also tears down the child's provider rounds instead of
+      // leaving a detached child burning tokens.
+      childAgentRunner: (childArgs) => this.childAgentManager.run({
+        ...childArgs,
+        depth: this.depth,
+        parentSignal: signal
+      }),
       todoStore: this.todoStore,
-      onProgress
+      onProgress,
+      // Threaded to the tools that can actually stop (run_shell kills its
+      // process group; shell_job wait breaks its poll loop).
+      signal,
+      // ADR 0037 D4: stamp delegated jobs (background run_shell / spawn_agent)
+      // with the owning session so save() can snapshot them per session.
+      sessionId: this.sessionId
     });
     if (!isToolResult(result)) {
       throw new TypeError(`executeSingleToolCall: tool "${toolCall.name}" did not return a ToolResult`);
@@ -576,8 +943,13 @@ export class AgentSession {
     maxToolRounds = this.settings.tools?.maxToolRounds ?? 150,
     systemPromptAppend = null,
     toolPolicy = null,
+    approvalMode = null,
     attachments = [],
-    sessionContext = null
+    sessionContext = null,
+    // Provider seam (mirrors executeModelRound's own runProviderImpl param):
+    // lets tests script model rounds without a live provider. Production
+    // callers leave it undefined and the real runProvider is used.
+    runProviderImpl = undefined
   } = {}) {
     // Reject re-entrant turns. A single AgentSession instance is shared across
     // every WS connection to the same conversation (serve liveSessions cache),
@@ -596,12 +968,33 @@ export class AgentSession {
       error.code = "TURN_IN_PROGRESS";
       throw error;
     }
+    // A fresh turn always starts un-paused. `pausedForInput` is stamped when a
+    // deferred UIR winds the PREVIOUS turn down; on a reused live session
+    // (browser chat keeps ONE AgentSession across turns) a stale value would trip
+    // the wind-down guard on the resume turn's first tool round and end it early.
+    // Run-loop workers recreate the session from the snapshot each resume so they
+    // never carried it, but clearing here is correct for every surface.
+    this.pausedForInput = null;
+    this.pausedForApproval = null;
+    // Remember this turn's provider seam so a parked-approval continuation
+    // (#continueParkedRounds) re-drives the SAME provider the turn started
+    // with. Production callers never pass one (null → real runProvider); a
+    // cold resume after a Pod restart also gets null, which is correct — the
+    // rebuilt session talks to the configured provider.
+    this.turnRunProviderImpl = runProviderImpl ?? null;
     if (!this.initialized) await this.initialize();
     // Per-turn knobs threaded from the serve bridge's runTurn args.options.
     // `toolPolicy: "read-only"` and a `systemPromptAppend` persona are how the
     // dashboard's project-setup wizard runs a dedicated, write-disabled
     // analysis session without changing the global agent settings.
     this.activeToolPolicy = toolPolicy === "read-only" ? "read-only" : null;
+    // Per-turn approval-mode override (same reset discipline as activeToolPolicy
+    // above — cleared in the finally). Only accept the three known modes;
+    // anything else falls back to settings.approvalMode (null → no override).
+    this.activeApprovalMode =
+      (approvalMode === "always-ask" || approvalMode === "auto-readonly" || approvalMode === "full-auto")
+        ? approvalMode
+        : null;
     if (typeof systemPromptAppend === "string" && systemPromptAppend.trim() && !this.systemPromptAppendApplied) {
       this.#applySystemPromptAppend(systemPromptAppend.trim());
     }
@@ -630,21 +1023,120 @@ export class AgentSession {
     this.turnAbortController = new AbortController();
     this.runningTurn = true;
     this.turnIdleAborted = false;
-    // Idle watchdog. A turn that emits NO agent event for a stretch is stalled:
-    // e.g. an upstream that keeps the HTTP stream alive with keep-alive comments
-    // (so llm-fetch's inter-chunk bodyTimeout never trips) yet never produces a
-    // token, or a hung tool. Real progress — reasoning/message deltas, tool and
-    // activity events — bumps `lastProgress`, so a healthy turn (even a long
-    // agentic one with many tool rounds) never fires this; only a truly idle one
-    // does. On fire we abort the turn so it surfaces as turn.failed (retryable)
-    // instead of hanging "model waiting" forever. Tunable; 0 disables.
-    // Default 180s (was 90s): a reasoning model's keepalive frames now bump this
-    // (openai-codex forwards them as activity.tick heartbeats), so the old 90s
-    // no longer false-fires on a healthy long-thinking turn. We also keep the
-    // default >= llm-fetch's 120s body timeout so a genuine stream stall is
-    // surfaced by the body timeout (clearer "stream died" semantics) before this
-    // coarser watchdog — this stays the backstop for non-stream hangs (a wedged
-    // tool emitting no events). Tunable via PROCWAY_TURN_IDLE_TIMEOUT_MS; 0 disables.
+    const watchdog = this.#startIdleWatchdog();
+    try {
+      const turnStartIndex = this.messages.length;
+      // Per-turn file-mutation retry accounting (turn-orchestrator caps the
+      // "you didn't write the file" nudge loop). Reset so a prior turn's count
+      // never carries over on a reused live session.
+      this.fileMutationRetry = { count: 0, lastSignature: null };
+      const needsFileMutation = requiresFileMutation(prompt);
+      // A: seed session-level procwayMeta from the first worker prompt that
+      // arrives. Subsequent ChatPanel messages have no Meta block but still
+      // inherit the enforcement because this.procwayMeta sticks.
+      if (this.procwayMeta == null && requiresTaskCompletion(prompt)) {
+        this.procwayMeta = extractProcwayMeta(prompt);
+      }
+      const requiresTaskComplete = this.procwayMeta != null;
+      const procwayMeta = this.procwayMeta;
+      // B: if the previous turn ended without `task complete`, prepend a
+      // synthetic reminder so the model addresses it before whatever new
+      // question came in. Re-confirm the condition (user may have run the CLI
+      // manually between turns) so we don't spam the reminder after the fact.
+      let effectivePrompt = prompt;
+      if (this.pendingTaskCompletionReminder) {
+        const stillNeedsReminder = shouldRemindTaskCompletion(this);
+        if (stillNeedsReminder) {
+          effectivePrompt = `<system-reminder>\nprocway runner: the previous turn ended without invoking \`task complete\`. ${buildTaskCompletionRetryPrompt(this.procwayMeta)}\n</system-reminder>\n\n${prompt}`;
+        }
+        this.pendingTaskCompletionReminder = false;
+      }
+      // Attachments (dashboard uploads, referenced by id) ride alongside the
+      // prompt text. They stay lightweight here — the provider hydration layer
+      // fetches + base64-inlines the bytes over HTTP only at request time (the
+      // single attachment transport; sessions have no shared-volume path).
+      const cleanAttachments = Array.isArray(attachments)
+        ? attachments.filter((a) => a && typeof a.id === "string" && a.id.length > 0)
+        : [];
+      const attachmentBlocks = cleanAttachments.map(
+        (a) => ({ kind: "attachment_ref", id: a.id, ...(a.mime ? { mime: a.mime } : {}), ...(typeof a.name === "string" && a.name ? { name: a.name } : {}) })
+      );
+      // Surface the attachment ids to the MODEL: hydration replaces the refs
+      // with inline images (or nothing it can touch), so without this note the
+      // model can SEE an attachment but has no handle to fetch the actual file
+      // (save_attachment needs the id). One text block after the refs.
+      const attachmentNoteBlocks = cleanAttachments.length > 0
+        ? [{ kind: "text", text: buildAttachmentNote(cleanAttachments) }]
+        : [];
+      const userMessage = createMessage({
+        role: "user",
+        sessionId: this.sessionId,
+        content: [{ kind: "text", text: effectivePrompt }, ...attachmentBlocks, ...attachmentNoteBlocks]
+      });
+      this.messages.push(userMessage);
+      const turnUserMessageId = userMessage.id;
+      this.currentTurnMessageId = turnUserMessageId;
+      if (this.hooksRunner) {
+        const promptHookOutcome = await this.hooksRunner.runUserPromptSubmit({ messageId: turnUserMessageId, prompt }).catch(() => ({ blocked: false }));
+        if (promptHookOutcome?.blocked) {
+          this.messages.pop();
+          this.events.emit(createEvent("turn.failed", {
+            sessionId: this.sessionId,
+            round: 0,
+            messageId: turnUserMessageId,
+            error: { message: `User prompt blocked by hook (exit ${promptHookOutcome.exitCode})`, code: "hook_blocked" }
+          }));
+          // The enclosing finally clears runningTurn / the watchdog — the old
+          // pre-refactor early return leaked both and wedged the session.
+          return { error: { message: "User prompt blocked by hook", code: "hook_blocked" } };
+        }
+      }
+      this.events.emit(createEvent("user.prompt.submitted", {
+        sessionId: this.sessionId,
+        messageId: turnUserMessageId,
+        content: userMessage.content
+      }));
+      await this.save();
+
+      return await this.#runRounds({
+        turnUserMessageId,
+        maxToolRounds,
+        needsFileMutation,
+        requiresTaskComplete,
+        procwayMeta,
+        turnStartIndex,
+        runProviderImpl
+      });
+    } finally {
+      watchdog.clear();
+      this.runningTurn = false;
+      this.activeToolPolicy = null;
+      this.activeApprovalMode = null;
+    }
+  }
+
+  /**
+   * Idle watchdog. A turn that emits NO agent event for a stretch is stalled:
+   * e.g. an upstream that keeps the HTTP stream alive with keep-alive comments
+   * (so llm-fetch's inter-chunk bodyTimeout never trips) yet never produces a
+   * token, or a hung tool. Real progress — reasoning/message deltas, tool and
+   * activity events — bumps `lastProgress`, so a healthy turn (even a long
+   * agentic one with many tool rounds) never fires this; only a truly idle one
+   * does. On fire we abort the turn so it surfaces as turn.failed (retryable)
+   * instead of hanging "model waiting" forever.
+   *
+   * ADR 0037 D2: there is no pause-on-pending branch any more — user waits are
+   * terminal (UIRs and tool approvals both wind the turn down), so a turn is
+   * never legitimately silent waiting on a human. Only real work is measured.
+   *
+   * Default 180s: a reasoning model's keepalive frames bump this (openai-codex
+   * forwards them as activity.tick heartbeats). Kept >= llm-fetch's 120s body
+   * timeout so a genuine stream stall surfaces there first with clearer
+   * semantics. Tunable via PROCWAY_TURN_IDLE_TIMEOUT_MS; 0 disables.
+   * Returns `{ clear }` — the caller owns the lifecycle (runTurn / parked
+   * continuation both use it).
+   */
+  #startIdleWatchdog() {
     const rawIdle = Number(process.env.PROCWAY_TURN_IDLE_TIMEOUT_MS);
     const idleMs = Number.isFinite(rawIdle) && rawIdle >= 0 ? rawIdle : 180_000;
     let lastProgress = Date.now();
@@ -653,14 +1145,6 @@ export class AgentSession {
     if (idleMs > 0) {
       this.events.on("*", bumpProgress);
       idleTimer = setInterval(() => {
-        // Pause the watchdog while a UIR / approval is awaiting a human: those
-        // go silent (no events) by design until the user responds, which is not
-        // a stall. Bumping keeps the turn alive; the coordinators carry their
-        // own fallback timeout so a vanished surface can't hang forever.
-        if (this.interactionCoordinator?.hasPending?.() || this.approvalCoordinator?.hasPending?.()) {
-          lastProgress = Date.now();
-          return;
-        }
         if (Date.now() - lastProgress > idleMs) {
           // Abort WITH a typed reason so the catch path can render a clear
           // message ("model went silent") instead of the raw DOMException
@@ -673,97 +1157,55 @@ export class AgentSession {
       }, Math.max(1000, Math.floor(idleMs / 4)));
       if (typeof idleTimer.unref === "function") idleTimer.unref();
     }
-    const clearIdleWatchdog = () => {
-      if (idleTimer) { clearInterval(idleTimer); idleTimer = null; }
-      try { this.events.off("*", bumpProgress); } catch { /* ignore */ }
+    return {
+      clear: () => {
+        if (idleTimer) { clearInterval(idleTimer); idleTimer = null; }
+        try { this.events.off("*", bumpProgress); } catch { /* ignore */ }
+      }
     };
-    const turnStartIndex = this.messages.length;
-    const needsFileMutation = requiresFileMutation(prompt);
-    // A: seed session-level procwayMeta from the first worker prompt that
-    // arrives. Subsequent ChatPanel messages have no Meta block but still
-    // inherit the enforcement because this.procwayMeta sticks.
-    if (this.procwayMeta == null && requiresTaskCompletion(prompt)) {
-      this.procwayMeta = extractProcwayMeta(prompt);
-    }
-    const requiresTaskComplete = this.procwayMeta != null;
-    const procwayMeta = this.procwayMeta;
-    // B: if the previous turn ended without `task complete`, prepend a
-    // synthetic reminder so the model addresses it before whatever new
-    // question came in. Re-confirm the condition (user may have run the CLI
-    // manually between turns) so we don't spam the reminder after the fact.
-    let effectivePrompt = prompt;
-    if (this.pendingTaskCompletionReminder) {
-      const stillNeedsReminder = shouldRemindTaskCompletion(this);
-      if (stillNeedsReminder) {
-        effectivePrompt = `<system-reminder>\nprocway runner: the previous turn ended without invoking \`task complete\`. ${buildTaskCompletionRetryPrompt(this.procwayMeta)}\n</system-reminder>\n\n${prompt}`;
-      }
-      this.pendingTaskCompletionReminder = false;
-    }
-    // Attachments (dashboard uploads, referenced by id) ride alongside the
-    // prompt text. They stay lightweight here — the provider hydration layer
-    // fetches + base64-inlines the bytes over HTTP only at request time (the
-    // single attachment transport; sessions have no shared-volume path).
-    const cleanAttachments = Array.isArray(attachments)
-      ? attachments.filter((a) => a && typeof a.id === "string" && a.id.length > 0)
-      : [];
-    const attachmentBlocks = cleanAttachments.map(
-      (a) => ({ kind: "attachment_ref", id: a.id, ...(a.mime ? { mime: a.mime } : {}), ...(typeof a.name === "string" && a.name ? { name: a.name } : {}) })
-    );
-    // Surface the attachment ids to the MODEL: hydration replaces the refs
-    // with inline images (or nothing it can touch), so without this note the
-    // model can SEE an attachment but has no handle to fetch the actual file
-    // (save_attachment needs the id). One text block after the refs.
-    const attachmentNoteBlocks = cleanAttachments.length > 0
-      ? [{ kind: "text", text: buildAttachmentNote(cleanAttachments) }]
-      : [];
-    const userMessage = createMessage({
-      role: "user",
-      sessionId: this.sessionId,
-      content: [{ kind: "text", text: effectivePrompt }, ...attachmentBlocks, ...attachmentNoteBlocks]
-    });
-    this.messages.push(userMessage);
-    const turnUserMessageId = userMessage.id;
-    if (this.hooksRunner) {
-      const promptHookOutcome = await this.hooksRunner.runUserPromptSubmit({ messageId: turnUserMessageId, prompt }).catch(() => ({ blocked: false }));
-      if (promptHookOutcome?.blocked) {
-        this.messages.pop();
-        this.events.emit(createEvent("turn.failed", {
-          sessionId: this.sessionId,
-          round: 0,
-          messageId: turnUserMessageId,
-          error: { message: `User prompt blocked by hook (exit ${promptHookOutcome.exitCode})`, code: "hook_blocked" }
-        }));
-        return { error: { message: "User prompt blocked by hook", code: "hook_blocked" } };
-      }
-    }
-    this.events.emit(createEvent("user.prompt.submitted", {
-      sessionId: this.sessionId,
-      messageId: turnUserMessageId,
-      content: userMessage.content
-    }));
-    await this.save();
+  }
 
+  /**
+   * The model-round loop shared by runTurn and the parked-approval
+   * continuation (#continueParkedRounds). The CALLER owns the turn lifecycle
+   * (runningTurn flag, abort controller, idle watchdog, per-turn knob reset);
+   * this drives rounds until the turn completes, pauses (deferred UIR /
+   * parked approval), fails, or exceeds maxToolRounds.
+   */
+  async #runRounds({
+    turnUserMessageId,
+    maxToolRounds,
+    needsFileMutation,
+    requiresTaskComplete,
+    procwayMeta,
+    turnStartIndex,
+    runProviderImpl = undefined
+  }) {
     let lastRound = 0;
     try {
       for (let round = 0; isToolRoundAllowed(round, maxToolRounds); round += 1) {
         lastRound = round;
         if (this.interruptRequested) {
+          // Same wording as the mid-stream / mid-tool interrupt paths
+          // (describeTurnAbort) — a Stop must not read differently just
+          // because of WHEN it landed.
           this.events.emit(createEvent("turn.failed", {
             sessionId: this.sessionId,
             round,
             messageId: turnUserMessageId,
-            error: { message: "Turn interrupted by user", code: "interrupted" }
+            error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE }
           }));
           this.resetInterrupt();
           this.raisePendingTaskCompletionIfNeeded();
           await this.save({ force: true });
-          return { error: { message: "Turn interrupted by user", code: "interrupted" } };
+          return { error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE } };
         }
         const response = await executeModelRound({
           session: this,
           round,
           turnMessageId: turnUserMessageId,
-          signal: this.turnAbortController?.signal
+          signal: this.turnAbortController?.signal,
+          ...(runProviderImpl ? { runProviderImpl } : {})
         });
 
         if (!hasToolCalls(response)) {
@@ -777,16 +1219,40 @@ export class AgentSession {
             round
           });
           if (outcome.action === "continue") continue;
+          // The file-mutation retry loop gave up (cap reached or the same tool
+          // kept failing identically). Surface a user-visible failure and end
+          // the turn through the normal return path so the caller's finally
+          // clears runningTurn — otherwise the wedged turn blocks every new
+          // message.
+          if (outcome.action === "stop") {
+            this.events.emit(createEvent("turn.failed", {
+              sessionId: this.sessionId,
+              round,
+              messageId: turnUserMessageId,
+              error: outcome.response?.error ?? { message: "Turn stopped", code: "stopped" }
+            }));
+            this.raisePendingTaskCompletionIfNeeded();
+            await this.save({ force: true });
+            return outcome.response;
+          }
           await this.maybeAutoCompact();
           if (this.planMode?.isActive() && this.planMode.hasPending()) {
-            await this.planMode.promptApply({
-              approvalRequester: this.approvalRequester,
-              executeImpl: async (entry) => this.executeSingleToolCall({
-                id: entry.entryId,
-                name: entry.name,
-                args: entry.args
-              })
-            });
+            try {
+              await this.planMode.promptApply({
+                approvalRequester: this.approvalRequester,
+                executeImpl: async (entry) => this.executeSingleToolCall({
+                  id: entry.entryId,
+                  name: entry.name,
+                  args: entry.args
+                })
+              });
+            } catch (error) {
+              // ADR 0037 D1: the plan-apply gate parked (kind "plan_apply").
+              // The queue stays intact; resolveParkedApproval applies or
+              // discards it when the user decides. Fall through to the normal
+              // turn end — the approval card is already on its way.
+              if (!(error instanceof ApprovalParkSignal)) throw error;
+            }
           }
           this.events.emit(createEvent("turn.completed", {
             sessionId: this.sessionId,
@@ -804,20 +1270,19 @@ export class AgentSession {
           round,
           toolCalls: response.toolCalls,
           messageId: response.messageId,
-          response
+          response,
+          signal: this.turnAbortController?.signal
         });
 
-        // §6 return mode: when a run-loop worker called request_user_action it
-        // recorded the hearing and `pausedForInput` was stamped (non-blocking
-        // deferral). DETERMINISTICALLY end the turn here instead of relying on
-        // the model obeying the tool-result `note` ("end your turn now / do NOT
-        // call task complete"): a model that ignored the note and kept calling
-        // tools or invoked `task complete` would defeat the return-mode hand-off
-        // (the run loop returns awaiting-user-input expecting a saved session to
-        // resume). The note remains as a model-side hint; this is the guarantee.
-        // Only fires for return-mode workers (hearingReturnMode) — a normal chat
-        // UIR blocks inside the tool and never reaches here with pausedForInput.
-        if (this.hearingReturnMode && this.pausedForInput) {
+        // Deferred UIR wind-down: when the requester force-deferred a UIR it
+        // recorded the request and stamped `pausedForInput` (non-blocking).
+        // DETERMINISTICALLY end the turn here instead of relying on the model
+        // obeying the tool-result `note` ("end your turn now / do NOT call task
+        // complete"): a model that ignored the note and kept calling tools or
+        // invoked `task complete` would defeat the hand-off (the surface resumes
+        // in a new turn once the user answers). The note remains a model-side
+        // hint; this is the guarantee.
+        if (this.pausedForInput) {
           await this.maybeAutoCompact();
           this.events.emit(createEvent("turn.completed", {
             sessionId: this.sessionId,
@@ -830,6 +1295,25 @@ export class AgentSession {
           // make the next resume turn nag about a task the user just deferred).
           await this.save({ force: true });
           return { paused: true, pausedForInput: this.pausedForInput };
+        }
+
+        // Parked-approval wind-down (ADR 0037 D1): one or more of this round's
+        // tools hit an "ask" verdict — their pending entries are checkpointed
+        // in parkedApprovals (snapshot-persisted by the save below) and their
+        // tool results are "parked" placeholders. Fold the turn NOW; the
+        // user's decision re-drives the tool and continues these rounds
+        // (resolveParkedApproval → #continueParkedRounds). Deliberately NO
+        // auto-compaction here: the placeholder tool_result must survive
+        // verbatim for the in-place replacement on resume.
+        if (Array.isArray(this.pausedForApproval) && this.pausedForApproval.length > 0) {
+          this.events.emit(createEvent("turn.completed", {
+            sessionId: this.sessionId,
+            round,
+            exitCode: 0,
+            messageId: turnUserMessageId
+          }));
+          await this.save({ force: true });
+          return { paused: true, pausedForApproval: this.pausedForApproval.slice() };
         }
       }
 
@@ -859,6 +1343,15 @@ export class AgentSession {
       this.raisePendingTaskCompletionIfNeeded();
       // best-effort: don't mask the original error if save() also throws
       try { await this.save({ force: true }); } catch { /* swallow */ }
+      // A user Stop that landed MID-round (in the provider stream or a tool)
+      // must settle exactly like one that landed between rounds: the same
+      // `{ error }` return, not a thrown DOMException. Without this the caller
+      // saw "This operation was aborted" for one Ctrl+C and a clean
+      // "Interrupted by user" for another, purely by timing.
+      if (mapped.userAbort) {
+        this.resetInterrupt();
+        return { error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE } };
+      }
       if (mapped.idleAbort) {
         // Surface the mapped message to callers too, so no path leaks the raw
         // DOMException. turnFailedEmitted prevents an upstream re-emit.
@@ -868,10 +1361,6 @@ export class AgentSession {
         throw mappedErr;
       }
       throw error;
-    } finally {
-      clearIdleWatchdog();
-      this.runningTurn = false;
-      this.activeToolPolicy = null;
     }
   }
 
@@ -970,7 +1459,6 @@ export class AgentSession {
     // it and carry the flag on the event so the dashboard can label the result
     // and operators can spot it after the fact in events.jsonl.
     if (result.llmFallback === true) {
-      // eslint-disable-next-line no-console
       console.warn(
         `[compact] llm-summary fell back to ${result.fallbackStrategy ?? "summarize-context"} `
         + `(reason: ${result.fallbackReason ?? "unknown"}, session: ${this.sessionId})`
@@ -1026,6 +1514,13 @@ export class AgentSession {
         usageEvents: typeof this.usageTracker?.raw === "function" ? this.usageTracker.raw() : [],
         loadedTools: this.loadedTools,
         alwaysAllow: [...this.approvalCoordinator.alwaysAllow],
+        // ADR 0037 D4: this session's delegated jobs (background run_shell /
+        // spawn_agent), so a Pod restart can rehydrate them (see initialize).
+        delegatedJobs: safeDehydrateJobs(this.sessionId),
+        // ADR 0037 D1: parked tool approvals — the checkpoint that lets a
+        // decision made after a reload / deploy / Pod restart still re-drive
+        // the folded turn (resolveParkedApproval).
+        parkedApprovals: [...this.parkedApprovals.values()],
         // A+B: persist worker enforcement state so dashboard restart / page
         // reload doesn't drop the reminder.
         procwayMeta: this.procwayMeta,
@@ -1050,6 +1545,19 @@ export class AgentSession {
     if (shouldRemindTaskCompletion(this)) {
       this.pendingTaskCompletionReminder = true;
     }
+  }
+}
+
+/**
+ * ADR 0037 D4: dehydrate the shared registry's jobs for one session, never
+ * letting a registry hiccup break the snapshot write (save() is on the turn's
+ * critical path). Returns [] on any failure.
+ */
+function safeDehydrateJobs(sessionId) {
+  try {
+    return getSharedJobRegistry().dehydrateJobs({ sessionId });
+  } catch {
+    return [];
   }
 }
 
@@ -1142,14 +1650,70 @@ export function buildAttachmentNote(attachments) {
   ].join("\n");
 }
 
-function createSessionApprovalRequester({ coordinator, settings, sessionId }) {
-  return async (args) => requestApproval({
-    ...args,
-    approvalMode: args.approvalMode ?? settings?.approvalMode,
-    permissions: args.permissions ?? settings?.permissions,
-    coordinator,
-    sessionId: args.sessionId ?? sessionId
-  });
+/**
+ * ADR 0037 D1 — the session's parking approval requester.
+ *
+ * Rule verdicts (deny / allow) resolve synchronously via
+ * ApprovalCoordinator.evaluate — identical outcomes to the old blocking
+ * requester. An "ask" verdict no longer waits on an in-memory Promise:
+ *
+ *   - DURING a turn it PARKS the tool call — registers a checkpointed entry
+ *     on session.parkedApprovals (snapshot-persisted), stamps
+ *     pausedForApproval so runTurn folds the turn after the round, emits
+ *     approval.requested for the surfaces, and throws ApprovalParkSignal
+ *     (executeSingleToolCall settles the call as a parked placeholder).
+ *     The user's decision later re-drives the tool + remaining rounds
+ *     (resolveParkedApproval), surviving reload / deploy / Pod restart.
+ *
+ *   - OUTSIDE a turn (TUI shell pre-gates, ad-hoc callers) it keeps the
+ *     legacy blocking coordinator round-trip: the asking process is itself
+ *     the surface that answers, so nothing durable is needed.
+ */
+function createParkingApprovalRequester({ session }) {
+  return async (args) => {
+    // Precedence: an explicit per-call approvalMode wins; else the session's
+    // per-turn override (activeApprovalMode); else settings.approvalMode.
+    const mode = args.approvalMode ?? session.activeApprovalMode ?? session.settings?.approvalMode;
+    const coordinator = session.approvalCoordinator;
+    if (!coordinator) {
+      // No coordinator wired (bare test session): pure permissions evaluation.
+      return requestApproval({ ...args, approvalMode: mode, permissions: args.permissions ?? session.settings?.permissions });
+    }
+    const verdict = coordinator.evaluate({
+      kind: args.kind,
+      summary: args.summary ?? "",
+      mutation: args.mutation === true,
+      approvalMode: mode
+    });
+    if (verdict === "allow") return true;
+    if (verdict === "deny") return false;
+    if (!session.runningTurn) {
+      const decision = await coordinator.request({
+        ...args,
+        approvalMode: mode,
+        sessionId: args.sessionId ?? session.sessionId
+      });
+      return decision === "allow" || decision === "always-allow";
+    }
+    const requestId = randomUUID();
+    session.parkedApprovals.set(requestId, {
+      requestId,
+      kind: args.kind,
+      summary: args.summary ?? "",
+      payload: args.payload ?? undefined,
+      turnMessageId: session.currentTurnMessageId ?? null,
+      createdAt: new Date().toISOString()
+    });
+    session.pausedForApproval = [...(session.pausedForApproval ?? []), requestId];
+    session.events.emit(createEvent("approval.requested", {
+      sessionId: session.sessionId,
+      requestId,
+      kind: args.kind,
+      summary: args.summary ?? "",
+      payload: args.payload ?? undefined
+    }));
+    throw new ApprovalParkSignal(requestId, { kind: args.kind, summary: args.summary });
+  };
 }
 
 function normalizeIncomingMessages(messages, sessionId) {
@@ -1348,7 +1912,6 @@ function mergeCompactedMessages({ before, result, sessionId }) {
   // (which would orphan a function_call_output -> provider 400). See
   // resolveTailStart for the full rationale.
   const tailStart = resolveTailStart(before, keepLast, firstSystemCount);
-  const middle = before.slice(firstSystemCount, tailStart);
   const tail = before.slice(tailStart);
 
   if (result.strategy === "truncate-oldest") {

@@ -3,7 +3,6 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { scanSkills, filterSkillsByTrigger } from "../src/context/skill-scanner.mjs";
-import { mergeSettings } from "../src/config/merge-settings.mjs";
 import { DEFAULT_SETTINGS } from "../src/config/default-settings.mjs";
 
 let cwd;

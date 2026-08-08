@@ -8,11 +8,12 @@
  * impersonate the worker / orchestrate the loop itself).
  *
  *  - start_run     → POST   $PROCWAY_DASHBOARD_URL/api/run/jobs
+ *  - attach_run    → (no POST) await-yield on an EXISTING job
  *  - get_run_status→ GET    $PROCWAY_DASHBOARD_URL/api/run/jobs/<jobId>
  *  - resume_run    → POST   $PROCWAY_DASHBOARD_URL/api/run/jobs/resume
  *  - reply_run     → POST   $PROCWAY_DASHBOARD_URL/api/run/jobs/conversational-resume
  *
- * ADR 0029 await-yield: start_run / resume_run / reply_run are NO LONGER
+ * ADR 0029 await-yield: start_run / attach_run / resume_run / reply_run are NO LONGER
  * fire-and-forget. After minting the jobId they INTERNALLY poll the job until it
  * leaves `running` (the run pauses for input, or finishes), then RETURN a
  * normalized yield — the side-panel AI thus "awaits the run as a sub-agent" and
@@ -63,7 +64,7 @@ function authHeaders(proxyToken, extra = {}) {
  * wrong (status + body, JSON `error.message` when present, else raw text).
  */
 async function errorFromResponse(res, label) {
-  let detail = "";
+  let detail;
   try {
     const text = await res.text();
     try {
@@ -148,8 +149,11 @@ async function awaitJobYield({
     ...(result?.sessionId !== undefined ? { sessionId: result.sessionId } : {}),
     ...(result?.pendingTask !== undefined ? { pendingTask: result.pendingTask } : {}),
     ...(result !== undefined ? { result } : {}),
-    project,
-    ticket
+    // attach_run knows only the runId, so fall back to what the job itself
+    // reports. The launching callers always pass both, so their yield is
+    // byte-identical to before.
+    project: project ?? json?.project,
+    ticket: ticket ?? json?.ticket
   };
 }
 
@@ -165,6 +169,14 @@ export async function startRun({
   ticket,
   autoApprove,
   runnerId,
+  // ADR 0038 D1 (attach): the id of the conversation this call is being made
+  // from. Supplied by the HOST (the tool dispatcher passes the owning
+  // AgentSession id) — NOT by the model, and deliberately absent from the
+  // start_run tool schema, so it cannot be forged in tool arguments. The
+  // dashboard records it on the run and verifies the claim against the calling
+  // session's principal. Omitted → the run starts unattached (the pre-0038
+  // behaviour, which an older dashboard also falls back to).
+  conversationId,
   dashboardUrl = process.env.PROCWAY_DASHBOARD_URL,
   proxyToken = process.env.PROCWAY_PROXY_TOKEN,
   fetchImpl = fetch,
@@ -184,6 +196,9 @@ export async function startRun({
   const body = { project: proj, ticket: tick };
   if (typeof autoApprove === "boolean") body.autoApprove = autoApprove;
   if (typeof runnerId === "string" && runnerId.trim()) body.runnerId = runnerId.trim();
+  // Only sent when known — an empty attach is the same as no attach, and older
+  // dashboards simply ignore the extra field.
+  if (typeof conversationId === "string" && conversationId.trim()) body.conversationId = conversationId.trim();
 
   const res = await fetchImpl(url, {
     method: "POST",
@@ -200,6 +215,40 @@ export async function startRun({
   }
   return awaitJobYield({
     jobId, kind: "start_run", project: proj, ticket: tick,
+    dashboardUrl, proxyToken, fetchImpl, pollIntervalMs, pollTimeoutMs, onProgress, sleepImpl
+  });
+}
+
+/**
+ * ADR 0038 D2 — ACCOMPANY a run that somebody else already started (the ticket
+ * detail's「実行」button now POSTs /api/run/jobs itself and hands the AI the
+ * jobId). This is `startRun` MINUS the POST: no side effect, just the same
+ * await-yield rendezvous, so the AI relays hearings and drives the resume exactly
+ * as it does for a run it started itself.
+ *
+ * `project` / `ticket` are deliberately NOT parameters: the model is given only
+ * the runId, and the job itself reports which ticket it belongs to (awaitJobYield
+ * falls back to the polled job's own fields).
+ *
+ * A not-yet-registered job is tolerated the same way a mid-run blip is — the
+ * poll retries for ~30s before giving up — which also covers the race where the
+ * dashboard has just minted the job and the AI attaches immediately.
+ */
+export async function attachRun({
+  runId,
+  dashboardUrl = process.env.PROCWAY_DASHBOARD_URL,
+  proxyToken = process.env.PROCWAY_PROXY_TOKEN,
+  fetchImpl = fetch,
+  pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+  pollTimeoutMs = DEFAULT_POLL_TIMEOUT_MS,
+  onProgress = null,
+  sleepImpl = realSleep
+} = {}) {
+  const jobId = typeof runId === "string" ? runId.trim() : "";
+  if (!jobId) throw new Error("runId is required");
+  if (!proxyToken) throw new Error("PROCWAY_PROXY_TOKEN is not set");
+  return awaitJobYield({
+    jobId, kind: "attach_run", project: undefined, ticket: undefined,
     dashboardUrl, proxyToken, fetchImpl, pollIntervalMs, pollTimeoutMs, onProgress, sleepImpl
   });
 }
@@ -243,6 +292,10 @@ export async function getRunStatus({
 export async function resumeRun({
   project,
   ticket,
+  /** ADR 0038 D1 attach — host-supplied, see startRun. A resume mints a NEW
+   *  jobId, so the attach must be re-declared or the conversation would keep
+   *  pointing at the settled job it started. */
+  conversationId,
   dashboardUrl = process.env.PROCWAY_DASHBOARD_URL,
   proxyToken = process.env.PROCWAY_PROXY_TOKEN,
   fetchImpl = fetch,
@@ -262,7 +315,11 @@ export async function resumeRun({
   const res = await fetchImpl(url, {
     method: "POST",
     headers: authHeaders(proxyToken, { "content-type": "application/json" }),
-    body: JSON.stringify({ project: proj, ticket: tick }),
+    body: JSON.stringify({
+      project: proj,
+      ticket: tick,
+      ...(typeof conversationId === "string" && conversationId.trim() ? { conversationId: conversationId.trim() } : {})
+    }),
     signal: AbortSignal.timeout(timeoutMs)
   });
   if (!res.ok) throw await errorFromResponse(res, "resume_run");
@@ -291,6 +348,9 @@ export async function replyRun({
   ticket,
   sessionId,
   answer,
+  /** ADR 0038 D1 attach — host-supplied, see startRun/resumeRun. NOTE: this is
+   *  the CONVERSATION id, not the paused worker `sessionId` above. */
+  conversationId,
   dashboardUrl = process.env.PROCWAY_DASHBOARD_URL,
   proxyToken = process.env.PROCWAY_PROXY_TOKEN,
   fetchImpl = fetch,
@@ -314,7 +374,13 @@ export async function replyRun({
   const res = await fetchImpl(url, {
     method: "POST",
     headers: authHeaders(proxyToken, { "content-type": "application/json" }),
-    body: JSON.stringify({ project: proj, ticket: tick, sessionId: sess, answer: ans }),
+    body: JSON.stringify({
+      project: proj,
+      ticket: tick,
+      sessionId: sess,
+      answer: ans,
+      ...(typeof conversationId === "string" && conversationId.trim() ? { conversationId: conversationId.trim() } : {})
+    }),
     signal: AbortSignal.timeout(timeoutMs)
   });
   if (!res.ok) throw await errorFromResponse(res, "reply_run");

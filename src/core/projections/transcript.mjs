@@ -1,8 +1,8 @@
 /**
  * Pure transcript projection. Phase 4 lift: was previously in `src/tui/`,
  * but it has zero I/O so it belongs alongside the other projections under
- * `core/projections/`. `tui/transcript.mjs` re-exports from here so existing
- * imports keep working.
+ * `core/projections/`. (The `src/tui/transcript.mjs` shim that used to
+ * re-export this module was deleted in Phase 1; this is the only definition.)
  *
  * @typedef {(
  *   | { kind: "user",                 role: "user",      text: string, attachments?: Array<{ id: string, mime?: string, name?: string }> }

@@ -8,11 +8,19 @@
  * The parser is tolerant: malformed JSON yields a record with `data` as the
  * raw string, blank lines flush, and `[DONE]` payloads are skipped.
  */
-export async function* parseSseStream(source) {
+export async function* parseSseStream(source, { signal = null } = {}) {
   if (!source) return;
+  // A user Stop must break the read loop even if the transport doesn't reject
+  // (a mocked/replayed body, or a chunk already buffered when the abort landed).
+  // Throwing the signal's reason keeps the unified interrupt wording intact.
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+  };
+  throwIfAborted();
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const chunk of toAsyncIterable(source)) {
+  for await (const chunk of toAsyncIterable(source, signal)) {
+    throwIfAborted();
     if (chunk == null) continue;
     const text = typeof chunk === "string"
       ? chunk
@@ -24,28 +32,45 @@ export async function* parseSseStream(source) {
       buffer = buffer.slice(separatorIndex + recordSeparatorLen(buffer, separatorIndex));
       const record = parseSseBlock(block);
       if (record) yield record;
+      throwIfAborted();
     }
   }
+  throwIfAborted();
   if (buffer.trim().length > 0) {
     const record = parseSseBlock(buffer);
     if (record) yield record;
   }
 }
 
-async function* toAsyncIterable(source) {
+async function* toAsyncIterable(source, signal = null) {
   if (typeof source[Symbol.asyncIterator] === "function") {
     for await (const chunk of source) yield chunk;
     return;
   }
   if (typeof source.getReader === "function") {
     const reader = source.getReader();
+    // `reader.read()` on an already-delivered-but-idle body never settles on
+    // its own; race the abort so a Stop always unblocks the loop, then cancel
+    // the body so the socket is released instead of leaking.
+    const abortPromise = signal
+      ? new Promise((_resolve, reject) => {
+          if (signal.aborted) return reject(signal.reason ?? new Error("Aborted"));
+          signal.addEventListener?.("abort", () => reject(signal.reason ?? new Error("Aborted")), { once: true });
+        })
+      : null;
+    // An unsettled abort promise must not surface as an unhandled rejection
+    // once the stream finishes normally.
+    abortPromise?.catch(() => {});
     try {
       while (true) {
-        const { value, done } = await reader.read();
+        const { value, done } = abortPromise
+          ? await Promise.race([reader.read(), abortPromise])
+          : await reader.read();
         if (done) break;
         if (value != null) yield value;
       }
     } finally {
+      try { if (signal?.aborted) await reader.cancel?.(signal.reason); } catch { /* already torn down */ }
       try { reader.releaseLock(); } catch { /* readable already closed */ }
     }
   }

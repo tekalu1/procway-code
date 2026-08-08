@@ -43,6 +43,37 @@ describe("snapshot — markdown rendering", () => {
     const md = "```ts\nfunction foo(): number {\n  return 1;\n}\n```\n";
     expect(asSnapshot(renderMarkdown(md, { width: 60, color: false }))).toMatchSnapshot();
   });
+
+  // P3d-1 / P3d-3. `asSnapshot` renders OSC 8 as `[link=URI]…[/link]`, so the
+  // reviewer can check by eye that (a) the URI is still printed next to the
+  // label, (b) unsafe schemes never become a link region at all.
+  const STRIKE_AND_LINKS = [
+    "~~打ち消し~~ と See [docs](https://example.com/docs) for more.",
+    "",
+    "Mixed ~~**struck bold**~~ and **~~bold struck~~**.",
+    "",
+    "- [x] ~~done~~ with [link](https://example.com/l)",
+    "",
+    "[bad](javascript:alert(1)) and [f](file:///etc/passwd) stay plain.",
+    ""
+  ].join("\n");
+
+  it("renders strikethrough and links — terminal without OSC 8 support", () => {
+    expect(asSnapshot(renderMarkdown(STRIKE_AND_LINKS, { width: 60, hyperlinks: false }))).toMatchSnapshot();
+  });
+
+  it("renders strikethrough and links — terminal with OSC 8 support", () => {
+    expect(asSnapshot(renderMarkdown(STRIKE_AND_LINKS, { width: 60, hyperlinks: true }))).toMatchSnapshot();
+  });
+
+  it("renders strikethrough and links — no colour (markers kept, no escapes)", () => {
+    expect(asSnapshot(renderMarkdown(STRIKE_AND_LINKS, { width: 60, color: false, hyperlinks: true }))).toMatchSnapshot();
+  });
+
+  it("re-opens a wrapped link on each row so padding never becomes clickable", () => {
+    const md = "Prefix text here [a very long link label that will certainly wrap](https://example.com/some/deep/path) tail.\n";
+    expect(asSnapshot(renderMarkdown(md, { width: 40, hyperlinks: true }))).toMatchSnapshot();
+  });
 });
 
 describe("snapshot — diff preview", () => {

@@ -106,7 +106,16 @@ export async function saveSessionState({ homeDir = os.homedir(), sessionId, stat
       todos: state?.todos,
       planMode: state?.planMode,
       usageEvents: state?.usageEvents,
-      alwaysAllow: state?.alwaysAllow
+      alwaysAllow: state?.alwaysAllow,
+      // Deferred-tool tier: without this passthrough the session's loaded
+      // schemas were silently dropped on save (restore already read
+      // snapshot.loadedTools — the write side was the missing half).
+      loadedTools: state?.loadedTools,
+      // ADR 0037 D4: the session's delegated jobs (background run_shell /
+      // spawn_agent) so a Pod restart can rehydrate them.
+      delegatedJobs: state?.delegatedJobs,
+      // ADR 0037 D1: parked tool approvals (checkpoint for approve-after-restart).
+      parkedApprovals: state?.parkedApprovals
     },
     encryptionKey
   });

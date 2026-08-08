@@ -26,7 +26,7 @@ import { EventEmitter } from "node:events";
  * loop and anything else later, instead of being hard-wired to one handler.
  *
  * Driver contract:
- *   driver.start(spec, { onEvent, onYield, jobId }) => handle
+ *   driver.start(spec, { onEvent, onYield, jobId, signal }) => handle
  *     - the driver runs the job DETACHED and calls:
  *         onEvent(e)               for progress / liveness heartbeats
  *         onYield({ status, result?, error?, awaiting?, ttlMs? })
@@ -34,6 +34,11 @@ import { EventEmitter } from "node:events";
  *           ttlMs (optional)       per-settle eviction window override; lets a
  *                                  driver keep a resumable terminal (e.g. the
  *                                  run loop's awaiting-user-input) live longer.
+ *         signal                   the job's per-job AbortSignal — a driver that
+ *                                  threads it into its work (the run loop →
+ *                                  runTask → serve-client) can fold an in-flight
+ *                                  turn when `abortJob(jobId)` fires it. Drivers
+ *                                  that don't observe it are unaffected.
  *     - handle = { kill(), resume?(input), ...kind-specific extensions }
  *       (the process driver also hangs status()/logs() off the handle so the
  *        shell_job tool can read live output without the registry knowing about
@@ -124,7 +129,15 @@ export class DelegatedJobRegistry {
       updatedAt: now,
       ...(meta ? { meta } : {}),
     };
-    const entry = { state, emitter: new EventEmitter(), handle: null, evictTimer: undefined };
+    // Per-job abort handle: fired by abortJob(jobId) and handed to the driver
+    // so a signal-aware driver can fold an in-flight turn. Created eagerly (an
+    // unfired controller is inert) so abortJob never has to special-case a
+    // job that hasn't wired one.
+    const abortController = new AbortController();
+    // `spec` is retained on the entry (NOT the public state) so dehydrateJobs
+    // (ADR 0037 D4) can persist enough to describe/resume the job after a
+    // process restart. Kept off state to preserve the public shape.
+    const entry = { state, emitter: new EventEmitter(), handle: null, evictTimer: undefined, abortController, spec };
     // Many subscribers (e.g. SSE-like fan-out) may attach; don't warn.
     entry.emitter.setMaxListeners(0);
     this.jobs.set(id, entry);
@@ -133,7 +146,7 @@ export class DelegatedJobRegistry {
     const onYield = (y) => this._settle(entry, y);
 
     try {
-      const handle = driver.start(spec, { onEvent, onYield, jobId: id });
+      const handle = driver.start(spec, { onEvent, onYield, jobId: id, signal: abortController.signal });
       // Allow a driver to return a thenable that resolves to the real handle;
       // a rejection settles the job as failed.
       if (handle && typeof handle.then === "function") {
@@ -259,6 +272,153 @@ export class DelegatedJobRegistry {
     return null;
   }
 
+  /**
+   * Stop a running job. Fires the job's AbortSignal so a signal-aware driver
+   * (the run loop → runTask → serve-client) folds its in-flight turn and
+   * settles through its OWN onYield — abortJob deliberately does NOT force a
+   * terminal state, so the driver's real terminal (result + housekeeping) is
+   * preserved. Also calls the handle's kill() when present, covering drivers
+   * that don't observe the signal (e.g. a detached child process). Idempotent;
+   * unknown job → null.
+   */
+  abortJob(jobId) {
+    const entry = this.jobs.get(jobId);
+    if (!entry) return null;
+    try { entry.abortController?.abort(); } catch { /* best-effort: abort must never throw */ }
+    const handle = entry.handle;
+    if (handle && typeof handle.kill === "function") {
+      try { handle.kill(); } catch (err) {
+        entry.state.error = err instanceof Error ? err.message : String(err);
+      }
+    }
+    return { jobId, status: entry.state.status };
+  }
+
+  /** Snapshot of all live job states (the live objects, not copies — mirrors
+   *  getJob). Lets a consumer find a job by its opaque `meta` when it holds no
+   *  jobId (e.g. the dashboard aborting a ticket's run-loop job by
+   *  project/ticket). */
+  listJobs() {
+    return Array.from(this.jobs.values(), (e) => e.state);
+  }
+
+  /**
+   * ADR 0037 D4 — serialize the registry's job state for a session snapshot.
+   * Returns plain-JSON descriptors for every job whose `meta.sessionId`
+   * matches (or every job when no filter is given). The events ring buffer is
+   * NOT serialized (bounded live-streaming state); `spec` and `meta` ride
+   * along so a rehydrated job can still be described — and, for kinds that
+   * support it later, cold-resumed.
+   *
+   * @param {{ sessionId?: string }} [filter]
+   * @returns {Array<object>}
+   */
+  dehydrateJobs({ sessionId } = {}) {
+    const out = [];
+    for (const entry of this.jobs.values()) {
+      const s = entry.state;
+      if (sessionId && s.meta?.sessionId !== sessionId) continue;
+      out.push({
+        jobId: s.jobId,
+        kind: s.kind,
+        status: s.status,
+        ...(s.result !== undefined ? { result: s.result } : {}),
+        ...(s.error !== undefined ? { error: s.error } : {}),
+        ...(s.awaiting !== undefined ? { awaiting: s.awaiting } : {}),
+        ...(s.meta ? { meta: s.meta } : {}),
+        ...(entry.spec !== undefined ? { spec: entry.spec } : {}),
+        startedAt: s.startedAt,
+        updatedAt: s.updatedAt
+      });
+    }
+    return out;
+  }
+
+  /**
+   * ADR 0037 D4 — restore dehydrated jobs after a process restart so status /
+   * logs / resume queries answer truthfully instead of "unknown job".
+   *
+   *   - A job that was `running` did NOT survive (its child process / inline
+   *     child died with the old process) → restored as `failed` with an
+   *     explicit lost-to-restart error.
+   *   - Terminal and awaiting-input jobs are restored verbatim. A restored
+   *     awaiting-input job has no live driver handle; resuming it settles it
+   *     as `failed` with a clear reason unless a kind-specific `coldResume`
+   *     is supplied (`coldResumes[kind] = (dehydrated, input, {onEvent,
+   *     onYield}) => handle` — the seam a future interactive agent kind uses).
+   *
+   * Jobs already present in the registry (id collision) are left untouched —
+   * the live entry is always fresher than the snapshot. Returns the number of
+   * jobs restored.
+   *
+   * @param {Array<object>} entries
+   * @param {{ coldResumes?: Record<string, Function> }} [opts]
+   */
+  rehydrateJobs(entries, { coldResumes = {} } = {}) {
+    if (!Array.isArray(entries)) return 0;
+    let restored = 0;
+    for (const d of entries) {
+      if (!d || typeof d.jobId !== "string" || d.jobId.length === 0) continue;
+      if (this.jobs.has(d.jobId)) continue;
+      const lost = d.status === "running";
+      const now = this.now();
+      /** @type {JobState} */
+      const state = {
+        jobId: d.jobId,
+        kind: typeof d.kind === "string" ? d.kind : "unknown",
+        status: lost ? "failed" : d.status,
+        result: lost ? undefined : d.result,
+        error: lost
+          ? "job lost to an agent restart (its process did not survive; start it again if still needed)"
+          : d.error,
+        awaiting: lost ? undefined : d.awaiting,
+        events: [],
+        startedAt: Number.isFinite(d.startedAt) ? d.startedAt : now,
+        updatedAt: now,
+        ...(d.meta ? { meta: d.meta } : {}),
+        restored: true
+      };
+      const entry = {
+        state,
+        emitter: new EventEmitter(),
+        handle: null,
+        evictTimer: undefined,
+        abortController: new AbortController(),
+        spec: d.spec
+      };
+      entry.emitter.setMaxListeners(0);
+      // Restored handle: kill is a no-op (nothing lives); resume delegates to a
+      // kind-specific cold-resume when provided, else settles failed loudly so
+      // a caller is never left with a silently-flipped 'running' zombie.
+      const coldResume = typeof coldResumes[state.kind] === "function" ? coldResumes[state.kind] : null;
+      entry.handle = {
+        kill: () => null,
+        resume: (input) => {
+          if (coldResume) {
+            const onEvent = (e) => this._pushEvent(entry, e);
+            const onYield = (y) => this._settle(entry, y);
+            try {
+              entry.handle = coldResume(d, input, { onEvent, onYield, jobId: state.jobId, signal: entry.abortController.signal }) ?? entry.handle;
+            } catch (err) {
+              this._fail(entry, err);
+            }
+            return;
+          }
+          this._settle(entry, {
+            status: "failed",
+            error: `job ${state.jobId} was restored from a snapshot after a restart and its kind ("${state.kind}") cannot be cold-resumed`
+          });
+        }
+      };
+      this.jobs.set(d.jobId, entry);
+      // Same eviction discipline as a live settle: no-evict pauses stay put,
+      // terminals age out so restored history doesn't pin memory forever.
+      if (!this.noEvictStatuses.has(state.status)) this._scheduleEvict(entry);
+      restored += 1;
+    }
+    return restored;
+  }
+
   /** Test-only: clear the registry and cancel pending eviction timers. */
   __resetForTest() {
     for (const entry of this.jobs.values()) {
@@ -346,6 +506,7 @@ export class DelegatedJobRegistry {
  * @property {import('node:events').EventEmitter} emitter
  * @property {any} handle
  * @property {ReturnType<typeof setTimeout>} [evictTimer]
+ * @property {AbortController} abortController  per-job abort handle (abortJob)
  */
 
 // --- ai-agent-scoped process-wide singleton (the front door for the

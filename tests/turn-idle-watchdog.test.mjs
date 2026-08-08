@@ -62,7 +62,9 @@ describe("AgentSession.runTurn idle watchdog", () => {
     // The abort is mapped to a clear, distinguishable message/code — NOT the raw
     // DOMException "This operation was aborted" (and NOT the user-Stop wording).
     expect(failed[0].error.code).toBe("idle_timeout");
-    expect(failed[0].error.message).toContain("中断");
+    // P3b-10: the watchdog message is English like every other CLI string.
+    expect(failed[0].error.message).toContain("The model sent nothing for");
+    expect(failed[0].error.message).toContain("PROCWAY_TURN_IDLE_TIMEOUT_MS");
     expect(failed[0].error.message).not.toContain("operation was aborted");
 
     await rm(cwd, { recursive: true, force: true });

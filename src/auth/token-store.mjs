@@ -53,7 +53,7 @@ async function readStoreFile(filePath) {
   try {
     return sanitizeStore(JSON.parse(raw));
   } catch (error) {
-    throw new Error(`auth-profiles.json is not valid JSON (${filePath}): ${error.message}`);
+    throw new Error(`auth-profiles.json is not valid JSON (${filePath}): ${error.message}`, { cause: error });
   }
 }
 
@@ -78,7 +78,7 @@ async function acquireLock(filePath) {
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for auth-profiles.json lock at ${lockPath}. If you are sure no other process holds it, delete the file manually.`);
+        throw new Error(`Timed out waiting for auth-profiles.json lock at ${lockPath}. If you are sure no other process holds it, delete the file manually.`, { cause: error });
       }
       await delay(LOCK_RETRY_DELAY_MS);
     }
