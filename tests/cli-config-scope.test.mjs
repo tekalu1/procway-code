@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -60,7 +60,10 @@ async function runCli(args, { cwd, homeDir }) {
 async function makeTempDir() {
   const dir = await mkdtemp(path.join(os.tmpdir(), "procway-cli-scope-"));
   tempDirs.push(dir);
-  return dir;
+  // On macOS `os.tmpdir()` is `/var/folders/...`, a symlink to
+  // `/private/var/folders/...`. The CLI resolves --cwd/HOME to a real path, so
+  // comparing against the unresolved temp path fails there and only there.
+  return realpath(dir);
 }
 
 async function readJson(filePath) {
