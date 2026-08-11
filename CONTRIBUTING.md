@@ -77,6 +77,12 @@ published by accident. Two rules beyond that:
   `package.json` says `-alpha`, publish with `npm publish --tag alpha`. Without
   the flag npm would move `latest` to a pre-release, and every
   `npm install procway-code` would get it.
+
+  One caveat worth knowing so it is not mistaken for a slip: on the **very
+  first** publish of a package, npm points `latest` at that version regardless
+  of `--tag`, because the registry needs `latest` to resolve to something. It
+  corrects itself as soon as a stable version is published normally, and
+  `latest` cannot be deleted in the meantime.
 - **`files` is an allowlist, and the tests treat it as one.**
   `tests/package-manifest.test.mjs` asserts that entry points, licence files
   and the `web/` assets `serve` loads from the install root are all covered.
