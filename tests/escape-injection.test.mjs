@@ -652,9 +652,8 @@ describe("live/replay parity survives sanitisation", () => {
   it("matches the assistant node the transcript replays, byte for byte", () => {
     const text = DOCS["escapes everywhere"];
     const node = renderTranscriptNode({ kind: "assistant", text }, { width: 80, colorize: true });
-    const body = node.slice(node.indexOf("\n") + 1);
     const chunks = [];
     for (let i = 0; i < text.length; i += 7) chunks.push(text.slice(i, i + 7));
-    expect(streamAll(text, chunks, { colorize: true, width: 80 })).toBe(`${body}\n\n`);
+    expect(streamAll(text, chunks, { colorize: true, width: 80 })).toBe(`${node}\n\n`);
   });
 });

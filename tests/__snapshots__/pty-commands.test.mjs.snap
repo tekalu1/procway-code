@@ -25,6 +25,8 @@ exports[`pty: slash commands and editing > prints the full command list for /hel
   /help                     List all slash commands with a one-line description
   /history                  Print the recent transcript
   /memory                   List persisted memory entries
+  /mcp [add|remove|reconnect]
+                            List MCP servers, or add/remove/reconnect one
   /model                    Show the active provider:model
   /plan                     Toggle plan mode (queue write tools for end-of-turn
                             approval)
@@ -32,7 +34,9 @@ exports[`pty: slash commands and editing > prints the full command list for /hel
   /status                   Show workspace, session, model, and mode
   /terminal-setup           Bind Shift+Enter to a newline in this terminal
                             (shows a diff first)
-  /thinking [on|off]        Show or hide the model's reasoning stream
+  /thinking [off|fold|full]
+                            Control the model's reasoning display: off (hidden),
+                            fold (one-line summary), full (stream)
   /todos                    Show the agent's running todo list
   /usage                    Show round-by-round usage / cost
 "
@@ -45,7 +49,7 @@ exports[`pty: slash commands and editing > prints the session panel for /status 
   [muted]Model    [/color]  openai-main:gpt-test
   [muted]Approval [/color]  auto-readonly
   [muted]Plan mode[/color]  off
-  [muted]Thinking [/color]  shown
+  [muted]Thinking [/color]  folded
   <tool-off-rows>
 "
 `;

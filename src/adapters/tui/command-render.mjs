@@ -272,6 +272,49 @@ export function renderModel(result, { color = true } = {}) {
   return `${paint("model", "muted", color)}  ${paint(`${result?.provider ?? "unconfigured"}:${result?.model ?? "unconfigured"}`, "accentStrong", color)}\n`;
 }
 
+
+/**
+ * `/mcp` — a per-server table plus a tool list for each connected server.
+ * Mirrors the other slash panels so `/mcp` reads like `/status`.
+ *
+ * @param {{ servers?: Array<{ id, transport, target, status, toolCount, tools }>,
+ *           connected?: number, failed?: number, disabled?: number }} result
+ */
+export function renderMcp(result, { width = 80, color = true } = {}) {
+  const servers = Array.isArray(result?.servers) ? result.servers : [];
+  const subtitle = [
+    `${result?.connected ?? 0} connected`,
+    `${result?.failed ?? 0} failed`,
+    `${result?.disabled ?? 0} disabled`
+  ].join(" · ");
+  const table = renderTable({
+    title: "MCP",
+    subtitle,
+    columns: [
+      { key: "id", label: "server" },
+      { key: "transport", label: "transport" },
+      { key: "target", label: "target" },
+      { key: "status", label: "status" },
+      { key: "toolCount", label: "tools", align: "right" }
+    ],
+    rows: servers.map((server) => ({
+      id: server.id,
+      transport: server.transport,
+      target: server.target,
+      status: server.status,
+      toolCount: String(server.toolCount)
+    })),
+    width,
+    color,
+    empty: "(no MCP servers — run /mcp add)"
+  });
+  const toolNotes = servers
+    .filter((server) => server.status === "connected" && server.tools?.length > 0)
+    .map((server) => `${server.id}: ${server.tools.join(", ")}`);
+  if (toolNotes.length === 0) return table;
+  return `${table}${renderPanel({ notes: toolNotes, width, color })}`;
+}
+
 function relativePath(target, cwd) {
   if (typeof target !== "string" || target.length === 0) return "-";
   if (typeof cwd !== "string" || cwd.length === 0) return target;

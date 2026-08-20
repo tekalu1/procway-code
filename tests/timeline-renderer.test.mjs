@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { EventBus } from "../src/core/events/bus.mjs";
 import { createEvent } from "../src/core/events/types.mjs";
 import { createTimelineRenderer } from "../src/adapters/tui/timeline-renderer.mjs";
@@ -211,6 +211,171 @@ describe("timeline renderer (event subscriber)", () => {
 });
 
 /**
+ * P3-14: a tool call used to print two rows — `● run_shell(…)` when it starts
+ * and a second `✓ run_shell(…)` when it finishes. On a real terminal the finish
+ * line now OVERWRITES the start line in place, so the tool takes one row for
+ * its whole lifecycle instead of two.
+ */
+describe("timeline renderer — P3-14 one-row tool lifecycle", () => {
+  it("overwrites the started line in place on a TTY", () => {
+    const writer = makeTtyWriter();
+    const bus = new EventBus();
+    createTimelineRenderer({ writer }).attach(bus);
+
+    bus.emit(createEvent("tool.call.scheduled", { sessionId: "s-1", toolCallId: "tc-1", name: "run_shell", args: { command: "pnpm test" }, mutation: false }));
+    bus.emit(createEvent("tool.call.started", { sessionId: "s-1", toolCallId: "tc-1", name: "run_shell" }));
+    expect(stripAnsi(writer.text)).toContain("● run_shell(command=\"pnpm test\")");
+
+    bus.emit(createEvent("tool.call.completed", { sessionId: "s-1", toolCallId: "tc-1", ok: true, result: { kind: "run_shell", summary: "exit 0" } }));
+
+    // The completion rewinds one row, clears it, and rewrites it with ✓ —
+    // i.e. no second row is appended.
+    expect(writer.text).toContain("\x1b[1A\r\x1b[2K");
+    expect(stripAnsi(writer.text)).toContain("✓ run_shell(command=\"pnpm test\")");
+    // After the in-place rewrite the feed is a single logical row: the ✓ line
+    // is the last thing, and both the ● and ✓ occupy that same line.
+    expect(stripAnsi(writer.text).endsWith("✓ run_shell(command=\"pnpm test\")\n")).toBe(true);
+  });
+
+  it("falls back to a fresh row when something was written in between (e.g. parallel tool)", () => {
+    const writer = makeTtyWriter();
+    const bus = new EventBus();
+    createTimelineRenderer({ writer }).attach(bus);
+
+    bus.emit(createEvent("tool.call.started", { sessionId: "s-1", toolCallId: "a", name: "read_file" }));
+    bus.emit(createEvent("tool.call.started", { sessionId: "s-1", toolCallId: "b", name: "grep" }));
+    bus.emit(createEvent("tool.call.completed", { sessionId: "s-1", toolCallId: "a", ok: true, result: { kind: "read_file", summary: "ok" } }));
+
+    // `grep`'s start landed between `read_file`'s start and completion, so we
+    // cannot safely rewind — append a new completion row instead.
+    expect(writer.text).not.toContain("\x1b[1A");
+    expect(stripAnsi(writer.text)).toContain("✓ read_file");
+  });
+
+  it("does not emit control codes on a non-TTY sink", () => {
+    const writer = makeNonTtyWriter();
+    const bus = new EventBus();
+    createTimelineRenderer({ writer }).attach(bus);
+
+    bus.emit(createEvent("tool.call.started", { sessionId: "s-1", toolCallId: "tc-1", name: "Edit" }));
+    bus.emit(createEvent("tool.call.completed", { sessionId: "s-1", toolCallId: "tc-1", ok: false, result: { kind: "edit", summary: "nope" } }));
+
+    expect(writer.text).not.toContain("\x1b[1A");
+    expect(writer.text).toContain("● Edit");
+    expect(writer.text).toContain("✗ Edit");
+    expect(writer.text.split("\n").filter((l) => l.trim() !== "")).toHaveLength(2);
+  });
+});
+
+/**
+ * P3-19: while a tool is in flight its row is overwritten in place, so it can
+ * carry a live spinner without the row growing — the ● marker animates through
+ * the FRAMES cadence and freezes back to ✓/✗ on completion. TTY-only; a piped
+ * sink keeps the static ● since it cannot repaint in place.
+ */
+describe("timeline renderer — running tool bullet animation", () => {
+  it("animates the running tool's bullet on a TTY and freezes to ✓ on completion", () => {
+    vi.useFakeTimers();
+    try {
+      const writer = makeTtyWriter();
+      const bus = new EventBus();
+      createTimelineRenderer({ writer, intervalMs: 100 }).attach(bus);
+
+      bus.emit(createEvent("tool.call.scheduled", { sessionId: "s", toolCallId: "tc", name: "run_shell", args: { command: "pnpm test" }, mutation: false }));
+      bus.emit(createEvent("tool.call.started", { sessionId: "s", toolCallId: "tc", name: "run_shell" }));
+
+      const afterStart = writer.text.length;
+      expect(stripAnsi(writer.text)).toContain("● run_shell(command=\"pnpm test\")");
+
+      // One interval tick repaints the row in place with a spinner frame.
+      vi.advanceTimersByTime(100);
+      const tick = stripAnsi(writer.text.slice(afterStart));
+      expect(tick).toContain("\x1b[1A\r\x1b[2K");
+      expect(tick).toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/);
+      // The repaint rewound out of the way (one \x1b[1A) instead of committing
+      // a new row, so the completion below can still overwrite in place.
+      expect(writer.text.match(/\x1b\[1A\r\x1b\[2K/g) ?? []).toHaveLength(1);
+
+      bus.emit(createEvent("tool.call.completed", { sessionId: "s", toolCallId: "tc", ok: true, result: { kind: "run_shell", summary: "exit 0" } }));
+      expect(stripAnsi(writer.text).endsWith("✓ run_shell(command=\"pnpm test\")\n")).toBe(true);
+      // The completion also rewound in place (a second \x1b[1A) rather than
+      // appending a row — the whole lifecycle stayed on the single start row.
+      expect(writer.text.match(/\x1b\[1A\r\x1b\[2K/g) ?? []).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start the animation on a non-TTY sink", () => {
+    const writer = makeNonTtyWriter();
+    const bus = new EventBus();
+    const renderer = createTimelineRenderer({ writer });
+    renderer.attach(bus);
+
+    bus.emit(createEvent("tool.call.scheduled", { sessionId: "s", toolCallId: "tc", name: "run_shell", args: { command: "x" }, mutation: false }));
+    bus.emit(createEvent("tool.call.started", { sessionId: "s", toolCallId: "tc", name: "run_shell" }));
+
+    expect(renderer.toolSpinner).toBeNull();
+    expect(writer.text).not.toContain("⠋");
+    renderer.detach();
+  });
+});
+
+/**
+ * P3-20: compaction now gets the same running/completed affordance as tools.
+ * `compact.started` opens a one-row spinner ("compacting conversation …") and
+ * `compact.applied` overwrites it in place with ✓ compacted (or ○ no-op), so a
+ * slow context compaction is never mistaken for an idle/blank TUI.
+ */
+describe("timeline renderer — compaction progress", () => {
+  it("shows a running spinner for compaction and overwrites it in place with the result", () => {
+    vi.useFakeTimers();
+    try {
+      const writer = makeTtyWriter();
+      const bus = new EventBus();
+      createTimelineRenderer({ writer, intervalMs: 100 }).attach(bus);
+
+      bus.emit(createEvent("compact.started", { sessionId: "s", strategy: "llm-summary" }));
+      const afterStart = writer.text.length;
+      expect(stripAnsi(writer.text)).toContain("● compacting conversation (strategy=llm-summary)");
+
+      // One interval tick repaints the row in place with a spinner frame.
+      vi.advanceTimersByTime(100);
+      const tick = stripAnsi(writer.text.slice(afterStart));
+      expect(tick).toContain("\x1b[1A\r\x1b[2K");
+      expect(tick).toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/);
+      expect(writer.text.match(/\x1b\[1A\r\x1b\[2K/g) ?? []).toHaveLength(1);
+
+      bus.emit(createEvent("compact.applied", { sessionId: "s", strategy: "llm-summary" }));
+      expect(stripAnsi(writer.text).endsWith("✓ compacting conversation compacted (strategy=llm-summary)\n")).toBe(true);
+      expect(writer.text.match(/\x1b\[1A\r\x1b\[2K/g) ?? []).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders a `compacted:false` no-op as a static done row", () => {
+    const writer = makeNonTtyWriter();
+    const bus = new EventBus();
+    const renderer = createTimelineRenderer({ writer }).attach(bus);
+    bus.emit(createEvent("compact.started", { sessionId: "s", strategy: "drop-tool-results" }));
+    bus.emit(createEvent("compact.applied", { sessionId: "s", strategy: "drop-tool-results", compacted: false }));
+    expect(stripAnsi(writer.text)).toContain("○ compacting conversation done (nothing to compact)");
+    renderer.detach();
+  });
+
+  it("does not emit control codes for compaction on a non-TTY sink", () => {
+    const writer = makeNonTtyWriter();
+    const bus = new EventBus();
+    const renderer = createTimelineRenderer({ writer }).attach(bus);
+    bus.emit(createEvent("compact.started", { sessionId: "s", strategy: "x" }));
+    expect(renderer.toolSpinner).toBeNull();
+    expect(writer.text).not.toContain("\x1b[1A");
+    renderer.detach();
+  });
+});
+
+/**
  * P3b-2: the live feed printed each tool call twice (once from
  * `activity.started`, once from `tool.call.started`), stamped every line with
  * a locale 12-hour clock, ticked the spinner at 1fps, and ran a spinner frame
@@ -276,6 +441,55 @@ describe("timeline renderer — Phase 3b cleanups", () => {
     bus.emit(createEvent("activity.started", { sessionId: "s", activityId: "a", label: "model waiting" }));
     expect(calls[0][0]).toBe("transient");
     expect(calls[0][1]).not.toContain("\r");
+  });
+
+  // Dock sink: the running tool row lives ONLY on the transient status row —
+  // if the "● …" text carried the trailing `\n` that `renderToolCall` produces,
+  // the dock would draw it with a real line-feed, pushing the row into the
+  // scrollback and leaving a stale "● list_files(dir=.)" row under the later
+  // "✓ list_files(dir=.)" row. The transient must be a single newline-free row.
+  it("keeps the running tool row off the scrollback on a dock writer", () => {
+    const calls = [];
+    const writer = {
+      isTTY: true,
+      hasDock: true,
+      write: (value) => calls.push(["write", value]),
+      writeTransient: (value) => calls.push(["transient", value]),
+      clearTransient: () => calls.push(["clear"])
+    };
+    const bus = new EventBus();
+    const renderer = createTimelineRenderer({ writer, intervalMs: 100000, colorize: false }).attach(bus);
+
+    bus.emit(createEvent("tool.call.scheduled", {
+      sessionId: "s",
+      toolCallId: "tc-9",
+      name: "list_files",
+      args: { dir: "." }
+    }));
+    bus.emit(createEvent("tool.call.started", { sessionId: "s", toolCallId: "tc-9", name: "list_files" }));
+
+    // The start line is transient-only: never committed to the feed, and the
+    // transient text is exactly one row with no trailing newline.
+    const startCalls = calls.filter(([kind]) => kind === "transient");
+    expect(startCalls.length).toBe(1);
+    expect(startCalls[0][1]).toContain("● list_files(dir=.)");
+    expect(startCalls[0][1]).not.toContain("\n");
+    expect(calls.some(([kind, value]) => kind === "write" && value.includes("●"))).toBe(false);
+
+    bus.emit(createEvent("tool.call.completed", {
+      sessionId: "s",
+      toolCallId: "tc-9",
+      ok: true,
+      result: { kind: "list_files", summary: "2 entries" }
+    }));
+
+    // Completion clears the transient status row and commits exactly ONE
+    // result row to the feed.
+    expect(calls).toContainEqual(["clear"]);
+    const feedRows = calls.filter(([kind, value]) => kind === "write" && value.includes("list_files"));
+    expect(feedRows.length).toBe(1);
+    expect(feedRows[0][1]).toContain("✓ list_files(dir=.)");
+    renderer.detach();
   });
 
   it("holds the spinner still while something is reading keys", () => {

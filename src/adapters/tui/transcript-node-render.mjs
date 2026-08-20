@@ -22,17 +22,19 @@
 
 import { transcriptFromMessages } from "../../core/projections/transcript.mjs";
 import { renderMarkdown, trimTrailingNewlines } from "./markdown-render.mjs";
-import { renderToolCall, TOOL_PREVIEW_LINES, TOOL_RESULT_MAX_CHARS } from "./tool-render.mjs";
+import { renderToolCall } from "./tool-render.mjs";
 import { style, terminalWidth } from "./ansi.mjs";
 import { sanitizeInline, sanitizeTerminalText } from "./sanitize.mjs";
+import { WAKE_NOTICE_LINE } from "./turn-executor.mjs";
 
 /**
  * Messages kept when replaying a session in the terminal. This is the core
  * projection's own default, restated here so that all four TUI routes share
  * one explicit value instead of three of them inheriting it by accident and a
  * fourth overriding it. 100 messages ≈ 30-50 turns; combined with the
- * per-tool-call clipping in tool-render.mjs the worst-case recap stays inside
- * a few screens instead of the 53 KB JSON wall it used to be.
+ * header-only tool lines (a tool node is `✓ name(args)`, no result body) the
+ * worst-case recap stays inside a few screens instead of the 53 KB JSON wall
+ * it used to be.
  * (`adapters/serve/` keeps `Infinity`: a web client can virtualise.)
  */
 export const RECAP_MAX_MESSAGES = 100;
@@ -50,9 +52,8 @@ export const NO_HISTORY = "(no prior conversation)\n";
  * @param {number}  [options.width]        terminal width for Markdown wrapping
  * @param {boolean} [options.colorize]     emit ANSI (callers pass supportsColor(stream))
  * @param {number}  [options.maxChars]     cap for user/assistant/system text
- * @param {number}  [options.toolMaxChars] cap for a tool result body
- * @param {number}  [options.previewLines] visible lines of a tool result body
- * @param {boolean} [options.expanded]     show the full tool result body
+ *        (tool nodes are header-only — `✓ name(args)` — so there is no body to
+ *        clip; this makes a replayed session look identical to the live feed)
  * @param {boolean} [options.hyperlinks]   emit OSC 8 links (callers pass
  *        `resolveHyperlinks(...)`; must match what the live renderer got)
  * @param {Map<string, {name: string, args: object}>} [options.toolCalls]
@@ -67,9 +68,6 @@ export function renderTranscriptNode(node, {
   width = 80,
   colorize = false,
   maxChars,
-  toolMaxChars = TOOL_RESULT_MAX_CHARS,
-  previewLines = TOOL_PREVIEW_LINES,
-  expanded = false,
   hyperlinks = false,
   toolCalls = EMPTY_MAP,
   resolvedToolCallIds = EMPTY_SET
@@ -86,10 +84,12 @@ export function renderTranscriptNode(node, {
   }
 
   if (kind === "assistant") {
-    const label = colorize ? style(["accent", "bold"], "Assistant") : "Assistant";
     const body = truncateText(node.text ?? "", maxChars);
     if (!body) return "";
-    return `${label}:\n${trimTrailingNewlines(renderMarkdown(body, { width, color: colorize, hyperlinks }))}`;
+    // No role label — the live streaming renderer prints the assistant's prose
+    // bare (renderAssistantContent), so a replayed message must be
+    // byte-identical to what streamed (P3c parity: replay === live output).
+    return trimTrailingNewlines(renderMarkdown(body, { width, color: colorize, hyperlinks }));
   }
 
   if (kind === "assistant-tool-calls") {
@@ -112,18 +112,25 @@ export function renderTranscriptNode(node, {
   if (kind === "tool") {
     const call = node.toolCallId ? toolCalls.get(node.toolCallId) : null;
     const { result, ok } = toolResultFromNode(node);
+    // Header only (`✓ name(args)`), exactly like the live feed's completed
+    // tool row — no clipped result body. Keeps a heavy tool session's recap
+    // one line per call and makes replay byte-identical to what was on screen.
     const block = trimTrailingNewlines(renderToolCall({
-      name: call?.name ?? result?.kind,
+      name: call?.name ?? result?.kind ?? "tool",
       args: call?.args ?? {},
-      result,
       status: ok ? "ok" : "error",
-      previewLines,
-      maxChars: toolMaxChars,
-      expanded,
       colorize
     }));
     const attachments = renderAttachments(node.attachments, colorize);
     return attachments ? `${block}\n${attachments}` : block;
+  }
+
+  if (kind === "wake") {
+    // event-wake (issue #143): replay the SAME muted one-liner the REPL printed
+    // live. The node's `text` is the raw <system-reminder> body — dumping it
+    // here would replace a one-line marker with a screenful of machine prompt,
+    // and it never appeared on screen in the first place.
+    return colorize ? style("muted", WAKE_NOTICE_LINE) : WAKE_NOTICE_LINE;
   }
 
   if (kind === "compact-summary") {

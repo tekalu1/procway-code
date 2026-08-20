@@ -11,8 +11,11 @@ import {
   executeModelRound,
   executeToolsRound,
   handleModelResponseWithoutTools,
-  isToolRoundAllowed
+  isToolRoundAllowed,
+  toolCallBudgetMs
 } from "../src/agent/turn-orchestrator.mjs";
+import { DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS } from "../src/safety/command-classifier.mjs";
+import { joinTimeoutMsFor } from "../src/tools/run-control.mjs";
 import { DEFAULT_SETTINGS } from "../src/config/default-settings.mjs";
 import { makeInvalidToolArgs } from "../src/providers/format/tool-args.mjs";
 
@@ -803,6 +806,114 @@ describe("turn orchestrator", () => {
         mutation: false
       }));
       expect(session.saveCalls).toHaveLength(1);
+    } finally {
+      await session.cleanup();
+    }
+  });
+});
+
+/**
+ * `toolCallBudgetMs` had NO test at all, which is how a tool that legitimately
+ * blocks for minutes ends up silently back on the scheduler's shared 60s
+ * timeout — a failure that never shows up in a unit run and kills a real run
+ * loop / JOIN in production. Every branch is pinned here.
+ *
+ * Issue #143 Phase 2 (event-driven JOIN) makes this MORE load-bearing, not
+ * less: the run tools still await, they just await an event instead of a poll.
+ */
+describe("toolCallBudgetMs (scheduler budget for tools that block)", () => {
+  const GRACE = 30_000;
+  const sessionWith = (tools = {}, agents = {}) => ({ settings: { tools, agents } });
+
+  it("gives no budget (scheduler default) to ordinary tools", () => {
+    expect(toolCallBudgetMs({ name: "read_file", args: { filePath: "a" } }, sessionWith())).toBeNull();
+    expect(toolCallBudgetMs({ name: "agent_job", args: { action: "status" } }, sessionWith())).toBeNull();
+    // A BACKGROUND run_shell returns immediately — nothing to budget for.
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: "sleep 1", runInBackground: true } }, sessionWith())).toBeNull();
+  });
+
+  it("run_shell: mirrors the shell tool's own deadline plus the grace margin", () => {
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: "ls" } }, sessionWith())).toBe(300_000 + GRACE);
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: "ls", timeoutMs: 90_000 } }, sessionWith())).toBe(90_000 + GRACE);
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: "ls" } }, sessionWith({ shellTimeoutMs: 120_000 }))).toBe(120_000 + GRACE);
+  });
+
+  it("run_shell: an orchestration drive gets the relaxed ceiling, never below any configured timer", () => {
+    const cmd = 'node "$PROCWAY_CLI" run loop --project p';
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: cmd } }, sessionWith()))
+      .toBe(DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS + GRACE);
+    // The budget must never be LOWER than the shell's own timer, whichever of
+    // the three sources is highest (shell.mjs takes the same max).
+    const huge = DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS * 2;
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: cmd, timeoutMs: huge } }, sessionWith())).toBe(huge + GRACE);
+    expect(toolCallBudgetMs({ name: "run_shell", args: { command: cmd } }, sessionWith({ sandbox: { timeoutMs: huge } }))).toBe(huge + GRACE);
+  });
+
+  it("shell_job / agent_job wait: the tool owns its deadline, the scheduler waits one margin longer", () => {
+    for (const name of ["shell_job", "agent_job"]) {
+      expect(toolCallBudgetMs({ name, args: { action: "wait" } }, sessionWith()), name).toBe(600_000 + GRACE);
+      expect(toolCallBudgetMs({ name, args: { action: "wait", waitMs: 90_000 } }, sessionWith()), name).toBe(90_000 + GRACE);
+    }
+  });
+
+  it("spawn_agent: the child's own provider deadline, floored at the long-running ceiling", () => {
+    expect(toolCallBudgetMs({ name: "spawn_agent", args: {} }, sessionWith()))
+      .toBe(DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS + GRACE);
+    // A child deadline BELOW the ceiling must not shrink the budget...
+    expect(toolCallBudgetMs({ name: "spawn_agent", args: {} }, sessionWith({}, { defaultTimeoutMs: 5_000 })))
+      .toBe(DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS + GRACE);
+    // ...and one above it must raise it.
+    const above = DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS + 60_000;
+    expect(toolCallBudgetMs({ name: "spawn_agent", args: {} }, sessionWith({}, { defaultTimeoutMs: above })))
+      .toBe(above + GRACE);
+  });
+
+  it("the four run tools get the long-running budget — and it OUTLASTS their own wait", () => {
+    // Deleting this branch would put a JOIN back on the shared 60s tool timeout.
+    for (const name of ["start_run", "attach_run", "resume_run", "reply_run"]) {
+      expect(toolCallBudgetMs({ name, args: {} }, sessionWith()), name)
+        .toBe(DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS + GRACE);
+
+      const lr = 30 * 60_000;
+      const budget = toolCallBudgetMs({ name, args: {} }, sessionWith({ longRunningShellTimeoutMs: lr }));
+      expect(budget, name).toBe(lr + GRACE);
+      // The ordering that matters: the tool's own deadline fires FIRST, so it
+      // returns its honest "still running" yield instead of being SIGTERMed.
+      expect(joinTimeoutMsFor(lr), name).toBeLessThan(budget);
+    }
+  });
+});
+
+/**
+ * The other half of the turn-idle watchdog chain (issue #143 Phase 2): a tool
+ * that reports progress must produce `activity.tick` session events, because
+ * ANY session event is what bumps the watchdog. The JOIN's heartbeat travels
+ * this path; if it stops, a long JOIN is aborted at 180s.
+ */
+describe("onProgress → activity.tick (turn-idle watchdog food)", () => {
+  it("emits one activity.tick per progress report of a long-blocking tool", async () => {
+    const session = await makeSession();
+    try {
+      const ticks = [];
+      session.events.on("activity.tick", (event) => ticks.push(event));
+      // Stand in for attach_run: block, reporting progress as it waits.
+      session.executeSingleToolCall = async (toolCall, { onProgress } = {}) => {
+        for (let i = 1; i <= 3; i += 1) onProgress({ detail: `run r1: running — waiting for it to settle (${i * 20}s)` });
+        onProgress({ detail: "run r1: completed" });
+        return { kind: "attach_run", summary: "Run r1 completed", data: { jobId: "r1", status: "completed" } };
+      };
+
+      await executeToolsRound({
+        session,
+        round: 1,
+        toolCalls: [{ id: "call-join", name: "attach_run", args: { runId: "r1" } }],
+        response: { usage: { inputTokens: 1, outputTokens: 1 } }
+      });
+
+      expect(ticks).toHaveLength(4);
+      expect(ticks[0].detail).toContain("run r1");
+      expect(ticks.at(-1).detail).toBe("run r1: completed");
+      expect(ticks.every((t) => typeof t.elapsedMs === "number")).toBe(true);
     } finally {
       await session.cleanup();
     }

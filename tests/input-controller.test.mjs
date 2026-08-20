@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { createInputController, splitPrompt } from "../src/adapters/tui/input-controller.mjs";
+import { renderScreen } from "./helpers/screen.mjs";
 
 function makeTty() {
   const input = new EventEmitter();
@@ -333,6 +334,160 @@ describe("input controller — piped stdin", () => {
     input.emit("end");
     await expect(last).resolves.toBeNull();
     controller.dispose();
+  });
+});
+
+describe("input controller — persistent dock (TODO panel + status row)", () => {
+  async function arm(prompt = "❯ ") {
+    const input = makeTty();
+    const output = makeOutput();
+    const controller = createInputController({ input, output });
+    const pending = controller.question(prompt);
+    await tick();
+    output.clear();
+    return { input, output, controller, pending };
+  }
+
+  it("pins the panel and a status spinner above the prompt, then drops the status on a content write", async () => {
+    const { output, controller, pending } = await arm();
+    controller.writer.setDockPanel("▌ TODO\n   ✔ a");
+    controller.writer.writeTransient("⠋ model waiting (0.3s)");
+    // Layout top→bottom: status spinner, panel, input row. `lastIndexOf`
+    // reads the FINAL composite (each transient repaint redraws the whole
+    // dock), so this is a true vertical-order check.
+    expect(output.text.lastIndexOf("model waiting")).toBeGreaterThan(-1);
+    expect(output.text.lastIndexOf("model waiting")).toBeLessThan(output.text.lastIndexOf("▌ TODO"));
+    expect(output.text.lastIndexOf("❯")).toBeGreaterThan(output.text.lastIndexOf("▌ TODO"));
+    // In-place repaint replaces the old frame instead of stacking lines.
+    controller.writer.writeTransient("⠙ model waiting (0.4s)");
+    expect(output.text).toContain("⠙ model waiting");
+    // A newline-terminated content write clears the status but keeps the panel
+    // pinned directly above the prompt.
+    output.clear();
+    controller.writer.write("response line\n");
+    expect(output.text).toContain("response line");
+    expect(output.text).not.toContain("model waiting");
+    expect(output.text.indexOf("▌ TODO")).toBeGreaterThan(output.text.indexOf("response line"));
+    expect(output.text.lastIndexOf("❯")).toBeGreaterThan(output.text.indexOf("▌ TODO"));
+    controller.dispose();
+    await pending.catch(() => {});
+  });
+
+  it("commits the docked editor's submitted line to the feed and re-pins the panel (no scroll leak)", async () => {
+    const { input, output, controller, pending } = await arm();
+    controller.writer.setDockPanel("▌ TODO\n   ✔ a");
+    output.clear();
+    type(input, "hello\r");
+    await expect(pending).resolves.toBe("hello");
+    // The submitted line is committed as a feed row and the TODO panel is
+    // re-pinned BELOW it (immediately above the now-empty prompt) — i.e. the
+    // panel does NOT scroll up past the message on submit, and the message is
+    // not swallowed by the dock redraw.
+    expect(output.text).toContain("\u276f hello");
+    expect(output.text.lastIndexOf("\u276f hello")).toBeGreaterThan(-1);
+    expect(output.text.lastIndexOf("\u276f hello")).toBeLessThan(output.text.lastIndexOf("▌ TODO"));
+    expect(output.text.lastIndexOf("\u276f")).toBeGreaterThan(output.text.lastIndexOf("▌ TODO"));
+    controller.dispose();
+  });
+
+  it("re-arming the prompt after a docked submit leaves ONE dock copy (no TODO/header flow)", async () => {
+    const input = makeTty();
+    const output = makeOutput();
+    const controller = createInputController({ input, output }).start();
+    const q1 = controller.question("╭─ ws · p:m\n╰─❯ ");
+    await tick();
+    controller.writer.setDockPanel("▌ TODO\n   ✔ a\ny");
+    output.clear();
+    // Submit; the pump then re-arms a fresh base prompt while a turn runs.
+    type(input, "hello\r");
+    await expect(q1).resolves.toBe("hello");
+    const q2 = controller.question("╭─ ws · p:m\n╰─❯ ");
+    await tick();
+    controller.writer.write("response\n");
+    await tick();
+    // The submitted line is committed to the feed, and the TODO panel + `╭─`
+    // header appear exactly once on the FINAL SCREEN — the re-arm must not
+    // stack a second dock below the old one, and the pinned panel must not
+    // "flow" into the scrollback in addition to being pinned.
+    const lines = renderScreen(output.text, { width: 60, height: 24 });
+    expect(lines.join("\n")).toContain("hello");
+    expect(lines.filter((l) => l.includes("▌ TODO")).length).toBe(1);
+    expect(lines.filter((l) => l.includes("╭─ ws")).length).toBe(1);
+    expect(lines.join("\n").lastIndexOf("❯")).toBeGreaterThan(lines.indexOf("▌ TODO"));
+    controller.dispose();
+    await q2.catch(() => {});
+  });
+
+  it("drop the panel with null (off mode) and clear the status with clearTransient()", async () => {
+    const { output, controller, pending } = await arm();
+    controller.writer.setDockPanel("▌ TODO\n   ✔ a");
+    output.clear();
+    controller.writer.writeTransient("⠋ spinning");
+    expect(output.text).toContain("spinning");
+    output.clear();
+    controller.writer.clearTransient();
+    expect(output.text).not.toContain("spinning");
+    expect(output.text).toContain("▌ TODO");
+    output.clear();
+    controller.writer.setDockPanel(null);
+    expect(output.text).not.toContain("▌ TODO");
+    controller.dispose();
+    await pending.catch(() => {});
+  });
+
+  it("an EMPTY write changes nothing — the panel and the input stay on screen", async () => {
+    const { output, controller, pending } = await arm("╭─ ws · p:m\n╰─❯ ");
+    controller.writer.setDockPanel("▌ TODO\n   ✔ a");
+    output.clear();
+    // `renderAssistantContent()` returns "" for a round whose assistant message
+    // is tool calls only, and the REPL wrote that verbatim — so EVERY turn that
+    // used a tool sent an empty string through here. It was treated as a
+    // partial (unterminated) line: the dock came down and, because a hidden
+    // editor took a bare-write early return, nothing ever put it back. The
+    // input line stayed gone until the user pressed Enter (which re-arms the
+    // prompt and redraws the dock).
+    controller.writer.write("");
+    expect(output.text).toBe("");
+    // The dock is still live: a following content write repaints it as usual.
+    controller.writer.write("after\n");
+    const lines = renderScreen(output.text, { width: 60, height: 10 });
+    expect(lines.filter((l) => l.includes("▌ TODO")).length).toBe(1);
+    expect(lines.filter((l) => l.includes("╰─❯")).length).toBe(1);
+    controller.dispose();
+    await pending.catch(() => {});
+  });
+
+  it("a partial (unterminated) write hides the dock, and the next full line brings it back", async () => {
+    const { output, controller, pending } = await arm("╭─ ws · p:m\n╰─❯ ");
+    controller.writer.setDockPanel("▌ TODO\n   ✔ a");
+    output.clear();
+    // Half a line: the dock has to come down (it must not be painted over an
+    // unterminated row), but that state has to be RECOVERABLE — before, a
+    // hidden editor made every later write a bare passthrough.
+    controller.writer.write("half");
+    controller.writer.write(" line\n");
+    const lines = renderScreen(output.text, { width: 60, height: 10 });
+    expect(lines.join("\n")).toContain("half line");
+    expect(lines.filter((l) => l.includes("▌ TODO")).length).toBe(1);
+    expect(lines.filter((l) => l.includes("╭─ ws")).length).toBe(1);
+    expect(lines.filter((l) => l.includes("╰─❯")).length).toBe(1);
+    controller.dispose();
+    await pending.catch(() => {});
+  });
+
+  it("isOverlay is false at the base prompt and true while an overlay reads keys; writeTransient is then refused", async () => {
+    const { input, controller, pending } = await arm();
+    expect(controller.isOverlay).toBe(false);
+    expect(controller.writer.hasDock).toBe(true);
+    const approval = controller.question({ prompt: "Approve? ", level: 1 });
+    await tick();
+    expect(controller.isOverlay).toBe(true);
+    expect(controller.writer.writeTransient("spinner")).toBe(false);
+    type(input, "y\r");
+    await expect(approval).resolves.toBe("y");
+    expect(controller.isOverlay).toBe(false);
+    controller.dispose();
+    await pending.catch(() => {});
   });
 });
 

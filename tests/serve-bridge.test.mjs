@@ -521,3 +521,196 @@ describe("serve bridge — loadSession dispatch", () => {
     await bridge.detach();
   });
 });
+
+// event-wake (issue #143) — the `wake` command. The whole point of it being a
+// command of its own (and not a runTurn) is that it is accepted while a turn is
+// running: a settle pushed by the host must be QUEUED, never refused, because
+// the refusal would be swallowed by the caller and the result lost.
+describe("serve bridge — wake", () => {
+  async function wakeSession(sessionId) {
+    return createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId,
+      events: new EventBus()
+    });
+  }
+
+  function sendWake(ws, id, args) {
+    ws.emit("message", JSON.stringify({ kind: "command", command: "wake", id, args }));
+  }
+
+  function responseFor(ws, id) {
+    return ws.sent.map((raw) => JSON.parse(raw)).find((m) => m.id === id);
+  }
+
+  it("queues a pushed run settle onto the session's wake supervisor", async () => {
+    const session = await wakeSession("bridge-wake-1");
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendWake(ws, "W1", {
+      source: "host",
+      items: [{ jobId: "run-1", kind: "run", status: "completed", project: "acme", ticket: "TK-1" }]
+    });
+    await waitFor(() => responseFor(ws, "W1"));
+
+    expect(responseFor(ws, "W1")).toMatchObject({
+      kind: "response",
+      ok: true,
+      result: { queued: true, accepted: 1, deduped: 0 }
+    });
+    const pending = session.wakeSupervisor.__inspect().pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ jobId: "run-1", kind: "run", project: "acme", ticket: "TK-1" });
+
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  // Without this line a wake leaves NO evidence inside the Pod: the only proof
+  // of delivery is the dashboard's own `woken_at` write plus the turn that
+  // eventually shows up, which is how the first real-environment check had to
+  // be done. One line, jobIds + accepted/deduped.
+  it("logs one line per accepted wake (jobIds, accepted, deduped)", async () => {
+    const session = await wakeSession("bridge-wake-log");
+    const ws = fakeWs();
+    const logs = [];
+    const bridge = attachBridge({ session, ws, version: "0.0.1", logger: (msg) => logs.push(msg) });
+    ws.sent.length = 0;
+
+    sendWake(ws, "W-LOG", {
+      source: "host",
+      items: [
+        { jobId: "run-log-1", kind: "run", status: "completed", project: "acme", ticket: "TK-1" },
+        { jobId: "run-log-2", kind: "run", status: "awaiting-user-input", project: "acme", ticket: "TK-2" }
+      ]
+    });
+    await waitFor(() => responseFor(ws, "W-LOG"));
+
+    const line = logs.find((msg) => msg.includes("wake received"));
+    expect(line).toBe("bridge: wake received jobs=2 run-log-1 +1 more accepted=2 deduped=0");
+
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  it("logs deduped wakes too, so a re-push is distinguishable from a lost one", async () => {
+    const session = await wakeSession("bridge-wake-log-dupe");
+    const ws = fakeWs();
+    const logs = [];
+    const bridge = attachBridge({ session, ws, version: "0.0.1", logger: (msg) => logs.push(msg) });
+    session.wakeSupervisor.collect({ jobId: "run-log-3", status: "completed" });
+    ws.sent.length = 0;
+
+    sendWake(ws, "W-LOG2", {
+      source: "host",
+      items: [{ jobId: "run-log-3", kind: "run", status: "completed", project: "acme", ticket: "TK-3" }]
+    });
+    await waitFor(() => responseFor(ws, "W-LOG2"));
+
+    expect(logs.find((msg) => msg.includes("wake received")))
+      .toBe("bridge: wake received jobs=1 run-log-3 accepted=0 deduped=1");
+
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  it("accepts a wake WHILE a turn is in flight (never turn_in_progress)", async () => {
+    const session = await wakeSession("bridge-wake-live");
+    // Same simulation as the runTurn re-entrancy test above.
+    session.runningTurn = true;
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendWake(ws, "W2", { items: [{ jobId: "run-2", status: "completed", project: "p", ticket: "TK-2" }] });
+    await waitFor(() => responseFor(ws, "W2"));
+
+    const response = responseFor(ws, "W2");
+    expect(response.ok).toBe(true);
+    expect(response.error).toBeUndefined();
+    expect(response.result).toMatchObject({ queued: true, accepted: 1 });
+    // Held, not injected: no turn may interleave with the running one.
+    expect(session.wakeSupervisor.__inspect().pending).toHaveLength(1);
+    expect(session.wakeSupervisor.hasOutstanding()).toBe(true);
+
+    session.runningTurn = false;
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  it("counts a settle the turn already collected as deduped, not accepted", async () => {
+    const session = await wakeSession("bridge-wake-dedupe");
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+    // attach_run / resume_run already delivered this yield inside the turn.
+    session.wakeSupervisor.collect({ jobId: "run-3", project: "p", ticket: "TK-3", status: "completed" });
+
+    sendWake(ws, "W3", {
+      items: [
+        { jobId: "run-3", status: "completed", project: "p", ticket: "TK-3" },
+        { jobId: "run-4", status: "failed", project: "p", ticket: "TK-4" }
+      ]
+    });
+    await waitFor(() => responseFor(ws, "W3"));
+
+    expect(responseFor(ws, "W3").result).toEqual({ queued: true, accepted: 1, deduped: 1 });
+    expect(session.wakeSupervisor.__inspect().pending.map((i) => i.jobId)).toEqual(["run-4"]);
+
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  it("reports queued:false when every pushed item was a duplicate", async () => {
+    const session = await wakeSession("bridge-wake-alldupe");
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+    session.wakeSupervisor.collect({ jobId: "run-5", status: "completed" });
+
+    sendWake(ws, "W4", { items: [{ jobId: "run-5", status: "completed" }] });
+    await waitFor(() => responseFor(ws, "W4"));
+
+    expect(responseFor(ws, "W4").result).toEqual({ queued: false, accepted: 0, deduped: 1 });
+
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  it("answers invalid_args for a malformed push", async () => {
+    const session = await wakeSession("bridge-wake-bad");
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendWake(ws, "W5", { items: [] });
+    await waitFor(() => responseFor(ws, "W5"));
+    expect(responseFor(ws, "W5")).toMatchObject({ ok: false, error: { code: "invalid_args" } });
+
+    sendWake(ws, "W6", { items: [{ status: "completed" }] });
+    await waitFor(() => responseFor(ws, "W6"));
+    expect(responseFor(ws, "W6")).toMatchObject({ ok: false, error: { code: "invalid_args" } });
+    expect(session.wakeSupervisor.__inspect().pending).toHaveLength(0);
+
+    session.wakeSupervisor.stop();
+    await bridge.detach();
+  });
+
+  it("answers wake_unavailable when the session has no supervisor", async () => {
+    const session = await wakeSession("bridge-wake-none");
+    session.wakeSupervisor?.stop();
+    session.wakeSupervisor = null;
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendWake(ws, "W7", { items: [{ jobId: "run-6", status: "completed" }] });
+    await waitFor(() => responseFor(ws, "W7"));
+    expect(responseFor(ws, "W7")).toMatchObject({ ok: false, error: { code: "wake_unavailable" } });
+
+    await bridge.detach();
+  });
+});

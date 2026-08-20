@@ -30,7 +30,8 @@ export const COMMANDS = Object.freeze([
   "history",
   "abort",
   "listSessions",
-  "loadSession"
+  "loadSession",
+  "wake"
 ]);
 
 export function isServerMessage(value) {
@@ -150,6 +151,88 @@ export function normalizeRunTurnAttachments(attachments) {
     }
     return normalized;
   });
+}
+
+/** Max wake items accepted on a single `wake` push. */
+export const MAX_WAKE_ITEMS = 32;
+
+/** String fields copied through onto a wake item (trimmed; empties dropped). */
+const WAKE_STRING_FIELDS = Object.freeze([
+  "status", "project", "ticket", "inputKind", "hearing", "runSessionId", "error", "task", "text"
+]);
+/**
+ * Structured fields copied through verbatim (never stringified, never dropped).
+ * Validation here is deliberately loose — an object OR a string is accepted,
+ * because the host's own shapes differ per field (`interaction` is a widget
+ * payload, `pendingTask` is a task id in the reference host) and the supervisor
+ * treats all of them as opaque. Rejecting a shape we merely did not expect
+ * would sink the whole push, i.e. LOSE the settle — the precise failure
+ * event-wake exists to remove.
+ */
+const WAKE_STRUCTURED_FIELDS = Object.freeze(["interaction", "pendingTask", "result"]);
+
+/**
+ * Validate + normalize the `wake` command's args (event-wake, issue #143).
+ *
+ * `wake` is the host's push channel for "a background run this conversation
+ * started has settled". It is deliberately NOT `runTurn`: a runTurn that races
+ * a live turn is rejected with `turn_in_progress` and the settle is simply
+ * lost, whereas a wake is always ACCEPTED — coalescing, holding it until the
+ * current turn ends, and de-duplicating it are the wake supervisor's job
+ * (agent/wake-supervisor.mjs), not the caller's.
+ *
+ * Shape: `{ source?, items: [{ jobId, kind?, status?, project?, ticket?, … }] }`.
+ * An item WITHOUT a jobId is dropped rather than rejected — the supervisor keys
+ * dedupe/tombstones/collect by jobId, so an anonymous item could never be
+ * reconciled, and one malformed row must not sink the whole push. A push where
+ * NO item carries a jobId is an `invalid_args` error (nothing was pushed).
+ *
+ * @param {object} args
+ * @returns {Array<object>} normalized wake items (never empty)
+ */
+export function normalizeWakeItems(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("wake: args must be an object");
+  }
+  if (args.source !== undefined && args.source !== null && typeof args.source !== "string") {
+    throw new Error("wake: source must be a string");
+  }
+  const items = args.items;
+  if (!Array.isArray(items)) throw new Error("wake: items must be an array");
+  if (items.length === 0) throw new Error("wake: items must not be empty");
+  if (items.length > MAX_WAKE_ITEMS) {
+    throw new Error(`wake: too many items (max ${MAX_WAKE_ITEMS})`);
+  }
+  const normalized = [];
+  items.forEach((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`wake: item[${i}] must be an object`);
+    }
+    if (item.jobId !== undefined && item.jobId !== null && typeof item.jobId !== "string") {
+      throw new Error(`wake: item[${i}].jobId must be a string`);
+    }
+    const jobId = typeof item.jobId === "string" ? item.jobId.trim() : "";
+    if (!jobId) return;
+    const out = { jobId, kind: item.kind === "agent" ? "agent" : "run" };
+    for (const field of WAKE_STRING_FIELDS) {
+      const value = item[field];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "string") throw new Error(`wake: item[${i}].${field} must be a string`);
+      const trimmed = value.trim();
+      if (trimmed) out[field] = trimmed;
+    }
+    for (const field of WAKE_STRUCTURED_FIELDS) {
+      const value = item[field];
+      if (value === undefined || value === null) continue;
+      if (typeof value !== "object" && typeof value !== "string") {
+        throw new Error(`wake: item[${i}].${field} must be an object or a string`);
+      }
+      out[field] = value;
+    }
+    normalized.push(out);
+  });
+  if (normalized.length === 0) throw new Error("wake: no item carries a jobId");
+  return normalized;
 }
 
 /**

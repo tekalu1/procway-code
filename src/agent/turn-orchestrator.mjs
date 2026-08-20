@@ -10,8 +10,13 @@ import { isLongRunningCommand, DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS } from "../
  * own deadline plus a grace margin so the scheduler is never the one that
  * fires first (the tool's own timeout produces the more useful error).
  * Null → use the scheduler's shared default.
+ *
+ * Exported for tests: every branch here exists because the shared 60s tool
+ * timeout would otherwise SIGTERM a legitimate multi-minute wait, and losing
+ * one is invisible until a long run dies in production. tests/turn-orchestrator
+ * pins each branch.
  */
-function toolCallBudgetMs(toolCall, session) {
+export function toolCallBudgetMs(toolCall, session) {
   const args = toolCall?.args ?? {};
   if (toolCall?.name === "run_shell" && args.runInBackground !== true) {
     // Keep this in lockstep with shell.mjs's effectiveTimeout: a long-running
@@ -39,13 +44,28 @@ function toolCallBudgetMs(toolCall, session) {
     const base = Number.isFinite(args.waitMs) ? args.waitMs : 600000;
     return base + 30000;
   }
+  if (toolCall?.name === "agent_job" && args.action === "wait") {
+    // Issue #142: the JOIN for a background child (spawn_agent with
+    // runInBackground:true). Same deal as shell_job wait — the tool owns its
+    // own deadline (waitMs, default 600000) and heartbeats while it blocks, so
+    // the scheduler must never be the one that fires first.
+    const base = Number.isFinite(args.waitMs) ? args.waitMs : 600000;
+    return base + 30000;
+  }
   if (toolCall?.name === "start_run" || toolCall?.name === "attach_run"
     || toolCall?.name === "resume_run" || toolCall?.name === "reply_run") {
-    // ADR 0029 await-yield: these tools poll the run-loop job until it pauses for
-    // input or finishes — minutes, not seconds. Without a budget the shared 60s
+    // ADR 0029 await-yield: these tools WAIT for the run-loop job to pause for
+    // input or finish — minutes, not seconds. Without a budget the shared 60s
     // tool timeout would SIGTERM the await mid-flight. Grant the same relaxed
-    // long-running ceiling a `run loop` shell drive gets; each poll's onProgress
-    // heartbeat keeps the turn-idle watchdog fed.
+    // long-running ceiling a `run loop` shell drive gets; the wait's own
+    // heartbeat (run-control DEFAULT_JOIN_HEARTBEAT_MS, forwarded to onProgress)
+    // keeps the turn-idle watchdog fed.
+    //
+    // Issue #143 Phase 2 made the wait event-driven (no more 2s poll), which
+    // does NOT make this branch redundant: the await is still an await. The
+    // tool's own deadline is derived from the SAME `lr` below and set one margin
+    // lower (run-control joinTimeoutMsFor), so the tool returns its own honest
+    // yield instead of being killed here.
     const lr = session.settings?.tools?.longRunningShellTimeoutMs ?? DEFAULT_LONG_RUNNING_SHELL_TIMEOUT_MS;
     return lr + 30000;
   }

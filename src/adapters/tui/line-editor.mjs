@@ -341,6 +341,7 @@ export class LineEditor {
     if (cursorCol > 0) out += `\x1b[${cursorCol}C`;
     this.drawnRows = rows.length;
     this.drawnCursorRow = cursorRow;
+    this.drawnCursorCol = cursorCol;
     this.visible = true;
     this.writeOut(out);
   }

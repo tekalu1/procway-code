@@ -150,6 +150,30 @@ describe("saveSessionState integration", () => {
     expect(body).toContain("deepseek/deepseek-v4-pro");
   });
 
+  it("renders a wake turn as an automatic-resume section, never a bodiless `## You`", () => {
+    // event-wake (issue #143): the injected turn is a user-role message whose
+    // whole body is a <system-reminder>. It used to project as a `user` node
+    // with "" text, which rendered as a `## You` heading with nothing under it.
+    const md = renderTranscriptMarkdown({
+      sessionId: "s-wake",
+      messages: [
+        { role: "user", content: "start the run" },
+        {
+          role: "user",
+          wake: true,
+          content: "<system-reminder>\nAUTOMATIC RESUME — this is NOT a message from the user.\nSettled (1):\n- run r-1 — completed\n</system-reminder>"
+        },
+        { role: "assistant", content: "the run finished." }
+      ]
+    });
+    expect(md).toContain("## Automatic resume");
+    expect(md).toContain("Background work settled");
+    // The body is kept for the reviewer, but not under a "You" heading.
+    expect(md).toContain("AUTOMATIC RESUME");
+    expect(md.match(/## You/g)).toHaveLength(1);
+    expect(md).not.toMatch(/## You\n\n\n/);
+  });
+
   it("does not emit transcript.md when the session is encrypted", async () => {
     const homeDir = await makeHome();
     await saveSessionState({

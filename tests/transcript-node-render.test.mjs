@@ -11,7 +11,6 @@ import {
 } from "../src/adapters/tui/transcript-node-render.mjs";
 import { transcriptFromMessages } from "../src/core/projections/transcript.mjs";
 import { stripAnsi } from "../src/adapters/tui/ansi.mjs";
-import { TOOL_PREVIEW_LINES } from "../src/adapters/tui/tool-render.mjs";
 
 function toolMessage({ id, kind, summary, data }) {
   return {
@@ -44,20 +43,20 @@ describe("renderTranscriptNode — per node kind", () => {
     expect(out).toContain("shot.png");
   });
 
-  it("renders an assistant node through the Markdown renderer", () => {
+  it("renders an assistant node through the Markdown renderer, with no role label", () => {
     const out = renderTranscriptNode({ kind: "assistant", role: "assistant", text: "# Title\n\n- one\n- two\n" });
-    expect(out.startsWith("Assistant:\n")).toBe(true);
+    expect(out).not.toContain("Assistant");
     expect(out).toContain("# Title");
     expect(out).toContain("• one");
   });
 
   it("colorizes only when asked", () => {
-    const node = { kind: "assistant", role: "assistant", text: "hi" };
+    const node = { kind: "assistant", role: "assistant", text: "# Headline" };
     expect(renderTranscriptNode(node, { colorize: false })).not.toContain("\x1b[");
     expect(renderTranscriptNode(node, { colorize: true })).toContain("\x1b[");
   });
 
-  it("renders a tool node as a tool call line, not raw JSON", () => {
+  it("renders a tool node as a header only, not raw JSON or a body", () => {
     const node = {
       kind: "tool",
       role: "tool",
@@ -68,7 +67,7 @@ describe("renderTranscriptNode — per node kind", () => {
       toolCalls: new Map([["tc-1", { name: "list_files", args: { dirPath: "src" } }]])
     });
     expect(out).toContain("✓ list_files(dir=src)");
-    expect(out).toContain("Listed 3 entries in .");
+    expect(out).not.toContain("Listed 3 entries in .");
     expect(out).not.toContain('{"kind"');
   });
 
@@ -82,16 +81,17 @@ describe("renderTranscriptNode — per node kind", () => {
     expect(renderTranscriptNode(node)).toContain("✓ run_shell");
   });
 
-  it("marks a failed tool node with ✗", () => {
+  it("marks a failed tool node with ✗ and no error body", () => {
     const node = { kind: "tool", role: "tool", toolCallId: "tc-e", text: JSON.stringify({ error: "boom" }) };
     const out = renderTranscriptNode(node, { toolCalls: new Map([["tc-e", { name: "Edit", args: { filePath: "x" } }]]) });
     expect(out).toContain("✗ Edit(path=x)");
-    expect(out).toContain("boom");
+    expect(out).not.toContain("boom");
   });
 
-  it("renders a non-JSON tool payload as its own summary", () => {
+  it("renders a non-JSON tool payload with a generic header and no body", () => {
     const node = { kind: "tool", role: "tool", toolCallId: "tc-p", text: "plain text result" };
-    expect(renderTranscriptNode(node)).toContain("plain text result");
+    expect(renderTranscriptNode(node)).toContain("✓ tool");
+    expect(renderTranscriptNode(node)).not.toContain("plain text result");
   });
 
   it("dims compact-summary and system nodes", () => {
@@ -157,11 +157,11 @@ describe("renderTranscriptNode — tool call / result pairing (P1-2)", () => {
     expect(map.get("legacy")).toEqual({ name: "run_shell", args: { command: "ls" } });
   });
 
-  it("shows what command was run when the transcript is replayed", () => {
+  it("shows the command header when the transcript is replayed, no body", () => {
     const plain = stripAnsi(renderTranscript(messages));
     expect(plain).toContain('✓ run_shell(command="pnpm test")');
-    expect(plain).toContain("Ran: pnpm test (exit 0)");
-    expect(plain).toContain("137 passed");
+    expect(plain).not.toContain("Ran: pnpm test (exit 0)");
+    expect(plain).not.toContain("137 passed");
     // The [tool calls: …] placeholder is replaced by the paired line.
     expect(plain).not.toContain("[tool calls:");
   });
@@ -172,37 +172,31 @@ describe("renderTranscriptNode — tool call / result pairing (P1-2)", () => {
   });
 });
 
-describe("renderTranscriptNode — clipping (P1-4)", () => {
+describe("renderTranscriptNode — header-only tool replay (P1-4)", () => {
   const bigFile = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`).join("\n");
   const messages = [
     assistantToolUse([{ id: "big", name: "read_file", args: { filePath: "huge.txt" } }]),
     toolMessage({ id: "big", kind: "read_file", summary: "Read 4 KB from huge.txt", data: { content: bigFile } })
   ];
 
-  it("clips a huge tool result to previewLines and reports the remainder", () => {
+  it("replays a huge tool result as a single header line (matches live feed)", () => {
     const plain = stripAnsi(renderTranscript(messages));
     expect(plain).toContain("✓ read_file(path=huge.txt)");
-    expect(plain).toContain("line 1");
+    expect(plain).not.toContain("line 1");
     expect(plain).not.toContain("line 300");
-    expect(plain).toMatch(/… \(\d+ more lines\)/);
-    // No ":show" — that command does not exist.
+    expect(plain).not.toMatch(/… \(\d+ more lines\)/);
     expect(plain).not.toContain(":show");
-    const bodyLines = plain.split("\n").filter((line) => line.startsWith("  "));
-    expect(bodyLines.length).toBeLessThanOrEqual(TOOL_PREVIEW_LINES + 1);
   });
 
-  it("caps a single pathological line with maxChars", () => {
+  it("renders a pathological one-line tool body as a header only", () => {
     const oneLine = "x".repeat(50_000);
     const plain = stripAnsi(renderTranscript([
       assistantToolUse([{ id: "min", name: "read_file", args: { filePath: "min.json" } }]),
       toolMessage({ id: "min", kind: "read_file", summary: "Read 50 KB", data: { content: oneLine } })
     ]));
-    expect(plain.length).toBeLessThan(3000);
-  });
-
-  it("expanded:true keeps the whole body", () => {
-    const plain = stripAnsi(renderTranscript(messages, { expanded: true, toolMaxChars: null }));
-    expect(plain).toContain("line 400");
+    expect(plain).toContain('✓ read_file(path=min.json)');
+    expect(plain).not.toContain("xxxxx");
+    expect(plain).not.toContain("more lines");
   });
 
   it("truncates user/assistant text when maxChars is given", () => {
@@ -236,7 +230,8 @@ describe("renderTranscript — whole transcript", () => {
     ]));
     expect(plain).not.toContain("ignored");
     expect(plain).toContain("You: hello");
-    expect(plain).toContain("Assistant:\nhi");
+    expect(plain).not.toContain("Assistant");
+    expect(plain).toContain("\nhi");
   });
 
   it("defaults maxMessages to the shared recap value", () => {

@@ -26,7 +26,10 @@ process.on("message", async (raw) => {
       depth: raw.depth ?? 0,
       // Forked child agents are programmatic spawns — tag origin="worker" so they
       // stay out of the /ai sidebar (mirrors the inline runAgentFromSession path).
-      origin: "worker"
+      origin: "worker",
+      // No wake supervisor: this process runs exactly one turn and exits, so a
+      // wake turn would have nowhere to land (see runAgentFromSession).
+      wake: false
     }).initialize();
     const captured = { text: "" };
     session.events.on("assistant.message.completed", (event) => {

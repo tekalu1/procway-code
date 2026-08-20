@@ -48,7 +48,13 @@ export async function attachTelemetry({ events, env = process.env, settings = {}
   };
 }
 
-function isTelemetryEnabled(env) {
+/**
+ * The ONE telemetry switch. Exported because tracing is no longer the only
+ * thing behind it — `delegation-metrics.mjs` gates on the same flag, and two
+ * independent readings of "is telemetry on?" is exactly how a product ends up
+ * emitting something a user thought they had turned off.
+ */
+export function isTelemetryEnabled(env) {
   const flag = env?.PROCWAY_TELEMETRY;
   if (typeof flag !== "string") return false;
   return ["on", "1", "true", "yes"].includes(flag.toLowerCase());

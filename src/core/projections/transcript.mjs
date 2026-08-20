@@ -10,6 +10,7 @@
  *   | { kind: "assistant-tool-calls", role: "assistant", text: string, toolCalls: Array<{ toolCallId?: string, name: string, args: object }> }
  *   | { kind: "tool",                 role: "tool",      text: string, toolCallId?: string, attachments?: Array<{ id: string, mime?: string, name?: string }> }
  *   | { kind: "compact-summary",      role: "system",    text: string, strategy: string|null, llmFallback?: true, fallbackStrategy?: string, fallbackReason?: string }
+ *   | { kind: "wake",                 role: "system",    text: string }
  *   | { kind: "system",               role: string,      text: string }
  * )} TranscriptNode
  */
@@ -29,6 +30,16 @@ export function transcriptFromMessages(messages = [], { maxMessages = DEFAULT_MA
 
 function projectMessage(message) {
   const role = message.role;
+  // event-wake (issue #143): the supervisor injects its wake as a USER message
+  // whose whole body is a <system-reminder>. Stripped for display that leaves
+  // an empty user bubble the user never sent, so it gets a node kind of its
+  // own instead: a system-role notice that "background work settled and the
+  // agent resumed on its own". `text` keeps the FULL body — the reviewer
+  // reading transcript.md wants to know what woke it — while the dashboard
+  // renders its own localized one-liner and ignores it.
+  if (role === "user" && message.wake === true) {
+    return { kind: "wake", role: "system", text: extractText(message) };
+  }
   if (role === "user") {
     const attachments = extractInboundAttachments(message);
     return {

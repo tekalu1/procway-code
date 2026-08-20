@@ -12,7 +12,8 @@ import {
   parseClientMessage,
   validateListSessionsArgs,
   validateLoadSessionArgs,
-  normalizeRunTurnAttachments
+  normalizeRunTurnAttachments,
+  normalizeWakeItems
 } from "./protocol.mjs";
 
 /**
@@ -246,6 +247,57 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
         if (attachments.length > 0) options.attachments = attachments;
         await state.session.runTurn(prompt, options);
         ws.send(JSON.stringify(makeResponse({ id, ok: true, result: { ok: true } })));
+        return;
+      }
+      case "wake": {
+        // event-wake (issue #143): the host observed a run job of THIS
+        // conversation reaching a terminal/awaiting status and pushes it in.
+        //
+        // Deliberately NOT routed through runTurn: runTurn refuses while a turn
+        // is in flight (`turn_in_progress` above) and the refusal is non-fatal,
+        // so the settle would be dropped on the floor and the caller would
+        // still believe it was delivered. A wake is always accepted — the
+        // supervisor holds it until the current turn ends, coalesces settles
+        // that arrive together, and drops duplicates via its tombstones. The
+        // ack means "queued", never "the model has read it": the wake turn is
+        // injected later, detached, after the debounce.
+        let items;
+        try {
+          items = normalizeWakeItems(args);
+        } catch (error) {
+          ws.send(JSON.stringify(makeResponse({ id, ok: false, error: { code: "invalid_args", message: error?.message ?? String(error) } })));
+          return;
+        }
+        const supervisor = state.session?.wakeSupervisor;
+        if (!supervisor || typeof supervisor.pushExternal !== "function") {
+          ws.send(JSON.stringify(makeResponse({
+            id,
+            ok: false,
+            error: { code: "wake_unavailable", message: "This session has no wake supervisor." }
+          })));
+          return;
+        }
+        let accepted = 0;
+        let deduped = 0;
+        for (const item of items) {
+          // null = the supervisor refused it (tombstoned: already collected by
+          // a tool call, or already delivered by an earlier wake).
+          if (supervisor.pushExternal(item)) accepted += 1;
+          else deduped += 1;
+        }
+        // The ONLY in-Pod evidence that a wake arrived. Without it a delivery
+        // could be confirmed solely from the dashboard side (`woken_at`) plus
+        // the turn that eventually appeared, which is exactly how the first
+        // real-environment check had to be done. One line per wake — a settle
+        // pushes once, and its retries are the interesting case anyway.
+        if (logger) {
+          const jobIds = items.map((item) => item?.jobId).filter(Boolean);
+          const which = jobIds.length === 0
+            ? ""
+            : ` ${jobIds[0]}${jobIds.length > 1 ? ` +${jobIds.length - 1} more` : ""}`;
+          logger(`bridge: wake received jobs=${items.length}${which} accepted=${accepted} deduped=${deduped}`);
+        }
+        ws.send(JSON.stringify(makeResponse({ id, ok: true, result: { queued: accepted > 0, accepted, deduped } })));
         return;
       }
       case "approve": {

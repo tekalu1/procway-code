@@ -1,14 +1,7 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`pty: /resume > lists the session, replays it as text, and never prints raw JSON 1`] = `
-"[csi:6A][CR][erase-below][accent]▌[/color] [accentStrong][bold]Resume a session[/intensity][/color]  [muted]2 sessions[/color][CR]
-  [muted]↑↓ move · PgUp/PgDn page · Enter resume · q cancel[/color][CR]
-[CR]
-  [muted]just now    1 msg   (untitled)                                        gpt-test[/color][CR]
-[accentStrong]❯[/color] [accentStrong][bold]3 days ago  5 msgs  run the unit tests                                gpt-test[/intensity][/color][CR]
-[CR]
-  [muted]page 1/1[/color][CR]
-[accent]╭─[/color][accentStrong][bold] procway-code [/intensity][/color][accent]───────────────────────────────────────────────────────────────╮[/color]
+"[csi:1A][CR][erase-below][accent]╭─[/color][accentStrong][bold] procway-code [/intensity][/color][accent]───────────────────────────────────────────────────────────────╮[/color]
 [accent]│[/color][muted] workspace  [/color]<workspace-row>
 [accent]│[/color][muted] model      [/color]openai-main:gpt-test                                              [accent]│[/color]
 [accent]│[/color][muted] approval   [/color]auto-readonly                                                     [accent]│[/color]
@@ -19,10 +12,7 @@ exports[`pty: /resume > lists the session, replays it as text, and never prints 
 [accentStrong][bold]You[/intensity][/color]: run the unit tests
 
 [success]✓[/color] [accent][bold]run_shell[/intensity][/color][muted](command="pnpm test")[/color]
-  Ran: pnpm test (exit 0)
-  1483 passed
 
-[accent][bold]Assistant[/intensity][/color]:
 All 1483 tests passed.
 "
 `;

@@ -104,10 +104,20 @@ export async function makePtyEnv({ settings = {} } = {}) {
  *   at its default size, which reports `columns === 0` — the shape that broke
  *   every panel in Phase 3b, so it is a scenario, not an accident.
  * @param {number} [options.rows]
- * @param {Array<{waitFor?: RegExp, send?: string, timeoutMs?: number}>} [options.steps]
+ * @param {Array<{waitFor?: RegExp, send?: string, timeoutMs?: number,
+ *   settleMs?: number}>} [options.steps]
  *   Wait for `waitFor` to appear, then write `send`. The process is always
- *   awaited to exit after the last step.
+ *   awaited to exit after the last step. `settleMs` waits AFTER the match —
+ *   use it only for "let the repaint that follows this line land", never as a
+ *   substitute for a `waitFor`.
+ * @param {boolean} [options.stopAfterSteps] kill the child once the steps are
+ *   done instead of waiting for it to exit on its own — for scenarios that
+ *   assert on the live screen, which leaving would replace with the goodbye.
  * @param {number} [options.timeoutMs]      hard kill for the whole run.
+ * @param {Record<string,string>} [options.env] extra environment for the child,
+ *   merged over the minimal base below. Keep it to what the scenario needs
+ *   (e.g. the API key variable a mock provider endpoint expects) — every
+ *   variable added here is one more thing the run's output can depend on.
  * @returns {Promise<{output: string, exitCode: number|null, signal: string|null,
  *   stderr: string}>} the raw pty bytes plus how the child ended. Cut the
  *   output up with `frames` / `lastFrameWith` / `framesBetween` / `blockFrom`
@@ -120,7 +130,9 @@ export async function runPty({
   cols = 80,
   rows = 24,
   steps = [],
-  timeoutMs = 20000
+  timeoutMs = 20000,
+  env = {},
+  stopAfterSteps = false
 } = {}) {
   const size = cols > 0 ? `stty cols ${cols} rows ${rows} >/dev/null 2>&1; ` : "";
   const command = `${size}exec node ${JSON.stringify(CLI_PATH)}${args.map((a) => ` ${JSON.stringify(a)}`).join("")}`;
@@ -139,7 +151,8 @@ export async function runPty({
       TMPDIR: os.tmpdir(),
       TERM: "xterm-256color",
       LANG: "C.UTF-8",
-      LC_ALL: "C.UTF-8"
+      LC_ALL: "C.UTF-8",
+      ...env
     }
   });
 
@@ -193,8 +206,14 @@ export async function runPty({
   try {
     for (const step of steps) {
       if (step.waitFor) await waitFor(step.waitFor, step.timeoutMs ?? 10000);
+      if (typeof step.settleMs === "number") await delay(step.settleMs);
       if (typeof step.send === "string") child.stdin.write(step.send);
     }
+    // A scenario about what is ON SCREEN *while the REPL is live* must not let
+    // the child shut down first: leaving (/exit, Ctrl+D) tears the dock down
+    // and prints its goodbye, so the last screen would be the exit screen, not
+    // the one under test. Cut the session where the steps end instead.
+    if (stopAfterSteps) child.kill("SIGKILL");
     const { code, signal } = await exited;
     return { output, stderr, exitCode: code, signal };
   } catch (error) {
@@ -205,6 +224,10 @@ export async function runPty({
     clearTimeout(guard);
     for (const waiter of waiters) clearTimeout(waiter.timer);
   }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
 /** The prompt is ready for input: `╰─❯ ` painted by shell.mjs `renderPrompt`. */

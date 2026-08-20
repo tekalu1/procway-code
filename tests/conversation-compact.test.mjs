@@ -174,4 +174,77 @@ describe("AgentSession compact (non-destructive)", () => {
       await rm(cwd, { recursive: true, force: true, maxRetries: 5 });
     }
   });
+
+  it("emits compact.started before compact.applied so the TUI can show a spinner", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "procway-code-"));
+    try {
+      const session = await new AgentSession({
+        settings: {
+          defaultProvider: "test",
+          defaultModel: "test-model",
+          session: { enabled: true, autoCompact: { keepLastMessages: 2, strategy: "summarize-context" } },
+          tools: {},
+          agents: {}
+        },
+        cwd,
+        messages: [
+          { role: "system", content: "system" },
+          { role: "user", content: "old request" },
+          { role: "assistant", content: "old answer" },
+          { role: "user", content: "recent request" },
+          { role: "assistant", content: "recent answer" }
+        ]
+      }).initialize();
+
+      const seq = [];
+      session.events.on("compact.started", (event) => seq.push({ type: event.type, ...event }));
+      session.events.on("compact.applied", (event) => seq.push({ type: event.type, ...event }));
+
+      const result = await session.compact();
+      expect(result.compacted).toBe(true);
+      expect(seq.map((e) => e.type)).toEqual(["compact.started", "compact.applied"]);
+      expect(seq[0]).toEqual(expect.objectContaining({
+        type: "compact.started",
+        strategy: "summarize-context",
+        keepLastMessages: 2
+      }));
+    } finally {
+      await rm(cwd, { recursive: true, force: true, maxRetries: 5 });
+    }
+  });
+
+  it("emits a compacted:false no-op so the TUI spinner always closes", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "procway-code-"));
+    try {
+      const session = await new AgentSession({
+        settings: {
+          defaultProvider: "test",
+          defaultModel: "test-model",
+          session: { enabled: true, autoCompact: { keepLastMessages: 100, strategy: "summarize-context" } },
+          tools: {},
+          agents: {}
+        },
+        cwd,
+        messages: [
+          { role: "system", content: "system" },
+          { role: "user", content: "recent request" },
+          { role: "assistant", content: "recent answer" }
+        ]
+      }).initialize();
+
+      const applied = [];
+      session.events.on("compact.applied", (event) => applied.push(event));
+
+      const result = await session.compact();
+      expect(result.compacted).toBe(false);
+      expect(applied).toHaveLength(1);
+      expect(applied[0]).toEqual(expect.objectContaining({
+        type: "compact.applied",
+        compacted: false,
+        strategy: "summarize-context"
+      }));
+    } finally {
+      await rm(cwd, { recursive: true, force: true, maxRetries: 5 });
+    }
+  });
 });

@@ -60,6 +60,15 @@ Spans go to `OTEL_EXPORTER_OTLP_ENDPOINT` (default
 packages absent, the CLI prints one line telling you what to install and
 otherwise runs normally.
 
+The same switch also turns on **delegation metrics**: with `PROCWAY_TELEMETRY`
+on, a session that delegates work (`spawn_agent`, `start_run`) writes one
+cumulative JSON line to stderr, marked `__procway_metrics__`, counting how that
+work was run — foreground vs background, how much of it overlapped, how long a
+turn sat blocked joining it, and what the automatic wake turns cost. It needs no
+extra packages, sends nothing anywhere, and contains only counts and
+milliseconds: no paths, no prompts, no task text. Off unless you turn it on. The
+field list is in `docs/host-contract.md`.
+
 ## Quickstart
 
 ```bash
@@ -175,6 +184,7 @@ A few of the most common ones:
 | `/clear` | Clear the terminal without ending the session |
 | `/config setup` | Configure a provider, endpoint, model, and API token |
 | `/usage` | Token usage + cost summary |
+| `/mcp` | List MCP servers; `/mcp add` adds one interactively (or `/mcp add <id> <transport> [options]`), `/mcp remove <id>` removes it. Changes reconnect the session live. |
 | `/compact` | Compact the active conversation |
 | `/resume` | Pick a prior session |
 | `/exit` | Quit |

@@ -27,7 +27,11 @@ import {
   planCommand,
   todosCommand,
   memoryCommand,
-  branchCommand
+  branchCommand,
+  mcpListCommand,
+  addMcpServer,
+  removeMcpServer,
+  parseMcpAddArgs
 } from "./core/index.mjs";
 import { migrateLegacyFormatIfNeeded } from "./session/migration.mjs";
 import { listSessions, loadSessionState } from "./session/store.mjs";
@@ -41,6 +45,8 @@ import { createStreamingRenderer } from "./adapters/tui/streaming-renderer.mjs";
 import { attachInterruptHandler } from "./adapters/tui/interrupt.mjs";
 import { createInputController } from "./adapters/tui/input-controller.mjs";
 import { createInputHistory } from "./adapters/tui/input-history.mjs";
+import { createTurnQueue } from "./adapters/tui/turn-queue.mjs";
+import { createWakeInjector, drainTurnQueue, WAKE_NOTICE_LINE } from "./adapters/tui/turn-executor.mjs";
 import { createShutdown } from "./adapters/tui/shutdown.mjs";
 import { applyTerminalSetup, planTerminalSetup, CTRL_J_ADVICE } from "./adapters/tui/terminal-setup.mjs";
 import { sanitizeTerminalText } from "./adapters/tui/sanitize.mjs";
@@ -49,7 +55,7 @@ import { createReplCompleter } from "./adapters/tui/path-completion.mjs";
 import { attachTodoRenderer } from "./adapters/tui/todo-render.mjs";
 import { createSlashCompleter, formatMenu, formatSlashHelp, findSkillMd, isBuiltinSlashCommand, slashCommandName } from "./adapters/tui/slash-completion.mjs";
 import { createCompletionSource } from "./adapters/tui/completion-menu.mjs";
-import { clearTerminal, renderDisabledToolNote, renderPrompt, renderStatus, renderWelcome } from "./adapters/tui/shell.mjs";
+import { clearTerminal, formatThinkingMode, renderDisabledToolNote, renderPrompt, renderStatus, renderWelcome } from "./adapters/tui/shell.mjs";
 import { resolveHyperlinks, style, supportsColor, terminalWidth } from "./adapters/tui/ansi.mjs";
 import {
   renderBranch,
@@ -59,7 +65,8 @@ import {
   renderModel,
   renderPlan,
   renderTodos,
-  renderUsage
+  renderUsage,
+  renderMcp
 } from "./adapters/tui/command-render.mjs";
 import { renderTurnError } from "./adapters/tui/error-render.mjs";
 import { renderHeading } from "./adapters/tui/panel.mjs";
@@ -352,7 +359,7 @@ async function runRepl({ cwd, settings }) {
   await runConversationLoop({ controller, history, cwd, settings, session });
 }
 
-function printWelcomeBanner({ session, cwd, settings }) {
+function printWelcomeBanner({ session, cwd, settings, output = process.stdout }) {
   const color = supportsColor(output);
   const width = terminalWidth(output);
   output.write(renderWelcome({
@@ -394,7 +401,7 @@ async function createReplSession({ cwd, settings, sessionId, messages = [], titl
   // output drift apart.
   const hyperlinks = resolveHyperlinks(settings?.ui?.hyperlinks, output);
   const streamRenderer = createStreamingRenderer({
-    writer: output,
+    writer: controller ? controller.writer : output,
     width: terminalWidth(output),
     colorize: supportsColor(output),
     hyperlinks
@@ -406,8 +413,9 @@ async function createReplSession({ cwd, settings, sessionId, messages = [], titl
   const renderer = createTimelineRenderer({
     enabled: true,
     writer: controller ? controller.writer : process.stderr,
-    isBusy: controller ? () => controller.isReading : null,
-    colorize
+    isBusy: controller ? () => controller.isOverlay : null,
+    colorize,
+    width: () => terminalWidth(output)
   });
   // Attach ORDER MATTERS, and the timeline renderer has to go first: both
   // subscribe to `assistant.message.delta`, and its handler is what erases
@@ -421,18 +429,34 @@ async function createReplSession({ cwd, settings, sessionId, messages = [], titl
     // Non-streaming providers land here. Render exactly what the streaming
     // path would have written (Markdown, no role label) so live output does
     // not depend on whether the provider streamed.
-    output.write(renderAssistantContent(event.content, {
+    // MUST go through the controller writer (not the raw `output` here): the
+    // streamRenderer writes via `controller.writer`, and any adapter that
+    // prints while the dock is armed has to use the same dock-aware sink or
+    // the editor's row bookkeeping desyncs from the terminal — which is what
+    // let a mid-turn (long bash / spawn_agent) completion dump its block over
+    // the pinned TODO panel / `╭─` header and left the tool rows lingering.
+    const sink = controller ? controller.writer : output;
+    // A tool-call round's assistant message carries no text, so this renders
+    // to "" — and a message that has nothing to show must not reach the sink
+    // at all (the dock treats an empty write as a partial line and hides the
+    // input). `assistant.message.completed` fires once per round, so this is
+    // the common case, not an edge one.
+    const rendered = renderAssistantContent(event.content, {
       width: terminalWidth(output),
       colorize: supportsColor(output),
       hyperlinks
-    }));
+    });
+    if (rendered !== "") sink.write(rendered);
   });
   // P3b-8: the CLI used to be the only surface that dropped reasoning deltas.
   const reasoningRenderer = createReasoningRenderer({
     writer: controller ? controller.writer : output,
     width: () => terminalWidth(output),
     colorize,
-    enabled: settings?.ui?.thinking !== false
+    // P3-14: reasoning is folded to a one-line summary by default so a long
+    // chain of thought does not dominate the screen; `/thinking [full|fold|off]`
+    // switches it. `settings.ui.thinking === false` hides it outright.
+    defaultMode: settings?.ui?.thinking === false ? "hidden" : "folded"
   });
   reasoningRenderer.attach(events);
   const session = await createAgentSession({
@@ -447,9 +471,19 @@ async function createReplSession({ cwd, settings, sessionId, messages = [], titl
   });
   // Every subscription this function makes is recorded so swapActiveSession()
   // can tear the whole session down on /resume and /checkout (P1-7).
+  // The todo renderer is kept on `session.todoRenderer` too so `/todos
+  // full|compact|off` can toggle its live display mode at runtime.
+  const todoRenderer = attachTodoRenderer({
+    session,
+    output: controller ? controller.writer : output,
+    colorize,
+    width: terminalWidth(output),
+    mode: settings?.ui?.todoDisplay ?? "full"
+  });
+  session.todoRenderer = todoRenderer;
   session.tuiDisposables = [
     attachApprovalPrompt({ session, input, output, controller }),
-    attachTodoRenderer({ session, output: controller ? controller.writer : output, colorize })
+    todoRenderer
   ];
   session.timelineRenderer = renderer;
   session.streamingRenderer = streamRenderer;
@@ -577,7 +611,15 @@ async function runConversationLoop({ controller, history = null, cwd, settings, 
   // EOF while a prompt is up resolves question() with null (handled below);
   // EOF while a turn is running has no pending question, so route it here.
   // shutdown() is idempotent, so the two paths cannot double-exit.
-  controller.onEof = () => { void leave({ code: 0, reason: "eof" }); };
+  // EOF while a prompt is up resolves question() with null (handled in the
+  // input pump); EOF while a turn is running reaches here. Either way the
+  // leave is DEFERRED to the executor so it can drain any queued lines first —
+  // a piped `echo "…" | procway-code` must process every line, never stop
+  // early. With the always-armed pump there is (nearly) always a pending
+  // question, so this is mostly a defensive path.
+  let eofDeferred = false;
+  let closeQueue = null;
+  controller.onEof = () => { eofDeferred = true; closeQueue?.(); };
   const onSigterm = () => { void leave({ code: 143, reason: "sigterm" }); };
   process.on("SIGTERM", onSigterm);
   // P3b-11: a resized window must reflow the Markdown the streaming renderer
@@ -596,211 +638,65 @@ async function runConversationLoop({ controller, history = null, cwd, settings, 
     try { return activeSession?.usageTracker?.summary?.() ?? null; } catch { return null; }
   };
   try {
-    while (true) {
-      let line;
+    // Persistent-input queue (turn-queue). The input pump below keeps a level-0
+    // prompt armed for the WHOLE REPL, so the user can keep typing and
+    // submitting while a turn runs. Every submitted line is pushed onto `queue`
+    // and the executor drains it one-at-a-time (FIFO): the current turn always
+    // finishes before the next queued line is started. Commands are just items
+    // too, so a `/help` typed during a long turn runs after that turn, never in
+    // the middle of its streaming.
+    //
+    // Because the prompt is always on screen, every byte this loop writes must
+    // go through the controller so it can erase/redraw the input line around it
+    // (a bare process.stdout write would desync the editor's row bookkeeping).
+    // `output` below still reports the stream's columns/isTTY (terminalWidth and
+    // supportsColor keep working) but routes writes through controller.write.
+    const output = {
+      write: (text) => controller.write(text),
+      writeTransient: (text) => controller.writeTransient(text),
+      get isTTY() { return process.stdout.isTTY === true; },
+      get columns() { return process.stdout.columns; },
+      get rows() { return process.stdout.rows; },
+      on: (...args) => process.stdout.on?.(...args),
+      removeListener: (...args) => process.stdout.removeListener?.(...args)
+    };
+    const queue = createTurnQueue();
+    // The onEof handler above defers leaving via the queue, but it must reach
+    // THIS queue instance (declared inside the try block).
+    closeQueue = () => queue.close();
+
+    // event-wake (issue #143). The supervisor's default injector calls
+    // session.runTurn() directly, which is exactly what the REPL must not do:
+    // turns here are run by ONE serial executor, and a wake starting its own
+    // turn would interleave with a queued line (two turns writing the same
+    // stream). So the wake becomes a queue item like any other — the FIFO IS
+    // the concurrency guard, and a wake pushed mid-turn runs right after the
+    // turn that was in flight. Re-bound after /resume and /checkout, because
+    // each session owns its own supervisor.
+    const wakeInjector = createWakeInjector({ queue });
+    const bindWakeInjector = (target) => {
+      target?.wakeSupervisor?.setInjector(wakeInjector);
+    };
+    bindWakeInjector(activeSession);
+
+    // Run one prompt as a fresh turn, verbatim. Split out of runTurnMessage so
+    // a wake can reuse the turn plumbing WITHOUT the @/! expansion below: a
+    // wake body is machine-written text that may legitimately contain `@` or
+    // `!` (a file path in a child agent's result), and expanding it would pop
+    // a shell-approval prompt for something the user never typed.
+    const sendToModel = async (prompt, options = {}) => {
       try {
-        line = await controller.question({
-          prompt: renderPrompt({
-            cwd,
-            provider: activeSession.settings?.defaultProvider,
-            model: resolveActiveModel(activeSession.settings),
-            planMode: activeSession.planMode?.isActive(),
-            approvalMode: activeSession.settings?.approvalMode,
-            usage: sessionUsage(),
-            // P4b-2: renderPrompt has dropped segments from the right since
-            // P3b, but this call never passed a width, so its limit was
-            // Infinity and nothing was ever dropped — the header wrapped on
-            // every narrow terminal and desynced the editor's repaint.
-            width: width(),
-            color: color(),
-            tty: output.isTTY === true
-          }),
-          // P3b-7: typing `/` (or `@`) opens the candidate list under the
-          // input immediately — no Tab, no blind guessing — and ↑↓/Tab/Enter
-          // drive it. The same source serves both, so they feel identical.
-          completions: completionSource,
-          menuWidth: width()
-        });
+        await activeSession.runTurn(prompt, options);
       } catch (error) {
-        // A disposed controller rejects its pending question with an
-        // AbortError. That is a normal way to leave the REPL, so exit quietly
-        // instead of surfacing a Node stack (P0-2).
-        if (isUiControlError(error)) break;
-        throw error;
+        if (isUiControlError(error)) return;
+        printTurnError(error, { output, width: width(), color: color() });
       }
-      // null = EOF (Ctrl+D on an empty buffer, or stdin closed).
-      if (line === null) {
-        await leave({ code: 0, reason: "eof" });
-        break;
-      }
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      if (trimmed === "/exit") {
-        await exitCommand();
-        // Without this the process used to hang after the goodbye line:
-        // undici's keep-alive pool and MCP stdio children keep the loop alive.
-        await leave({ code: 0, reason: "exit-command" });
-        break;
-      }
-      if (trimmed === "/terminal-setup") {
-        await runTerminalSetupCommand({ controller });
-        continue;
-      }
-      if (trimmed === "/help") {
-        output.write(`${renderHeading("Commands", { color: color() })}\n`);
-        output.write(`${formatSlashHelp(undefined, { width: width() })}\n`);
-        continue;
-      }
-      if (trimmed === "/clear") {
-        clearTerminal(output);
-        // A cleared screen used to take the model name and session id with it
-        // (P3b-4) — the banner is what identifies the session, so re-print it.
-        printWelcomeBanner({ session: activeSession, cwd, settings: activeSession.settings ?? settings });
-        continue;
-      }
-      if (trimmed === "/status") {
-        output.write(renderStatus({
-          cwd,
-          sessionId: activeSession.sessionId,
-          provider: activeSession.settings?.defaultProvider,
-          model: resolveActiveModel(activeSession.settings),
-          approvalMode: activeSession.settings?.approvalMode,
-          planMode: activeSession.planMode?.isActive(),
-          usage: sessionUsage(),
-          disabledTools: disabledToolNotes,
-          thinking: activeSession.reasoningRenderer?.isEnabled?.() ?? null,
-          width: width(),
-          color: color()
-        }));
-        continue;
-      }
-      if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
-        const renderer = activeSession.reasoningRenderer;
-        const arg = trimmed.split(/\s+/)[1]?.toLowerCase() ?? "";
-        if (!renderer) {
-          output.write("Reasoning output is not available for this session.\n");
-          continue;
-        }
-        const next = arg === "on" ? true : arg === "off" ? false : !renderer.isEnabled();
-        renderer.setEnabled(next);
-        output.write(`Thinking output ${next ? "shown" : "hidden"}.\n`);
-        continue;
-      }
-      if (trimmed === "/config") {
-        const result = await configCommand({ session: activeSession });
-        console.log(JSON.stringify(result.settings, null, 2));
-        continue;
-      }
-      if (trimmed === "/config setup") {
-        try {
-          await configureProviderInTui({ controller, cwd, settings, session: activeSession });
-        } catch (error) {
-          // Ctrl+C inside the hidden token prompt throws "Secret input
-          // cancelled" — a user action, not a crash. Stay in the REPL.
-          if (!isUiControlError(error)) throw error;
-          output.write("Provider setup cancelled.\n");
-        }
-        continue;
-      }
-      if (trimmed === "/model") {
-        const result = await modelCommand({ session: activeSession });
-        output.write(renderModel(result, { color: color() }));
-        continue;
-      }
-      // welcome:false — /history replays the transcript of the session the
-      // banner already describes; re-printing the card was noise (P3b-12).
-      if (trimmed === "/history") {
-        const result = await historyCommand({ session: activeSession });
-        printSessionRecap({ session: activeSession, output, cwd, settings, welcome: false });
-        void result;
-        continue;
-      }
-      if (trimmed === "/usage") {
-        const result = await usageCommand({ session: activeSession });
-        output.write(renderUsage(result, { width: width(), color: color() }));
-        continue;
-      }
-      if (trimmed.startsWith("/compact")) {
-        const result = await compactCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
-        output.write(renderCompact(result, { width: width(), color: color() }));
-        continue;
-      }
-      if (trimmed === "/resume") {
-        // The controller MUST be threaded through: the picker borrows its key
-        // stream and the new session's approval prompt asks through it, so
-        // stdin keeps exactly one owner across the swap (P2-1).
-        const resumed = await pickAndCreateSession({ cwd, settings, controller });
-        if (resumed) {
-          activeSession = swapActiveSession(activeSession, resumed);
-          printSessionRecap({ session: activeSession, output, cwd, settings });
-        }
-        continue;
-      }
-      if (trimmed.startsWith("/checkout")) {
-        const targetId = trimmed.split(/\s+/).slice(1).join(" ").trim();
-        if (!targetId) {
-          console.log("Usage: /checkout <sessionId>");
-          continue;
-        }
-        const checkedOut = await checkoutSession({ cwd, settings, sessionId: targetId, controller });
-        if (checkedOut) {
-          activeSession = swapActiveSession(activeSession, checkedOut);
-          printSessionRecap({ session: activeSession, output, cwd, settings });
-        }
-        continue;
-      }
-      if (trimmed === "/context") {
-        const result = await contextCommand({ cwd, settings });
-        output.write(renderContext(result, { width: width(), color: color(), cwd }));
-        continue;
-      }
-      if (trimmed === "/plan" || trimmed.startsWith("/plan ")) {
-        const result = await planCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
-        output.write(renderPlan(result, { width: width(), color: color() }));
-        continue;
-      }
-      if (trimmed === "/todos") {
-        const result = await todosCommand({ session: activeSession });
-        output.write(renderTodos(result, { width: width(), color: color() }));
-        continue;
-      }
-      if (trimmed === "/memory") {
-        const result = await memoryCommand({ session: activeSession });
-        output.write(renderMemory(result, { width: width(), color: color() }));
-        continue;
-      }
-      if (trimmed.startsWith("/branch")) {
-        const result = await branchCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
-        output.write(renderBranch(result, { width: width(), color: color(), cwd }));
-        continue;
-      }
-      if (trimmed.startsWith("/") && !trimmed.includes(" ")) {
-        const skillName = slashCommandName(trimmed);
-        if (skillName && !isBuiltinSlashCommand(trimmed)) {
-          const skill = await findSkillMd({ cwd, name: skillName });
-          if (skill) {
-            output.write(`Loaded SKILL.md for "${skill.name}" from ${skill.path}\n`);
-            // Inject SKILL.md content into the session's system message (R2)
-            const systemMsg = activeSession.messages[0];
-            if (systemMsg && systemMsg.role === "system" && Array.isArray(systemMsg.content)) {
-              const textBlock = systemMsg.content.find((b) => b?.kind === "text");
-              if (textBlock) {
-                textBlock.text += `\n\n## Injected Skill: ${skill.name}\n${skill.content}\n`;
-              } else {
-                systemMsg.content.push({ kind: "text", text: `## Injected Skill: ${skill.name}\n${skill.content}\n` });
-              }
-            }
-            console.log(`Skill "/${skill.name}" is now active. You can ask questions related to this skill.`);
-            continue;
-          }
-        }
-        const menu = formatMenu(trimmed, { width: width() });
-        if (menu) {
-          output.write(menu);
-          continue;
-        }
-      }
-      let prompt = trimmed;
+    };
+
+    // Run one user message as a fresh turn. The @/! expansion is done here (in
+    // the executor) because it can itself prompt for approval through the
+    // controller — never while the input pump is between reads.
+    const runTurnMessage = async (prompt) => {
       if (prompt.includes("@") || prompt.includes("!")) {
         try {
           const expanded = await expandInput({
@@ -813,11 +709,6 @@ async function runConversationLoop({ controller, history = null, cwd, settings, 
             prompt = expanded.expanded;
             // Echo what was attached so the user can see it locally — the
             // expanded blocks are otherwise only visible to the LLM.
-            //
-            // P3b-10: this used to go to stderr, so `procway-code > log`
-            // dropped the very lines that explain what the model was given.
-            // It is REPL chrome, not diagnostics — it belongs on stdout with
-            // the rest of the conversation, including the command output.
             for (const item of expanded.attached) {
               if (item.kind === "file") {
                 const note = item.error
@@ -842,13 +733,279 @@ async function runConversationLoop({ controller, history = null, cwd, settings, 
           // expansion is best-effort; fall back to raw input
         }
       }
-      try {
-        await activeSession.runTurn(prompt);
-      } catch (error) {
-        if (isUiControlError(error)) continue;
-        printTurnError(error, { width: width(), color: color() });
+      await sendToModel(prompt);
+    };
+
+    // Resolve one submitted line. Returns true if it was consumed as a
+    // /command; false if the caller should send it to the model as a message.
+    const dispatch = async (trimmed) => {
+      if (trimmed === "/terminal-setup") {
+        await runTerminalSetupCommand({ controller, output });
+        return true;
       }
-    }
+      if (trimmed === "/help") {
+        // One write for the whole panel: with the always-on prompt every write
+        // redraws around the input line, so splitting header and body into two
+        // writes fragments the panel across repaint boundaries.
+        output.write(`${renderHeading("Commands", { color: color() })}\n${formatSlashHelp(undefined, { width: width() })}\n`);
+        return true;
+      }
+      if (trimmed === "/clear") {
+        clearTerminal(output);
+        // A cleared screen used to take the model name and session id with it
+        // (P3b-4) — the banner is what identifies the session, so re-print it.
+        printWelcomeBanner({ session: activeSession, cwd, settings: activeSession.settings ?? settings, output });
+        return true;
+      }
+      if (trimmed === "/status") {
+        output.write(renderStatus({
+          cwd,
+          sessionId: activeSession.sessionId,
+          provider: activeSession.settings?.defaultProvider,
+          model: resolveActiveModel(activeSession.settings),
+          approvalMode: activeSession.settings?.approvalMode,
+          planMode: activeSession.planMode?.isActive(),
+          usage: sessionUsage(),
+          disabledTools: disabledToolNotes,
+          thinking: activeSession.reasoningRenderer?.getMode?.() ?? null,
+          width: width(),
+          color: color()
+        }));
+        return true;
+      }
+      if (trimmed === "/thinking" || trimmed.startsWith("/thinking ")) {
+        const renderer = activeSession.reasoningRenderer;
+        const arg = trimmed.split(/\s+/)[1]?.toLowerCase() ?? "";
+        if (!renderer) {
+          output.write("Reasoning output is not available for this session.\n");
+          return true;
+        }
+        // off|fold|full set a mode; a bare `/thinking` cycles hidden → folded →
+        // full. `on` / `off` stay as aliases for `full` / `hidden`.
+        let mode;
+        if (arg === "on" || arg === "full") mode = renderer.setMode("full");
+        else if (arg === "off" || arg === "hidden") mode = renderer.setMode("hidden");
+        else if (arg === "fold" || arg === "folded") mode = renderer.setMode("folded");
+        else {
+          const current = renderer.getMode();
+          mode = renderer.setMode(current === "hidden" ? "folded" : current === "folded" ? "full" : "hidden");
+        }
+        output.write(`Thinking output: ${formatThinkingMode(mode)}.\n`);
+        return true;
+      }
+      if (trimmed === "/config") {
+        const result = await configCommand({ session: activeSession });
+        output.write(`${JSON.stringify(result.settings, null, 2)}\n`);
+        return true;
+      }
+      if (trimmed === "/config setup") {
+        try {
+          await configureProviderInTui({ controller, cwd, settings, session: activeSession, output });
+        } catch (error) {
+          // Ctrl+C inside the hidden token prompt throws "Secret input
+          // cancelled" — a user action, not a crash. Stay in the REPL.
+          if (!isUiControlError(error)) throw error;
+          output.write("Provider setup cancelled.\n");
+        }
+        return true;
+      }
+      if (trimmed === "/model") {
+        const result = await modelCommand({ session: activeSession });
+        output.write(renderModel(result, { color: color() }));
+        return true;
+      }
+      // welcome:false — /history replays the transcript of the session the
+      // banner already describes; re-printing the card was noise (P3b-12).
+      if (trimmed === "/history") {
+        const result = await historyCommand({ session: activeSession });
+        printSessionRecap({ session: activeSession, output, cwd, settings, welcome: false });
+        void result;
+        return true;
+      }
+      if (trimmed === "/usage") {
+        const result = await usageCommand({ session: activeSession });
+        output.write(renderUsage(result, { width: width(), color: color() }));
+        return true;
+      }
+      if (trimmed.startsWith("/compact")) {
+        const result = await compactCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
+        output.write(renderCompact(result, { width: width(), color: color() }));
+        return true;
+      }
+      if (trimmed === "/resume") {
+        // The controller MUST be threaded through: the picker borrows its key
+        // stream and the new session's approval prompt asks through it, so
+        // stdin keeps exactly one owner across the swap (P2-1).
+        const resumed = await pickAndCreateSession({ cwd, settings, controller });
+        if (resumed) {
+          activeSession = swapActiveSession(activeSession, resumed);
+          bindWakeInjector(activeSession);
+          printSessionRecap({ session: activeSession, output, cwd, settings });
+        }
+        return true;
+      }
+      if (trimmed.startsWith("/checkout")) {
+        const targetId = trimmed.split(/\s+/).slice(1).join(" ").trim();
+        if (!targetId) {
+          output.write("Usage: /checkout <sessionId>\n");
+          return true;
+        }
+        const checkedOut = await checkoutSession({ cwd, settings, sessionId: targetId, controller });
+        if (checkedOut) {
+          activeSession = swapActiveSession(activeSession, checkedOut);
+          bindWakeInjector(activeSession);
+          printSessionRecap({ session: activeSession, output, cwd, settings });
+        }
+        return true;
+      }
+      if (trimmed === "/context") {
+        const result = await contextCommand({ cwd, settings });
+        output.write(renderContext(result, { width: width(), color: color(), cwd }));
+        return true;
+      }
+      if (trimmed === "/plan" || trimmed.startsWith("/plan ")) {
+        const result = await planCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
+        output.write(renderPlan(result, { width: width(), color: color() }));
+        return true;
+      }
+      if (trimmed === "/todos" || trimmed.startsWith("/todos ")) {
+        const arg = trimmed.split(/\s+/)[1];
+        if (arg === "full" || arg === "compact" || arg === "off") {
+          activeSession.todoRenderer?.setMode?.(arg);
+          activeSession.todoRenderer?.rerender?.();
+          output.write(`${color() ? style("muted", `Todo display set to ${arg}.`) : `Todo display set to ${arg}.`}\n`);
+        } else {
+          const result = await todosCommand({ session: activeSession });
+          output.write(renderTodos(result, { width: width(), color: color() }));
+        }
+        return true;
+      }
+      if (trimmed === "/memory") {
+        const result = await memoryCommand({ session: activeSession });
+        output.write(renderMemory(result, { width: width(), color: color() }));
+        return true;
+      }
+      if (trimmed.startsWith("/branch")) {
+        const result = await branchCommand({ session: activeSession, args: trimmed.split(/\s+/).slice(1) });
+        output.write(renderBranch(result, { width: width(), color: color(), cwd }));
+        return true;
+      }
+      if (trimmed === "/mcp" || trimmed.startsWith("/mcp ")) {
+        await handleMcpCommand({ controller, session: activeSession, cwd, args: trimmed.split(/\s+/).slice(1), output });
+        return true;
+      }
+      if (trimmed.startsWith("/") && !trimmed.includes(" ")) {
+        const skillName = slashCommandName(trimmed);
+        if (skillName && !isBuiltinSlashCommand(trimmed)) {
+          const skill = await findSkillMd({ cwd, name: skillName });
+          if (skill) {
+            output.write(`Loaded SKILL.md for "${skill.name}" from ${skill.path}\n`);
+            // Inject SKILL.md content into the session's system message (R2)
+            const systemMsg = activeSession.messages[0];
+            if (systemMsg && systemMsg.role === "system" && Array.isArray(systemMsg.content)) {
+              const textBlock = systemMsg.content.find((b) => b?.kind === "text");
+              if (textBlock) {
+                textBlock.text += `\n\n## Injected Skill: ${skill.name}\n${skill.content}\n`;
+              } else {
+                systemMsg.content.push({ kind: "text", text: `## Injected Skill: ${skill.name}\n${skill.content}\n` });
+              }
+            }
+            output.write(`Skill "/${skill.name}" is now active. You can ask questions related to this skill.\n`);
+            return true;
+          }
+        }
+        const menu = formatMenu(trimmed, { width: width() });
+        if (menu) {
+          output.write(menu);
+          return true;
+        }
+      }
+      // not a command → send to the model as a message
+      return false;
+    };
+
+    // Executor: drain the queue one-at-a-time (FIFO). It never blocks the
+    // input pump, so a message typed mid-turn is processed right after the
+    // current turn finishes.
+    const executor = (async () => {
+      await drainTurnQueue({
+        queue,
+        dispatch,
+        runMessage: runTurnMessage,
+        // A wake is not user input (see turn-executor.mjs): it skips dispatch
+        // and the @/! expansion, and is labelled on screen so the user can tell
+        // an automatic resume from something they typed.
+        runWake: async (text) => {
+          const notice = WAKE_NOTICE_LINE;
+          output.write(`${color() ? style("muted", notice) : notice}\n`);
+          await sendToModel(text, { wake: true });
+        }
+      });
+      // The pump closed the queue (EOF). Drain is complete, so now we may
+      // actually leave — this is what makes piped input process every line.
+      if (eofDeferred) await leave({ code: 0, reason: "eof" });
+    })();
+
+    // Input pump: the persistent, always-armed prompt. It only READS and
+    // pushes — all turn execution and command output happens in the executor.
+    const pump = (async () => {
+      try {
+        for (;;) {
+          let line;
+          try {
+            line = await controller.question({
+              prompt: renderPrompt({
+                cwd,
+                provider: activeSession.settings?.defaultProvider,
+                model: resolveActiveModel(activeSession.settings),
+                planMode: activeSession.planMode?.isActive(),
+                approvalMode: activeSession.settings?.approvalMode,
+                usage: sessionUsage(),
+                // P4b-2: renderPrompt has dropped segments from the right since
+                // P3b, but this call never passed a width, so its limit was
+                // Infinity and nothing was ever dropped — the header wrapped on
+                // every narrow terminal and desynced the editor's repaint.
+                width: width(),
+                color: color(),
+                tty: process.stdout.isTTY === true
+              }),
+              // P3b-7: typing `/` (or `@`) opens the candidate list under the
+              // input immediately — no Tab, no blind guessing — and ↑↓/Tab/Enter
+              // drive it. The same source serves both, so they feel identical.
+              completions: completionSource,
+              menuWidth: width()
+            });
+          } catch (error) {
+            // A disposed controller rejects its pending question with an
+            // AbortError. That is a normal way to leave the REPL, so exit quietly
+            // instead of surfacing a Node stack (P0-2).
+            if (isUiControlError(error)) break;
+            throw error;
+          }
+          // null = EOF (Ctrl+D on an empty buffer, or stdin closed). Defer the
+          // leave to the executor so it can drain queued lines first (piped
+          // input must not drop lines).
+          if (line === null) {
+            eofDeferred = true;
+            break;
+          }
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (trimmed === "/exit") {
+            await exitCommand();
+            // Without this the process used to hang after the goodbye line:
+            // undici's keep-alive pool and MCP stdio children keep the loop alive.
+            await leave({ code: 0, reason: "exit-command" });
+            break;
+          }
+          if (!queue.push(trimmed)) break; // queue already closed (we are leaving)
+        }
+      } finally {
+        queue.close();
+      }
+    })();
+
+    await Promise.all([pump, executor]);
   } catch (error) {
     // Safety net: anything that reaches here and is really a UI event (an
     // interface closed under us, a cancelled prompt) leaves the loop quietly.
@@ -889,7 +1046,7 @@ function makeReplShellApprovalRequester({ controller }) {
  * answered `y`; existing bindings are left alone and modified files are backed
  * up (see adapters/tui/terminal-setup.mjs).
  */
-async function runTerminalSetupCommand({ controller }) {
+async function runTerminalSetupCommand({ controller, output = process.stdout }) {
   const plan = await planTerminalSetup();
   if (!plan.supported) {
     output.write(`${plan.note}\n`);
@@ -938,7 +1095,102 @@ async function runTerminalSetupCommand({ controller }) {
   output.write(`${plan.note}\n`);
 }
 
-async function configureProviderInTui({ controller, cwd, settings, session }) {
+/**
+ * `/mcp` — REPL dispatch for the MCP list / add / remove / reconnect subcommands.
+ * Interactive prompting for `add` (the wizard) lives in `configureMcpInTui`;
+ * the direct non-interactive form reuses the same core command and validation.
+ */
+async function handleMcpCommand({ controller, session, cwd, args = [], output = process.stdout }) {
+  const sub = (args[0] ?? "").toLowerCase();
+  const renderNow = async () => {
+    const result = await mcpListCommand({ session });
+    output.write(renderMcp(result, { width: terminalWidth(output), color: supportsColor(output) }));
+  };
+  if (sub === "" || sub === "list") {
+    await renderNow();
+    return;
+  }
+  if (sub === "add") {
+    if (args.length === 1) {
+      try {
+        await configureMcpInTui({ controller, session, cwd });
+      } catch (error) {
+        // Ctrl+C inside a hidden prompt throws "Secret input cancelled" — a
+        // user action, not a crash. Stay in the REPL.
+        if (!isUiControlError(error)) throw error;
+        output.write("MCP add cancelled.\n");
+      }
+      return;
+    }
+    const parsed = parseMcpAddArgs(args.slice(1));
+    if (parsed.error) { output.write(`${parsed.error}\n`); return; }
+    const result = await addMcpServer({ session, cwd, scope: parsed.scope, serverId: parsed.serverId, config: parsed.config });
+    if (!result.ok) { output.write(`Not saved: ${result.errors.join("; ")}\n`); return; }
+    output.write(`Added MCP server "${parsed.serverId}" (${parsed.transport}) and reconnected.\n`);
+    await renderNow();
+    return;
+  }
+  if (sub === "remove") {
+    const id = args[1];
+    if (!id) { output.write("Usage: /mcp remove <serverId>\n"); return; }
+    const result = await removeMcpServer({ session, cwd, serverId: id });
+    if (!result.ok) { output.write(`${result.error ?? "not removed"}\n`); return; }
+    output.write(`Removed MCP server "${id}" and reconnected.\n`);
+    await renderNow();
+    return;
+  }
+  if (sub === "reconnect") {
+    await session?.reconnectMcpTools?.();
+    output.write("Reconnected MCP servers.\n");
+    await renderNow();
+    return;
+  }
+  output.write(`Unknown /mcp subcommand "${sub}". Try /mcp, /mcp add, /mcp add <id> <transport> [...], /mcp remove <id>, /mcp reconnect\n`);
+}
+
+/**
+ * `/mcp add` — interactive wizard. Reads a server id, transport and the
+ * transport-specific fields through the REPL controller, validates and
+ * persists through the core command (which also reconnects the session).
+ */
+async function configureMcpInTui({ controller, session, cwd, output = process.stdout }) {
+  const serverId = (await questionWithDefault(controller, "Server id (e.g. demo)", "demo")).trim();
+  if (!serverId) { output.write("Server id cannot be empty.\n"); return; }
+  const transport = (await questionWithDefault(controller, "Transport (stdio|http|sse)", "stdio")).trim().toLowerCase();
+  const config = { transport };
+  if (transport === "stdio") {
+    const command = (await questionWithDefault(controller, "Command", "")).trim();
+    config.command = command;
+    const argsRaw = (await questionWithDefault(controller, "Args (space separated, optional)", "")).trim();
+    if (argsRaw) config.args = argsRaw.split(/\s+/).filter(Boolean);
+  } else if (transport === "http" || transport === "sse") {
+    const baseUrl = (await questionWithDefault(controller, "Base URL", "")).trim();
+    config.baseUrl = baseUrl;
+    const headersRaw = (await questionWithDefault(controller, "Headers (k=v, comma separated, optional)", "")).trim();
+    if (headersRaw) {
+      const headers = {};
+      for (const pair of headersRaw.split(",")) {
+        const idx = pair.indexOf("=");
+        if (idx === -1) continue;
+        headers[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+      }
+      if (Object.keys(headers).length > 0) config.headers = headers;
+    }
+  } else {
+    output.write(`Transport must be one of: stdio, http, sse\n`);
+    return;
+  }
+  const result = await addMcpServer({ session, cwd, scope: "workspace", serverId, config });
+  if (!result.ok) {
+    output.write(`Not saved:\n${result.errors.map((error) => `- ${error}`).join("\n")}\n`);
+    return;
+  }
+  output.write(`Added MCP server "${serverId}" (${transport}) and reconnected. The next turn can use its tools.\n`);
+  const list = await mcpListCommand({ session });
+  output.write(renderMcp(list, { width: terminalWidth(output), color: supportsColor(output) }));
+}
+
+async function configureProviderInTui({ controller, cwd, settings, session, output: _output = process.stdout }) {
   const currentId = settings.defaultProvider ?? "openai-main";
   const current = settings.providers?.[currentId] ?? {};
   const providerId = (await questionWithDefault(controller, "Provider ID", currentId)).trim();
@@ -1006,7 +1258,7 @@ async function questionHidden(controller, prompt) {
  * reading — a turn that failed is a turn, and redirecting stdout must not
  * silently swallow the reason.
  */
-function printTurnError(error, { width = terminalWidth(output), color = supportsColor(output) } = {}) {
+function printTurnError(error, { output = process.stdout, width = terminalWidth(output), color = supportsColor(output) } = {}) {
   output.write(renderTurnError(error, { width, color }));
 }
 

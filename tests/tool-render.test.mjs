@@ -76,6 +76,81 @@ describe("tool-render adapter", () => {
     expect(summariseToolHeader({ name: "unknown_tool", args: {} })).toBe("unknown_tool");
   });
 
+  // Issue #142 — background children.
+  it("marks a background spawn_agent in the header and shows the jobId to wait on", () => {
+    const args = { task: "audit the config loader", runInBackground: true };
+    expect(summariseToolHeader({ name: "spawn_agent", args })).toContain("background");
+    const rendered = renderToolCall({
+      name: "spawn_agent",
+      args,
+      result: {
+        kind: "spawn_agent",
+        summary: "Child agent started in background: audit the config loader",
+        data: { jobId: "9f2c1b7e-aaaa-bbbb-cccc-ddddeeeeffff", status: "running", background: true, task: "audit the config loader" }
+      }
+    });
+    const plain = plainText(rendered);
+    expect(plain).toContain("spawn_agent(task=\"audit the config loader\", background)");
+    expect(plain).toContain("Child agent started in background");
+    expect(plain).toContain("jobId=9f2c1b7e-aaaa-bbbb-cccc-ddddeeeeffff");
+    expect(plain).toContain("agent_job");
+  });
+
+  it("renders an agent_job wait with the collected child text", () => {
+    const rendered = renderToolCall({
+      name: "agent_job",
+      args: { action: "wait", jobId: "9f2c1b7e-aaaa-bbbb-cccc-ddddeeeeffff" },
+      result: {
+        kind: "spawn_agent",
+        summary: "child 9f2c1b7e: completed: found 3 issues",
+        data: { tool: "agent_wait", jobId: "9f2c1b7e-aaaa-bbbb-cccc-ddddeeeeffff", status: "completed", text: "found 3 issues" }
+      }
+    });
+    const plain = plainText(rendered);
+    expect(plain).toContain("agent_job(action=wait, job=9f2c1b7e)");
+    expect(plain).toContain("child 9f2c1b7e: completed");
+    expect(plain).toContain("found 3 issues");
+  });
+
+  it("renders an agent_job list as one line per child", () => {
+    const rendered = renderToolCall({
+      name: "agent_job",
+      args: { action: "list" },
+      result: {
+        kind: "spawn_agent",
+        summary: "2 child agent job(s), 1 running",
+        data: {
+          tool: "agent_list",
+          running: 1,
+          jobs: [
+            { jobId: "aaaaaaaa-1111", status: "running", task: "audit config" },
+            { jobId: "bbbbbbbb-2222", status: "completed", task: "audit docs" }
+          ]
+        }
+      }
+    });
+    const plain = plainText(rendered);
+    expect(plain).toContain("agent_job(action=list)");
+    expect(plain).toContain("- aaaaaaaa running — audit config");
+    expect(plain).toContain("- bbbbbbbb completed — audit docs");
+  });
+
+  it("surfaces an agent_job error body (unknown / out-of-scope jobId)", () => {
+    const rendered = renderToolCall({
+      name: "agent_job",
+      args: { action: "status", jobId: "nope" },
+      ok: false,
+      result: {
+        kind: "spawn_agent",
+        summary: "Unknown child agent jobId: nope",
+        data: { tool: "agent_status", jobId: "nope", error: "jobId not found" }
+      }
+    });
+    const plain = plainText(rendered);
+    expect(plain).toContain("✗ agent_job(action=status, job=nope)");
+    expect(plain).toContain("(error) jobId not found");
+  });
+
   describe("live (result-less) case — P1-6", () => {
     it("renders a start line with the same signature as the completed line", () => {
       const args = { command: "pnpm test" };

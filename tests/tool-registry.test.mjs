@@ -13,15 +13,51 @@ describe("tool registry", () => {
       "list_files", "read_file", "search_files",
       "write_file", "apply_patch", "Edit",
       "run_shell", "shell_job",
-      "spawn_agent"
+      "spawn_agent", "agent_job"
     ]));
     expect(isMutationTool("read_file")).toBe(false);
     // shell_job is name-level read-only (status/logs/wait); the kill action
     // is gated as a mutation per-call inside the dispatch.
     expect(isMutationTool("shell_job")).toBe(false);
+    // agent_job (issue #142) follows the same rule — and it MUST stay
+    // read-only at the name level, or the scheduler would serialize waits on
+    // several background children and undo the parallelism.
+    expect(isMutationTool("agent_job")).toBe(false);
+    expect(isMutationTool("spawn_agent")).toBe(true);
     expect(isMutationTool("write_file")).toBe(true);
     expect(isMutationTool("Edit")).toBe(true);
     expect(isMutationTool("run_shell")).toBe(true);
+  });
+
+  // Issue #142: the async spawn_agent mode and its JOIN tool must be exposed
+  // exactly the way shell_job / run_shell's background mode are — same opt-in
+  // flag shape, same deferred-loading path — or the model meets a tool it was
+  // told about but whose schema never arrives.
+  it("declares spawn_agent runInBackground and the agent_job schema alongside shell_job", () => {
+    const defs = getToolDefinitions();
+    const byName = Object.fromEntries(defs.map((tool) => [tool.function.name, tool.function]));
+
+    expect(byName.spawn_agent.parameters.properties.runInBackground.type).toBe("boolean");
+    expect(byName.spawn_agent.description).toContain("agent_job");
+
+    expect(byName.agent_job.parameters.properties.action.enum).toEqual(["status", "wait", "kill", "list"]);
+    // Only `action` is required — `list` takes no jobId.
+    expect(byName.agent_job.parameters.required).toEqual(["action"]);
+    expect(byName.agent_job.parameters.properties.jobId.type).toBe("string");
+    expect(byName.agent_job.parameters.properties.waitMs.type).toBe("number");
+
+    // Deferred tier, exactly like shell_job: not in the default catalog, and
+    // appended once the session loads it.
+    const base = selectToolDefinitions(defs, { loadedTools: [], settings: {} }).map((t) => t.function.name);
+    expect(base).not.toContain("agent_job");
+    expect(base).not.toContain("shell_job");
+    const loaded = selectToolDefinitions(defs, { loadedTools: ["agent_job"], settings: {} }).map((t) => t.function.name);
+    expect(loaded).toContain("agent_job");
+    // ...and the load_tools summary advertises it, so the model can ask for it.
+    const loadTools = base.includes("load_tools")
+      ? selectToolDefinitions(defs, { loadedTools: [], settings: {} }).find((t) => t.function.name === "load_tools")
+      : null;
+    expect(loadTools.function.description).toContain("agent_job");
   });
 
   it("exposes the typed run-control tools (start_run/get_run_status/resume_run) with structured schemas, not a free-form command string", () => {
@@ -87,6 +123,112 @@ describe("tool registry", () => {
     // start_run stays registered — the AI-driven launch is still a first-class
     // path (ADR 0038 D3), attach_run does not replace it.
     expect(byName.start_run).toBeTruthy();
+  });
+
+  /**
+   * Issue #143 Phase 2 — the JOIN no longer polls, so the ONLY thing feeding the
+   * turn-idle watchdog (180s of session-event silence aborts the whole turn) is
+   * the wait's heartbeat travelling supervisor → run-control → onProgress →
+   * activity.tick. This pins the dispatcher half of that chain; the
+   * onProgress → activity.tick half is pinned in tests/turn-orchestrator.
+   */
+  it("bridges the wake supervisor's awaitSettle into attach_run, heartbeats included", async () => {
+    const prevToken = process.env.PROCWAY_PROXY_TOKEN;
+    process.env.PROCWAY_PROXY_TOKEN = "tkn";
+    try {
+      const seen = [];
+      const ticks = [];
+      const wakeSupervisor = {
+        awaitSettle: async (jobId, opts) => {
+          seen.push({ jobId, opts });
+          // Three heartbeats, as a long JOIN would emit over a minute.
+          for (let i = 1; i <= 3; i += 1) opts.onHeartbeat?.({ jobId, waitedMs: i * 20_000 });
+          return {
+            jobId, kind: "run", status: "awaiting-user-input", inputKind: "conversational",
+            hearing: "Which DB?", project: "proj-a", ticket: "TK-1", runSessionId: "sess-1"
+          };
+        },
+        collect: (target) => { seen.push({ collected: target }); return true; }
+      };
+
+      const result = await executeToolCall({
+        name: "attach_run",
+        args: { runId: "run_1" },
+        cwd: process.cwd(),
+        settings: { approvalMode: "auto-readonly", tools: { longRunningShellTimeoutMs: 1_800_000 } },
+        approvalRequester: async () => true,
+        wakeSupervisor,
+        onProgress: (p) => ticks.push(p)
+      });
+
+      // The wait was handed the run id, a deadline BELOW the scheduler's budget
+      // (longRunningShellTimeoutMs + 30s) and a sub-watchdog heartbeat cadence.
+      expect(seen[0].jobId).toBe("run_1");
+      expect(seen[0].opts.timeoutMs).toBeLessThan(1_800_000 + 30_000);
+      expect(seen[0].opts.heartbeatMs).toBeLessThan(60_000);
+
+      // Heartbeats reached the progress channel: 1 opening + 3 beats + 1 close.
+      expect(ticks).toHaveLength(5);
+      expect(ticks.every((t) => t.detail.includes("run_1"))).toBe(true);
+      expect(ticks.at(-1).detail).toBe("run run_1: awaiting-user-input");
+
+      // The yield still carries what resume_run / reply_run need.
+      expect(isToolResult(result)).toBe(true);
+      expect(result.data).toMatchObject({ project: "proj-a", ticket: "TK-1", sessionId: "sess-1", hearing: "Which DB?" });
+      // ...and the supervisor was told not to ALSO wake about this run.
+      expect(seen.at(-1).collected).toMatchObject({ jobId: "run_1", project: "proj-a", ticket: "TK-1" });
+    } finally {
+      if (prevToken === undefined) delete process.env.PROCWAY_PROXY_TOKEN;
+      else process.env.PROCWAY_PROXY_TOKEN = prevToken;
+    }
+  });
+
+  /**
+   * Issue #143 follow-up — the dispatcher must hand attach_run the OWNING
+   * conversation id, exactly as it does for start_run/resume_run/reply_run.
+   * Without it the declaration is empty and the host never learns where to push
+   * the run's settle, which is the whole regression: a run started by the
+   * ticket header's「実行」button carries no conversation of its own.
+   */
+  it("declares the calling conversation when joining a run (attach_run → POST /attach)", async () => {
+    const prevToken = process.env.PROCWAY_PROXY_TOKEN;
+    const prevUrl = process.env.PROCWAY_DASHBOARD_URL;
+    const prevFetch = globalThis.fetch;
+    process.env.PROCWAY_PROXY_TOKEN = "tkn";
+    process.env.PROCWAY_DASHBOARD_URL = "https://dash.example.test";
+    const requests = [];
+    globalThis.fetch = async (url, init = {}) => {
+      requests.push({ url: String(url), init });
+      const body = { jobId: "run_1", status: "running", project: "proj-a", ticket: "TK-1" };
+      return { ok: true, status: 200, statusText: "OK", json: async () => body, text: async () => JSON.stringify(body) };
+    };
+    try {
+      const result = await executeToolCall({
+        name: "attach_run",
+        args: { runId: "run_1" },
+        cwd: process.cwd(),
+        settings: { approvalMode: "auto-readonly" },
+        approvalRequester: async () => true,
+        // The host's AgentSession id — NOT a model-supplied argument.
+        sessionId: "conv-abc",
+        wakeSupervisor: {
+          awaitSettle: async () => ({ jobId: "run_1", kind: "run", status: "completed", project: "proj-a", ticket: "TK-1" }),
+          collect: () => true
+        }
+      });
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toBe("https://dash.example.test/api/run/jobs/run_1/attach");
+      expect(requests[0].init.method).toBe("POST");
+      expect(JSON.parse(requests[0].init.body)).toEqual({ conversationId: "conv-abc" });
+      expect(result.data).toMatchObject({ jobId: "run_1", status: "completed" });
+    } finally {
+      globalThis.fetch = prevFetch;
+      if (prevToken === undefined) delete process.env.PROCWAY_PROXY_TOKEN;
+      else process.env.PROCWAY_PROXY_TOKEN = prevToken;
+      if (prevUrl === undefined) delete process.env.PROCWAY_DASHBOARD_URL;
+      else process.env.PROCWAY_DASHBOARD_URL = prevUrl;
+    }
   });
 
   it("runs safe shell commands without approval and returns a ToolResult", async () => {

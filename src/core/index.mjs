@@ -61,6 +61,14 @@ export { planCommand } from "./commands/plan.mjs";
 export { todosCommand } from "./commands/todos.mjs";
 export { memoryCommand } from "./commands/memory.mjs";
 export { branchCommand } from "./commands/branch.mjs";
+export {
+  mcpListCommand,
+  addMcpServer,
+  removeMcpServer,
+  parseMcpAddArgs,
+  validateMcpServerConfig,
+  MCP_TRANSPORTS
+} from "./commands/mcp.mjs";
 
 export { listSessions } from "../session/store.mjs";
 

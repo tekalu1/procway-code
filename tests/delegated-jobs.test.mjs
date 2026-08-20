@@ -288,4 +288,95 @@ describe("DelegatedJobRegistry", () => {
     expect(out.status).toBe("running");
     expect(fake.calls.resume).toEqual(["answer"]);
   });
+  // --- subscribeSettled (issue #143, event-wake) ---
+
+  it("subscribeSettled reports every settle with a self-contained snapshot", () => {
+    const reg = new DelegatedJobRegistry();
+    const seen = [];
+    reg.subscribeSettled((payload) => seen.push(payload));
+    const fake = makeFakeDriver();
+    const { jobId } = reg.spawnJob({
+      kind: "agent",
+      spec: {},
+      driver: fake.driver,
+      meta: { sessionId: "s1", wake: true, task: "do it" },
+    });
+    fake.yield({ status: "completed", result: { text: "ok" } });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].jobId).toBe(jobId);
+    expect(seen[0].kind).toBe("agent");
+    expect(seen[0].status).toBe("completed");
+    expect(seen[0].result).toEqual({ text: "ok" });
+    expect(seen[0].meta).toEqual({ sessionId: "s1", wake: true, task: "do it" });
+    expect(seen[0].restored).toBe(false);
+  });
+
+  it("subscribeSettled also fires on the _fail path (driver.start throws)", () => {
+    const reg = new DelegatedJobRegistry();
+    const seen = [];
+    reg.subscribeSettled((payload) => seen.push(payload));
+    const fake = makeFakeDriver({ throwOnStart: true });
+    const { jobId } = reg.spawnJob({ kind: "agent", spec: {}, driver: fake.driver, meta: { sessionId: "s1" } });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].jobId).toBe(jobId);
+    expect(seen[0].status).toBe("failed");
+    expect(seen[0].error).toBe("driver boom");
+  });
+
+  it("subscribeSettled does NOT replay past settles to a new subscriber", () => {
+    const reg = new DelegatedJobRegistry();
+    const fake = makeFakeDriver();
+    reg.spawnJob({ kind: "fake", spec: {}, driver: fake.driver });
+    fake.yield({ status: "completed", result: 1 });
+
+    const seen = [];
+    reg.subscribeSettled((payload) => seen.push(payload));
+    expect(seen).toEqual([]);
+  });
+
+  it("subscribeSettled unsubscribe stops delivery, and a throwing handler is contained", () => {
+    const reg = new DelegatedJobRegistry();
+    const seen = [];
+    const off = reg.subscribeSettled(() => { throw new Error("subscriber boom"); });
+    reg.subscribeSettled((payload) => seen.push(payload.status));
+
+    const first = makeFakeDriver();
+    reg.spawnJob({ kind: "fake", spec: {}, driver: first.driver });
+    expect(() => first.yield({ status: "completed", result: 1 })).not.toThrow();
+    expect(seen).toEqual(["completed"]);
+
+    off();
+    const second = makeFakeDriver();
+    reg.spawnJob({ kind: "fake", spec: {}, driver: second.driver });
+    second.yield({ status: "failed", error: "nope" });
+    expect(seen).toEqual(["completed", "failed"]);
+  });
+
+  it("rehydrating a lost 'running' job does NOT emit a settle (no wake storm on resume)", () => {
+    const reg = new DelegatedJobRegistry({ setTimeoutImpl: () => ({ unref() {} }), clearTimeoutImpl: () => {} });
+    const seen = [];
+    reg.subscribeSettled((payload) => seen.push(payload));
+    const restored = reg.rehydrateJobs([
+      { jobId: "j1", kind: "agent", status: "running", meta: { sessionId: "s1", wake: true }, startedAt: 1 },
+    ]);
+    expect(restored).toBe(1);
+    expect(reg.getJob("j1").status).toBe("failed");
+    expect(seen).toEqual([]);
+  });
+
+  it("a restored job that settles later carries restored:true", () => {
+    const reg = new DelegatedJobRegistry({ setTimeoutImpl: () => ({ unref() {} }), clearTimeoutImpl: () => {} });
+    const seen = [];
+    reg.rehydrateJobs([
+      { jobId: "j2", kind: "agent", status: "awaiting-input", meta: { sessionId: "s1", wake: true }, startedAt: 1 },
+    ]);
+    reg.subscribeSettled((payload) => seen.push(payload));
+    // No cold-resume for the kind → the restored handle settles it as failed.
+    reg.resumeJob("j2", "go");
+    expect(seen).toHaveLength(1);
+    expect(seen[0].jobId).toBe("j2");
+    expect(seen[0].restored).toBe(true);
+  });
 });

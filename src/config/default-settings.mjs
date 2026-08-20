@@ -102,6 +102,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
         type: "instruction-file",
         filenames: ["CLAUDE.md"],
         walk: "up",
+        // Claude Code 相当: プロジェクト直下の ./CLAUDE.md に加え、プロジェクト
+        // の ./.claude/CLAUDE.md とユーザースコープの ~/.claude/CLAUDE.md も読む。
+        // activeInModes は claude/mixed のままなので、codex 互換では読み込まない
+        // (Codex に合わせて AGENTS.md のみ — agents-md が担当)。
+        subdirs: [".claude"],
+        userScope: true,
         compatibility: "claude",
         activeInModes: ["claude", "mixed"],
         enabled: true

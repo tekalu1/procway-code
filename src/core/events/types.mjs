@@ -19,6 +19,7 @@ import { ulid } from "./ulid.mjs";
  *   | "activity.started"
  *   | "activity.tick"
  *   | "activity.stopped"
+ *   | "compact.started"
  *   | "compact.applied"
  *   | "usage.recorded"
  *   | "attachment.produced"
@@ -33,7 +34,7 @@ import { ulid } from "./ulid.mjs";
  * @typedef {EventEnvelope & (
  *   | { type: "session.created", cwd: string, provider: string, model: string, compatibilityMode?: string }
  *   | { type: "session.resumed", from: { eventCount: number, snapshotId?: string } }
- *   | { type: "user.prompt.submitted", messageId: string, content: import("../types/message.mjs").ContentBlock[] }
+ *   | { type: "user.prompt.submitted", messageId: string, content: import("../types/message.mjs").ContentBlock[], wake?: true }
  *   | { type: "assistant.message.started",   messageId: string, round: number }
  *   | { type: "assistant.message.delta",     messageId: string, deltaText: string }
  *   | { type: "assistant.reasoning.delta",   messageId: string, deltaText: string }
@@ -63,7 +64,8 @@ import { ulid } from "./ulid.mjs";
  *       // shell_job wait heartbeats). Any event feeds the turn-idle watchdog,
  *       // so these keep a healthy multi-minute tool from aborting the turn.
  *   | { type: "activity.stopped", activityId: string, outcome: string }
- *   | { type: "compact.applied", strategy: string, removedMessageIds: string[], snapshotId?: string, summaryMessageId?: string }
+ *   | { type: "compact.started",  strategy: string, keepLastMessages?: number }
+ *   | { type: "compact.applied", strategy: string, removedMessageIds: string[], snapshotId?: string, summaryMessageId?: string, compacted?: boolean }
  *   | { type: "usage.recorded",  round: number, inputTokens: number, outputTokens: number, costUsd?: number }
  *   | { type: "attachment.produced", id: string, mime?: string, name?: string, bytes?: number, direction: "outbound", toolCallId?: string }
  *       // The session attached a workspace file to the conversation via
@@ -103,6 +105,7 @@ export const EVENT_TYPES = Object.freeze([
   "activity.started",
   "activity.tick",
   "activity.stopped",
+  "compact.started",
   "compact.applied",
   "usage.recorded",
   "attachment.produced",

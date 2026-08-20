@@ -6,6 +6,8 @@ import { EventLog, readEventLog } from "../session/event-log.mjs";
 import { writeArchivedSnapshot, readSnapshot, SnapshotThrottle } from "../session/snapshot.mjs";
 import { migrateLegacyFormatIfNeeded } from "../session/migration.mjs";
 import { createChildAgentManager } from "./child-agent.mjs";
+import { createWakeSupervisor } from "./wake-supervisor.mjs";
+import { createDelegationMetrics } from "../telemetry/delegation-metrics.mjs";
 import {
   requiresFileMutation,
   requiresTaskCompletion,
@@ -98,7 +100,13 @@ export class AgentSession {
     // resume, threaded from serve's ?hearingMode=return) because the serve /
     // run-loop plumbing still reads it to describe the session.
     hearingReturnMode = false,
-    pendingTaskCompletionReminder = false
+    pendingTaskCompletionReminder = false,
+    // event-wake (issue #143): whether this session owns a wake supervisor —
+    // the thing that re-starts the conversation when background work settles
+    // after the turn ended. false for sessions nobody could ever deliver a wake
+    // turn to (a forked child agent, a one-shot programmatic run), and for
+    // tests that want the plain turn lifecycle.
+    wake = true
   }) {
     this.settings = settings;
     this.cwd = cwd;
@@ -191,6 +199,30 @@ export class AgentSession {
     // page reload / history-load can re-render the in-progress UI (Stop button)
     // for a turn that's still going inside this session.
     this.runningTurn = false;
+    // event-wake (issue #143): the per-session supervisor that turns "a
+    // background child / run settled while nothing was listening" into a fresh
+    // turn. Created here (one per session, keyed by this session's id) and
+    // subscribed immediately — a settle can land before the first turn even
+    // ends. The default injector is a plain runTurn; surfaces that own their own
+    // input queue (the TUI) swap it with setInjector().
+    // ADR 0029 追補 A1 E7 Phase 3 — the numbers the "should background be the
+    // default?" decision needs (usage split, concurrency of uncollected
+    // background work, foreground JOIN wall clock, wake cost, same-cwd hazard).
+    // OFF unless PROCWAY_TELEMETRY is on, in which case this is a frozen no-op
+    // and every call site below optional-chains into nothing. It owns no
+    // listener and no timer, so it cannot outlive the session or change a turn.
+    this.delegationMetrics = createDelegationMetrics({ sessionId: this.sessionId });
+    this.wakeSupervisor = wake === false
+      ? null
+      : createWakeSupervisor({
+        sessionId: this.sessionId,
+        injectTurn: (text) => this.runTurn(text, { wake: true }),
+        isTurnRunning: () => this.runningTurn,
+        metrics: this.delegationMetrics,
+        onError: (error, context) => {
+          console.warn(`[wake] injection failed (${context?.phase ?? "?"}): ${error?.message ?? error}`);
+        }
+      }).start();
     // Per-turn tool policy supplied via runTurn options (currently only
     // "read-only"). When set, executeModelRound narrows the tool list it
     // offers the model and #executeUnhookedToolCall skips any mutation tool
@@ -687,6 +719,10 @@ export class AgentSession {
       this.runningTurn = false;
       this.activeToolPolicy = null;
       this.activeApprovalMode = null;
+      // Same as runTurn's finally: a parked continuation IS the turn, so the
+      // wake gate opens only when it, too, is done.
+      this.wakeSupervisor?.notifyTurnSettled();
+      this.delegationMetrics?.flush();
     }
   }
 
@@ -747,6 +783,27 @@ export class AgentSession {
       ...this.tools.filter((tool) => internalNames.has(tool.function.name)),
       ...mcpDefs
     ];
+  }
+
+  /**
+   * Disconnect and re-establish every MCP connection, then rebuild
+   * `this.tools` so the next model round ships the updated tool set.
+   *
+   * The TUI REPL has no settings hot-reload, so `/mcp add|remove` call this
+   * after persisting a change to `settings.mcpServers` (see
+   * `core/commands/mcp.mjs`). `startMcpTools` reads live `this.settings`, so
+   * the caller updates `this.settings.mcpServers` before invoking this.
+   *
+   * @returns {Promise<void>}
+   */
+  async reconnectMcpTools() {
+    if (this.mcpRegistry) {
+      try { await this.mcpRegistry.close(); }
+      catch { /* best-effort disconnect */ }
+    }
+    this.mcpRegistry = null;
+    this.mcpStarted = false;
+    await this.startMcpTools();
   }
 
   /**
@@ -925,6 +982,11 @@ export class AgentSession {
         parentSignal: signal
       }),
       todoStore: this.todoStore,
+      // event-wake (issue #143): background spawns register with it, and the
+      // tools that JOIN background work (agent_job wait/status, attach_run,
+      // resume_run, reply_run) tell it to forget what they already delivered.
+      wakeSupervisor: this.wakeSupervisor,
+      delegationMetrics: this.delegationMetrics,
       onProgress,
       // Threaded to the tools that can actually stop (run_shell kills its
       // process group; shell_job wait breaks its poll loop).
@@ -946,6 +1008,11 @@ export class AgentSession {
     approvalMode = null,
     attachments = [],
     sessionContext = null,
+    // event-wake (issue #143): this turn was injected by the wake supervisor,
+    // not typed by anyone. Marks the stored message + the emitted
+    // `user.prompt.submitted` so display surfaces can render "background work
+    // settled — resumed automatically" instead of an empty user bubble.
+    wake = false,
     // Provider seam (mirrors executeModelRound's own runProviderImpl param):
     // lets tests script model rounds without a live provider. Production
     // callers leave it undefined and the real runProvider is used.
@@ -1013,7 +1080,11 @@ export class AgentSession {
     // Title from the VISIBLE prompt only — a leading <system-reminder> preamble
     // (task-completion retry / Phase-2 sidepanel hidden context) is runtime-only
     // and must not become the human-readable session title shown in the sidebar.
-    if (!this.title) {
+    // A wake turn is never a title: its body is entirely a <system-reminder>,
+    // so `visible` is empty and the fallback would stamp the raw reminder onto
+    // the session (it can legitimately be the first turn of a session that was
+    // resumed cold for the sole purpose of collecting background work).
+    if (!this.title && !wake) {
       const visible = stripSystemReminders(prompt).trim();
       this.title = (visible || prompt).slice(0, 80);
     }
@@ -1073,6 +1144,14 @@ export class AgentSession {
         sessionId: this.sessionId,
         content: [{ kind: "text", text: effectivePrompt }, ...attachmentBlocks, ...attachmentNoteBlocks]
       });
+      // event-wake (issue #143): mark the synthetic turn the wake supervisor
+      // injects. The body is entirely a <system-reminder>, which every display
+      // surface strips — so without a mark the message renders as an EMPTY user
+      // bubble ("a message I never sent") and as a bodiless `## You` in
+      // transcript.md. The mark is a plain top-level flag on the Message, the
+      // same shape `compacted` uses on the compaction-summary message, so it
+      // rides the snapshot and the transcript projection without a new concept.
+      if (wake) userMessage.wake = true;
       this.messages.push(userMessage);
       const turnUserMessageId = userMessage.id;
       this.currentTurnMessageId = turnUserMessageId;
@@ -1094,7 +1173,11 @@ export class AgentSession {
       this.events.emit(createEvent("user.prompt.submitted", {
         sessionId: this.sessionId,
         messageId: turnUserMessageId,
-        content: userMessage.content
+        content: userMessage.content,
+        // Same mark on the LIVE path, so a connected dashboard renders the
+        // automatic-resume notice immediately instead of waiting for a reload
+        // to pick it up from the transcript projection.
+        ...(wake ? { wake: true } : {})
       }));
       await this.save();
 
@@ -1112,6 +1195,15 @@ export class AgentSession {
       this.runningTurn = false;
       this.activeToolPolicy = null;
       this.activeApprovalMode = null;
+      // event-wake: settles held while this turn ran are now free to wake the
+      // session. Deliberately not a new session event — the supervisor is a
+      // plain collaborator, so the event catalog (and its isomorphism test)
+      // stays untouched.
+      this.wakeSupervisor?.notifyTurnSettled();
+      // Same reasoning for the metrics line: cumulative, written at turn end
+      // (and only when something changed), so a killed process still leaves the
+      // truth up to its last completed turn and the event catalog is untouched.
+      this.delegationMetrics?.flush();
     }
   }
 
@@ -1394,6 +1486,14 @@ export class AgentSession {
     const strategy = options.strategy ?? config.strategy;
     const keepLastMessages = options.keepLastMessages ?? config.keepLastMessages;
     const dropToolResults = options.dropToolResults ?? config.dropToolResults ?? false;
+    // Tell the TUI a compaction run has begun so it can show a live spinner
+    // row (tools-style) instead of looking idle while the summary request is in
+    // flight. `compact.applied` closes that row whether it compacted or not.
+    this.events.emit(createEvent("compact.started", {
+      sessionId: this.sessionId,
+      strategy,
+      keepLastMessages
+    }));
     let archivedSnapshotId = null;
     if (this.eventLog && this.settings.session?.enabled !== false) {
       const archived = await writeArchivedSnapshot({
@@ -1434,7 +1534,18 @@ export class AgentSession {
         dropToolResults
       });
     }
-    if (!result.compacted) return result;
+    if (!result.compacted) {
+      // Nothing met the compaction bar — still close the "compacting" row so
+      // the TUI does not spin forever. `compacted:false` lets consumers tell
+      // a no-op apart from a real compaction.
+      this.events.emit(createEvent("compact.applied", {
+        sessionId: this.sessionId,
+        strategy,
+        removedMessageIds: [],
+        compacted: false
+      }));
+      return result;
+    }
     this.messages = mergeCompactedMessages({
       before: beforeMessages,
       result,
@@ -1588,7 +1699,12 @@ async function runAgentFromSession({ settings, prompt, cwd, depth, onEvent, sign
   // tag them origin="worker" so listSessions keeps them out of the /ai sidebar
   // (which allowlists origin user/slack). Without this they default to
   // origin=null = "user" and surface as phantom history entries.
-  const session = await new AgentSession({ settings, cwd, depth, origin: "worker" }).initialize();
+  // wake:false — a child agent session is a one-shot delegation whose only
+  // consumer is the parent awaiting its yield. There is no surface a wake turn
+  // could be delivered to, and subscribing one supervisor per spawned child
+  // would leak a listener (plus the whole child session) into the process-wide
+  // job registry.
+  const session = await new AgentSession({ settings, cwd, depth, origin: "worker", wake: false }).initialize();
   const captured = { text: "" };
   session.events.on("assistant.message.completed", (event) => {
     if (Array.isArray(event.content)) {
@@ -1757,6 +1873,7 @@ function convertLegacyToMessage(legacy, sessionId) {
   if (legacy.compactedAt) message.compactedAt = legacy.compactedAt;
   if (legacy.compactStrategy) message.compactStrategy = legacy.compactStrategy;
   if (legacy.originalMessageCount != null) message.originalMessageCount = legacy.originalMessageCount;
+  if (legacy.wake) message.wake = true;
   if (legacy.llmFallback) message.llmFallback = true;
   if (legacy.fallbackStrategy) message.fallbackStrategy = legacy.fallbackStrategy;
   if (legacy.fallbackReason) message.fallbackReason = legacy.fallbackReason;
@@ -1863,6 +1980,10 @@ function preservedExtras(message) {
   if (message.compactedAt) extras.compactedAt = message.compactedAt;
   if (message.compactStrategy) extras.compactStrategy = message.compactStrategy;
   if (message.originalMessageCount != null) extras.originalMessageCount = message.originalMessageCount;
+  // event-wake: keep the "this turn was injected, not typed" mark across a
+  // raw-shape round trip (compaction) so the transcript projection still
+  // renders it as an automatic-resume notice afterwards.
+  if (message.wake) extras.wake = true;
   if (message.llmFallback) extras.llmFallback = true;
   if (message.fallbackStrategy) extras.fallbackStrategy = message.fallbackStrategy;
   if (message.fallbackReason) extras.fallbackReason = message.fallbackReason;

@@ -63,6 +63,15 @@ function renderNode(node, { maxBlockChars }) {
   if (node.kind === "user") {
     return `## You\n\n${fenceIfMultiline(truncate(node.text, maxBlockChars))}`;
   }
+  if (node.kind === "wake") {
+    // event-wake (issue #143): NOT a `## You` — nobody typed this. Rendering it
+    // as a user turn produced a bodiless heading (the whole body is a
+    // <system-reminder>, which the projection strips from user text), which read
+    // as a message the user sent and left blank.
+    return "## Automatic resume\n\n"
+      + "_Background work settled while no turn was running — the agent resumed on its own._\n\n"
+      + fenceIfMultiline(truncate(node.text, maxBlockChars));
+  }
   if (node.kind === "assistant") {
     return `## Assistant\n\n${truncate(node.text, maxBlockChars)}`;
   }

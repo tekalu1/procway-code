@@ -28,6 +28,12 @@ export function disposeSessionRenderers(session) {
     try { disposable?.dispose?.(); } catch { /* ignore */ }
   }
   session.tuiDisposables = [];
+  // event-wake (issue #143): the wake supervisor is a subscription bound to
+  // this session too — it holds a registry listener and a debounce timer, and
+  // its injector pushes onto the REPL's turn queue. Left running after a
+  // /resume, a settle from the session the user LEFT would inject a turn into
+  // the session they moved to.
+  try { session.wakeSupervisor?.stop?.(); } catch { /* ignore */ }
 }
 
 /**

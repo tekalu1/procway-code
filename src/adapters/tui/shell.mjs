@@ -250,6 +250,18 @@ function formatSpend(usage) {
  * environment): …` line used to shout above the banner (P3b-3): the banner now
  * shows a dim one-liner and the reasons live here.
  */
+/**
+ * Human label for a reasoning display mode (P3-14). Accepts the mode strings
+ * from `ReasoningRenderer` (`hidden` / `folded` / `full`) — normalised so a
+ * plain boolean (`true` = shown, `false` = hidden) still works.
+ */
+export function formatThinkingMode(mode) {
+  const v = String(mode ?? "").toLowerCase();
+  if (v === "hidden" || v === "off" || v === "false") return "hidden";
+  if (v === "folded" || v === "fold") return "folded";
+  return "shown";
+}
+
 export function renderStatus({
   cwd,
   sessionId,
@@ -270,7 +282,7 @@ export function renderStatus({
     ["Approval", approvalMode ?? "default"],
     ["Plan mode", planMode ? "on" : "off"]
   ];
-  if (thinking != null) rows.push(["Thinking", thinking ? "shown" : "hidden"]);
+  if (thinking != null) rows.push(["Thinking", formatThinkingMode(thinking)]);
   if (usage && ((usage.inputTokens ?? 0) > 0 || (usage.outputTokens ?? 0) > 0)) {
     rows.push(["Tokens", `${formatTokens(usage.inputTokens ?? 0)} in / ${formatTokens(usage.outputTokens ?? 0)} out`]);
     rows.push(["Cost", formatUsd(usage.costUsd ?? 0)]);

@@ -3,6 +3,7 @@ import { editFile } from "./edit.mjs";
 import { runGlob } from "./glob.mjs";
 import { runGrep } from "./grep.mjs";
 import { runShell, runShellKill, runShellLogs, runShellStatus, runShellWait } from "./shell.mjs";
+import { runAgentJobStatus, runAgentJobWait, runAgentJobKill, runAgentJobList } from "./agent-job.mjs";
 import { getSharedJobRegistry } from "../jobs/delegated-jobs.mjs";
 import { createAgentDriver } from "../jobs/agent-driver.mjs";
 import { runWebFetch, runWebSearch } from "./web-search.mjs";
@@ -12,7 +13,7 @@ import { runDesktopAction, getDesktopActionAvailability } from "./desktop.mjs";
 import { viewImage } from "./view-image.mjs";
 import { saveAttachment } from "./save-attachment.mjs";
 import { attachFile } from "./attach-file.mjs";
-import { startRun, attachRun, getRunStatus, resumeRun, replyRun } from "./run-control.mjs";
+import { startRun, attachRun, getRunStatus, resumeRun, replyRun, joinTimeoutMsFor } from "./run-control.mjs";
 import { askImage } from "./ask-image.mjs";
 import { providerSupportsVision, resolveVisionProviderId } from "../providers/vision.mjs";
 import * as jiraTools from "./integrations/jira.mjs";
@@ -75,6 +76,7 @@ const DEFERRED_TOOL_SUMMARIES = Object.freeze({
   web_browser: "drive a persistent HEADED browser visible in the noVNC desktop — renders real pixels, the right tool for 'open this page in a browser' / viewing rendered web pages (navigate/click/fill/snapshot/screenshot)",
   desktop_action: "control the OS-level virtual desktop via xdotool/scrot (raw mouse/keyboard/screenshot) — NOT a browser",
   shell_job: "manage long-running background shell jobs (start/status/logs/wait/kill)",
+  agent_job: "manage background child agents started by spawn_agent with runInBackground:true (status/wait/kill/list) — action:\"wait\" blocks for a child's result when you want it right now (otherwise it reaches you automatically in a later turn)",
   jira_list_projects: "list Jira projects",
   jira_search_issues: "search Jira issues with JQL",
   jira_get_issue: "get a Jira issue",
@@ -291,12 +293,13 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
       type: "function",
       function: {
         name: "spawn_agent",
-        description: "Run a bounded child coding agent task. The child can inspect the workspace and returns its final text result.",
+        description: "Run a bounded child coding agent task. The child can inspect the workspace and returns its final text result. By DEFAULT this call waits for the child to finish and hands you its result. Set runInBackground:true ONLY when you want several children working at the same time — it returns a jobId immediately. You do NOT have to collect a background child: when it finishes you are woken automatically in a new turn with its result, so it is fine to keep working or to give your final answer meanwhile. Use `agent_job` action:\"wait\" (one call per jobId) only when you want to BLOCK here and have the result right now.",
         parameters: {
           type: "object",
           properties: {
             task: { type: "string", description: "Concrete task for the child agent." },
-            cwd: { type: "string", description: "Optional workspace-relative cwd for the child agent." }
+            cwd: { type: "string", description: "Optional workspace-relative cwd for the child agent." },
+            runInBackground: { type: "boolean", description: "Detach and return a jobId immediately instead of waiting. ONLY for running several children in parallel. The result reaches you automatically in a later turn; agent_job action:\"wait\" is only for blocking on it now." }
           },
           required: ["task"]
         }
@@ -448,6 +451,23 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
             graceMs: { type: "number", description: "kill only: wait this long for graceful exit before SIGKILL." }
           },
           required: ["action", "shellId"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "agent_job",
+        description: "Manage a background child agent started by spawn_agent with runInBackground:true. A background child's result also reaches you on its own — you are woken in a new turn when it finishes — so none of these actions is mandatory. action=wait: BLOCK until the child finishes and return its result, for when you want it RIGHT NOW (preferred over polling status in a loop: one call instead of many). action=status: inspect the child's state and recent activity without blocking. action=kill: stop the child. action=list: list this conversation's child agent jobs. You can only reach children YOU started.",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["status", "wait", "kill", "list"], description: "Operation to perform on the child agent job." },
+            jobId: { type: "string", description: "jobId returned by spawn_agent with runInBackground:true. Required for status/wait/kill; ignored by list." },
+            waitMs: { type: "number", description: "wait only: max wait in milliseconds (default 600000). Returns with timedOut:true if the child is still running." },
+            tail: { type: "number", description: "status/wait only: return only the last N activity events (default 20)." }
+          },
+          required: ["action"]
         }
       }
     },
@@ -965,13 +985,14 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
       type: "function",
       function: {
         name: "start_run",
-        description: "Start a ticket's run loop (the project's process flow) and AWAIT it like a sub-agent. This is the ONLY correct way to run a ticket from this chat — do NOT shell out to the procway CLI (e.g. `node \"$PROCWAY_CLI\" run loop`) via run_shell; that lets you impersonate the worker. This call RETURNS only when the run pauses for input or finishes (it may run for minutes — live progress streams into the side panel meanwhile). Inspect the returned `status`: if `awaiting-user-input` with a `hearing` (inputKind 'conversational'), relay the `hearing` text to the user, get their answer, and call reply_run with that answer + the returned `sessionId`; if it returns a structured `interaction` (inputKind 'structured'), tell the user to answer the widget, then call resume_run; otherwise it finished — report the result.",
+        description: "Start a ticket's run loop (the project's process flow) and AWAIT it like a sub-agent. This is the ONLY correct way to run a ticket from this chat — do NOT shell out to the procway CLI (e.g. `node \"$PROCWAY_CLI\" run loop`) via run_shell; that lets you impersonate the worker. By DEFAULT this call RETURNS only when the run pauses for input or finishes (it may run for minutes — live progress streams into the side panel meanwhile). Inspect the returned `status`: if `awaiting-user-input` with a `hearing` (inputKind 'conversational'), relay the `hearing` text to the user, get their answer, and call reply_run with that answer + the returned `sessionId`; if it returns a structured `interaction` (inputKind 'structured'), tell the user to answer the widget, then call resume_run; otherwise it finished — report the result. Set runInBackground:true ONLY when you want several tickets running at the same time — it returns a runId immediately. You do NOT have to join a background run: when it settles you are woken automatically in a new turn with its outcome, so it is fine to keep working or to give your final answer meanwhile. Use `attach_run` (one call per runId) only when you want to BLOCK here and follow that run right now.",
         parameters: {
           type: "object",
           properties: {
             project: { type: "string", description: "Project name the ticket belongs to." },
             ticket: { type: "string", description: "Ticket id to run." },
-            autoApprove: { type: "boolean", description: "Run without pausing for step approvals (optional)." }
+            autoApprove: { type: "boolean", description: "Run without pausing for step approvals (optional)." },
+            runInBackground: { type: "boolean", description: "Detach and return a runId immediately instead of waiting. ONLY for running several tickets in parallel. The run's outcome reaches you automatically in a later turn; attach_run is only for blocking on it now." }
           },
           required: ["project", "ticket"]
         }
@@ -981,7 +1002,7 @@ export function getToolDefinitions({ settings, availability = resolveDisplayTool
       type: "function",
       function: {
         name: "attach_run",
-        description: "ACCOMPANY a run that is ALREADY started — use this, not start_run, when you are told a run id (e.g. the user pressed the ticket's Run button and the run was started for you). It starts nothing: it AWAITS the existing run exactly like start_run does and RETURNS only when the run pauses for input or finishes (it may run for minutes — live progress streams into the panel meanwhile). Handle the returned `status` the same way as start_run: if `awaiting-user-input` with a `hearing` (inputKind 'conversational'), relay the `hearing` text to the user, get their answer, and call reply_run with that answer + the returned `sessionId`; if it returns a structured `interaction` (inputKind 'structured'), tell the user to answer the widget, then call resume_run; if `awaiting-approval` (inputKind 'approval'), the run is PAUSED awaiting approval of the completed task — say which task needs approval and point the user at the notification bell / the ticket's review tab, never report it as done; only `completed` means finished. The yield also carries the run's `project` / `ticket`, which resume_run and reply_run need. Do NOT shell out to the procway CLI to watch a run.",
+        description: "ACCOMPANY a run that is ALREADY started — use this, not start_run, when you are told a run id (e.g. the user pressed the ticket's Run button and the run was started for you). This is ALSO how you join a run you yourself started with start_run(runInBackground:true), when you want to follow it RIGHT NOW rather than wait to be woken when it settles: pass the runId it returned. It starts nothing: it AWAITS the existing run exactly like start_run does and RETURNS only when the run pauses for input or finishes (it may run for minutes — live progress streams into the panel meanwhile). Handle the returned `status` the same way as start_run: if `awaiting-user-input` with a `hearing` (inputKind 'conversational'), relay the `hearing` text to the user, get their answer, and call reply_run with that answer + the returned `sessionId`; if it returns a structured `interaction` (inputKind 'structured'), tell the user to answer the widget, then call resume_run; if `awaiting-approval` (inputKind 'approval'), the run is PAUSED awaiting approval of the completed task — say which task needs approval and point the user at the notification bell / the ticket's review tab, never report it as done; only `completed` means finished. The yield also carries the run's `project` / `ticket`, which resume_run and reply_run need. Do NOT shell out to the procway CLI to watch a run.",
         parameters: {
           type: "object",
           properties: {
@@ -1091,19 +1112,35 @@ const READ_ONLY_TOOLS = new Set([
   // a mutation per-call inside the dispatch (the name-level classification
   // only drives scheduling + read-only tool filtering, where exposing
   // shell_job is safe — a read-only session can't start a shell to kill).
-  "shell_job", "TodoWrite", "ReadMemory",
+  "shell_job",
+  // agent_job: same shape as shell_job — status/wait/list are reads; the kill
+  // action is gated as a mutation per-call inside the dispatch (the name-level
+  // classification only drives scheduling + read-only tool filtering, and
+  // exposing agent_job there is safe: a read-only turn can't spawn a child to
+  // kill). Keeping it read-only ALSO matters for scheduling — mutation tools
+  // run serially, which would defeat waiting on several children at once.
+  "agent_job",
+  "TodoWrite", "ReadMemory",
   // request_user_action asks the user for input — benign, so it stays available
   // even in read-only turns and is not classified as a mutation.
   "request_user_action",
-  // get_run_status is a read-only poll of a run-loop job (start_run / resume_run
-  // have side effects and stay mutations).
+  // get_run_status is a read-only one-shot read of a run-loop job (start_run /
+  // resume_run have side effects and stay mutations).
   "get_run_status",
-  // attach_run (ADR 0038 D2) is the SAME poll, just held open until the run
-  // yields: it starts/changes nothing server-side, so gating it as a mutation
-  // would ask the user to approve watching a run they just launched themselves
-  // from the ticket header. Blocking the turn for minutes is a SCHEDULING
-  // concern, handled by the long-running tool budget (turn-orchestrator), not by
-  // the approval gate.
+  // attach_run (ADR 0038 D2) is the same read, held open until the run yields:
+  // it starts/changes nothing about the RUN, so gating it as a mutation would
+  // ask the user to approve watching a run they just launched themselves from
+  // the ticket header. (Its attach declaration — issue #143 — records who is
+  // accompanying the run so the host knows where to push the settle; it is
+  // notification bookkeeping about THIS conversation, not an execution change.) Blocking the turn for minutes is a SCHEDULING concern,
+  // handled by the long-running tool budget (turn-orchestrator), not by the
+  // approval gate.
+  //
+  // Read-only ALSO matters for scheduling, and now more than ever: mutation
+  // tools run SERIALLY (agent/scheduler.mjs), so classifying attach_run as one
+  // would make two JOINs of two different runs wait for each other. Since Phase
+  // 2 (issue #143) the wait is a plain event wait, so N JOINs really do resolve
+  // in parallel — provided this stays read-only.
   "attach_run",
   "WebSearch", "WebFetch",
   "jira_list_projects", "jira_search_issues", "jira_get_issue", "jira_list_transitions",
@@ -1228,6 +1265,17 @@ export async function executeToolCall({
   // Delegated-job registry the spawn_agent path routes through (ADR 0029 P3).
   // Injectable for tests; defaults to the process-wide shared registry.
   jobRegistry,
+  // event-wake (issue #143): the calling session's wake supervisor, when it has
+  // one. Background spawns register with it so a settle after the turn ends can
+  // wake the conversation; the tools that JOIN background work tell it to
+  // forget what they already delivered. Null for direct / headless callers —
+  // every call below is optional-chained.
+  wakeSupervisor = null,
+  // ADR 0029 E7 Phase 3: the delegation metrics collector for the calling
+  // session (telemetry/delegation-metrics.mjs). A frozen no-op unless
+  // PROCWAY_TELEMETRY is on, and null for direct / headless callers — every
+  // call below is optional-chained, so behaviour is identical either way.
+  delegationMetrics = null,
   todoStore = null,
   webSearchRunner = runWebSearch,
   webFetchRunner = runWebFetch,
@@ -1248,6 +1296,28 @@ export async function executeToolCall({
   // headless callers.
   sessionId = null
 }) {
+  /**
+   * ADR 0029 addendum A1 Phase 2 (issue #143): the run tools no longer poll —
+   * they WAIT for the settle the host pushes into this session's wake
+   * supervisor. run-control is a pure module that knows nothing about sessions,
+   * so the wait is handed to it as a function (the same seam `sleepImpl` used to
+   * occupy). Null supervisor (direct / headless callers) → run-control falls
+   * back to its single confirming `get_run_status` read.
+   */
+  const awaitRunSettle = typeof wakeSupervisor?.awaitSettle === "function"
+    ? (jobId, opts) => wakeSupervisor.awaitSettle(jobId, opts)
+    : null;
+  /**
+   * The JOIN's own deadline. Derived from the SAME setting turn-orchestrator's
+   * toolCallBudgetMs uses for these tools (longRunningShellTimeoutMs + 30s) and
+   * deliberately one margin BELOW it, so a JOIN that outlives its budget returns
+   * its own honest "still running" yield instead of being killed by the
+   * scheduler with no answer at all.
+   */
+  const runJoinTimeoutMs = joinTimeoutMsFor(settings?.tools?.longRunningShellTimeoutMs);
+  /** Everything the four awaiting run tools share. */
+  const runJoinOptions = { awaitSettle: awaitRunSettle, joinTimeoutMs: runJoinTimeoutMs, onProgress, signal };
+
   async function gate({ kind, summary, mutation, payload }) {
     return approvalRequester({
       kind,
@@ -1257,6 +1327,19 @@ export async function executeToolCall({
       permissions: settings?.permissions,
       payload
     });
+  }
+
+  /**
+   * event-wake (issue #143): an `agent_job` status/wait that came back TERMINAL
+   * has delivered the child's outcome into the transcript, so the supervisor
+   * must forget it — otherwise the settle it is already holding would wake the
+   * session to report the very thing the model just read. A still-running job
+   * is left alone: nothing was delivered yet.
+   */
+  function collectSettledChild(toolResult) {
+    const data = toolResult?.data;
+    if (data?.status !== "completed" && data?.status !== "failed") return;
+    wakeSupervisor?.collect({ jobId: data.jobId ?? args?.jobId, status: data.status });
   }
 
   // Enforce the tool's declared required args before dispatch (see
@@ -1307,25 +1390,72 @@ export async function executeToolCall({
     if (!allowed) {
       result = makeSkippedResult("start_run", `Skipped start_run: ${summary}`, { project: args.project, ticket: args.ticket });
     } else {
-      // ADR 0029 await-yield: startRun polls internally until the run pauses or
-      // finishes (minutes). onProgress feeds the turn-idle watchdog meanwhile.
+      // ADR 0029 await-yield: startRun waits internally until the run pauses or
+      // finishes (minutes). runJoinOptions carries the event wait and the
+      // heartbeat that feeds the turn-idle watchdog meanwhile.
       // ADR 0038 D1: the owning conversation id rides along so the dashboard can
       // ATTACH the run to this conversation. Taken from the DISPATCH context
       // (the host's AgentSession id) — never from `args`, which the model
       // controls and could point at somebody else's conversation.
-      const r = await startRun({ project: args.project, ticket: args.ticket, autoApprove: args.autoApprove, conversationId: sessionId, onProgress });
-      result = { kind: "start_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
+      const background = args.runInBackground === true;
+      const startedAt = Date.now();
+      const r = await startRun({
+        project: args.project,
+        ticket: args.ticket,
+        autoApprove: args.autoApprove,
+        conversationId: sessionId,
+        runInBackground: background,
+        // Nothing is awaited in background mode, so there is no settle to wait
+        // for and nothing to heartbeat through.
+        ...(background ? {} : runJoinOptions)
+      });
+      delegationMetrics?.delegationStarted({ surface: "start_run", background, jobId: r?.jobId });
+      // Foreground start_run BLOCKS the turn until the run pauses or finishes.
+      // That wall clock is the ceiling of what a background default could win
+      // back here, so it is measured separately from the explicit joins.
+      if (!background) delegationMetrics?.joinBlocked({ surface: "start_run_foreground", ms: Date.now() - startedAt });
+      if (background && r?.jobId) {
+        // Issue #143: tell the wake supervisor a run is outstanding. It
+        // cannot learn this from the job registry — the run lives on the
+        // dashboard — so the host feeds its settle back in with pushExternal.
+        // project/ticket ride along because they are the only identity a
+        // resume_run / reply_run continuation shares with this jobId.
+        wakeSupervisor?.trackRun({ jobId: r.jobId, project: args.project, ticket: args.ticket });
+      }
+      result = background
+        ? {
+          kind: "start_run",
+          summary: `Run ${r.jobId ?? "?"} started in background (${summary})`,
+          data: {
+            ...r,
+            note: `This run is running in the BACKGROUND. When it settles you are woken automatically in a new turn with its outcome, so leaving it unjoined is NOT a failure — carry on with other work, or give your final answer. Call \`attach_run\` (runId="${r.jobId ?? ""}") only if you want to block here and follow this run right now.`
+          }
+        }
+        : { kind: "start_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
     }
   } else if (name === "attach_run") {
     // ADR 0038 D2: accompany an ALREADY-started run (the ticket header's「実行」
     // button now starts it deterministically and tells us the id). Shares
-    // start_run's await-yield verbatim (run-control awaitJobYield) but performs
-    // NO POST → not a mutation (see READ_ONLY_TOOLS for why).
+    // start_run's await-yield verbatim (run-control awaitJobYield). Its only
+    // POST is the attach DECLARATION (issue #143) — it records who is
+    // accompanying the run and starts nothing, so this stays a READ (see
+    // READ_ONLY_TOOLS for why).
     const allowed = await gate({ kind: "attach_run", summary: args.runId ?? "", mutation: false });
     if (!allowed) {
       result = makeSkippedResult("attach_run", `Skipped attach_run: ${args.runId}`, { runId: args.runId });
     } else {
-      const r = await attachRun({ runId: args.runId, onProgress });
+      // conversationId: ADR 0038 D1 attach, host-supplied (see start_run).
+      // A JOIN on a run started by the ticket header's「実行」button reaches a
+      // run with NO conversation on it — declaring it here is what makes the
+      // host push that run's settle to us instead of dropping it (issue #143).
+      const attachStartedAt = Date.now();
+      const r = await attachRun({ runId: args.runId, conversationId: sessionId, ...runJoinOptions });
+      // An explicit JOIN of work that is already background — measured, but
+      // deliberately NOT counted as recoverable wall clock (see the ADR).
+      delegationMetrics?.joinBlocked({ surface: "attach_run", ms: Date.now() - attachStartedAt });
+      // Issue #143: the model has the yield in hand — a wake about this run
+      // would deliver the same thing twice.
+      wakeSupervisor?.collect({ jobId: r.jobId ?? args.runId, project: r.project, ticket: r.ticket, status: r.status });
       result = { kind: "attach_run", summary: `Run ${r.jobId ?? args.runId} ${r.status ?? "?"}`, data: r };
     }
   } else if (name === "get_run_status") {
@@ -1346,9 +1476,13 @@ export async function executeToolCall({
     if (!allowed) {
       result = makeSkippedResult("resume_run", `Skipped resume_run: ${summary}`, { project: args.project, ticket: args.ticket });
     } else {
-      // ADR 0029 await-yield: resumeRun polls internally until the next pause/finish.
+      // ADR 0029 await-yield: resumeRun waits internally until the next pause/finish.
       // conversationId: ADR 0038 D1 attach, host-supplied (see start_run).
-      const r = await resumeRun({ project: args.project, ticket: args.ticket, conversationId: sessionId, onProgress });
+      const r = await resumeRun({ project: args.project, ticket: args.ticket, conversationId: sessionId, ...runJoinOptions });
+      // Issue #143: driving the run IS joining it. Cleared by TICKET, not by
+      // jobId — the continued run carries a fresh jobId, so the tracked id
+      // can't match.
+      wakeSupervisor?.collect({ jobId: r.jobId, project: args.project, ticket: args.ticket, status: r.status });
       result = { kind: "resume_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
     }
   } else if (name === "reply_run") {
@@ -1362,7 +1496,10 @@ export async function executeToolCall({
     } else {
       // args.sessionId = the paused WORKER session; conversationId = THIS
       // conversation (ADR 0038 D1 attach, host-supplied — see start_run).
-      const r = await replyRun({ project: args.project, ticket: args.ticket, sessionId: args.sessionId, answer: args.answer, conversationId: sessionId, onProgress });
+      const r = await replyRun({ project: args.project, ticket: args.ticket, sessionId: args.sessionId, answer: args.answer, conversationId: sessionId, ...runJoinOptions });
+      // Issue #143: same as resume_run — answering a hearing is a join, and the
+      // continued run carries a new jobId, so clear by ticket.
+      wakeSupervisor?.collect({ jobId: r.jobId, project: args.project, ticket: args.ticket, status: r.status });
       result = { kind: "reply_run", summary: `Run ${r.jobId ?? "?"} ${r.status ?? "?"} (${summary})`, data: r };
     }
   } else if (name === "ask_image") {
@@ -1481,6 +1618,47 @@ export async function executeToolCall({
         kind: "run_shell",
         summary: `shell_job: unknown action "${action}"`,
         data: { tool: "shell_job", error: `action must be one of status|logs|wait|kill, got "${action}"` }
+      };
+    }
+  } else if (name === "agent_job") {
+    // Issue #142: the management tool for BACKGROUND children (spawn_agent with
+    // runInBackground:true). Same four-action shape as shell_job, and the same
+    // gating discipline: status/wait/list are reads, kill is a per-call
+    // mutation. `sessionId` scopes every action to the calling conversation's
+    // own children (see agent-job.mjs).
+    const action = typeof args.action === "string" ? args.action : "";
+    if (action === "status") {
+      const allowed = await gate({ kind: "agent_status", summary: args.jobId ?? "", mutation: false });
+      result = allowed
+        ? await runAgentJobStatus({ jobId: args.jobId, tail: args.tail, jobRegistry, sessionId })
+        : makeSkippedResult("spawn_agent", `Skipped status: ${args.jobId}`, { tool: "agent_status", jobId: args.jobId });
+      collectSettledChild(result);
+    } else if (action === "wait") {
+      const allowed = await gate({ kind: "agent_wait", summary: args.jobId ?? "", mutation: false });
+      result = allowed
+        ? await runAgentJobWait({ jobId: args.jobId, waitMs: args.waitMs, tail: args.tail, onProgress, signal, jobRegistry, sessionId })
+        : makeSkippedResult("spawn_agent", `Skipped wait: ${args.jobId}`, { tool: "agent_wait", jobId: args.jobId });
+      // The tool already measured its own block; reuse it rather than timing
+      // the approval gate as if it were wait time.
+      if (Number.isFinite(result?.data?.waitedMs)) {
+        delegationMetrics?.joinBlocked({ surface: "agent_job_wait", ms: result.data.waitedMs });
+      }
+      collectSettledChild(result);
+    } else if (action === "kill") {
+      const allowed = await gate({ kind: "agent_kill", summary: args.jobId ?? "", mutation: true });
+      result = allowed
+        ? await runAgentJobKill({ jobId: args.jobId, jobRegistry, sessionId })
+        : makeSkippedResult("spawn_agent", `Skipped kill: ${args.jobId}`, { tool: "agent_kill", jobId: args.jobId });
+    } else if (action === "list") {
+      const allowed = await gate({ kind: "agent_list", summary: "child agent jobs", mutation: false });
+      result = allowed
+        ? await runAgentJobList({ jobRegistry, sessionId })
+        : makeSkippedResult("spawn_agent", "Skipped list", { tool: "agent_list" });
+    } else {
+      result = {
+        kind: "spawn_agent",
+        summary: `agent_job: unknown action "${action}"`,
+        data: { tool: "agent_job", error: `action must be one of status|wait|kill|list, got "${action}"` }
       };
     }
   } else if (name === "TodoWrite") {
@@ -1615,43 +1793,95 @@ export async function executeToolCall({
       // driver wraps it as the manager so concurrency/depth stay in child-agent.
       const registry = jobRegistry ?? getSharedJobRegistry();
       const driver = createAgentDriver({ childAgentManager: { run: (a) => childAgentRunner(a) } });
+      const background = args.runInBackground === true;
+      const task = typeof args.task === "string" ? args.task : "";
       const { jobId } = registry.spawnJob({
         kind: "agent",
         driver,
         spec: { task: args.task, childCwd: args.cwd ?? "." },
-        ...(sessionId ? { meta: { sessionId } } : {})
+        // event-wake (issue #143): `wake: true` marks a job whose settle may
+        // arrive with NOBODY listening, which is exactly what the wake
+        // supervisor reacts to. A FOREGROUND spawn awaits its own yield below,
+        // so it is deliberately unmarked — waking for it would deliver the same
+        // child result a second time. `task` rides along because the settle
+        // payload carries meta but not the spec, and a wake naming only an
+        // opaque jobId is useless to the model.
+        ...(sessionId
+          ? { meta: { sessionId, ...(background ? { wake: true, task: truncateSummary(task, 200) } : {}) } }
+          : {})
       });
-      // Forward the job's progress events as turn heartbeats so the parent turn's
-      // idle watchdog stays fed while a long child runs (mirrors how run_shell /
-      // run-control thread onProgress).
-      const unsubscribe = registry.subscribeJob(jobId, (env) => {
-        if (env?.type !== "event" || typeof onProgress !== "function") return;
-        const e = env.data ?? {};
-        const detail = e.type === "agent.progress"
-          ? `child agent running (${e.runningSec ?? 0}s)`
-          : e.type === "agent.started"
-            ? `child agent started${e.task ? `: ${e.task}` : ""}`
-            : `child agent: ${e.type ?? "activity"}`;
-        try { onProgress({ detail }); } catch { /* best-effort */ }
+      // ADR 0029 E7 Phase 3: the usage split, the concurrency of uncollected
+      // background work, and the same-cwd hazard all start here. `cwd` is passed
+      // so two children can be COMPARED for a shared directory; the collector
+      // uses it as a Map key and never emits it.
+      delegationMetrics?.delegationStarted({
+        surface: "spawn_agent",
+        background,
+        jobId,
+        cwd: args.cwd ?? ".",
+        baseCwd: cwd
       });
-      let yld;
-      try {
-        yld = await registry.awaitJobYield(jobId);
-      } finally {
-        unsubscribe();
+      if (background) {
+        // Issue #142: return the jobId WITHOUT awaiting the first yield, so the
+        // caller can start several children that actually run concurrently (the
+        // global semaphore in child-agent.mjs already queues past its ceiling).
+        // Deliberately NO subscribeJob here: nothing would ever unsubscribe (the
+        // dispatch returns immediately), so a progress tap would be a listener
+        // leak on a process-wide registry. Liveness for a background child is
+        // carried by `agent_job` action:"wait", which heartbeats while it blocks.
+        result = {
+          kind: "spawn_agent",
+          summary: `Child agent started in background: ${truncateSummary(task, 60)}`,
+          data: {
+            jobId,
+            status: "running",
+            background: true,
+            task,
+            cwd: args.cwd ?? ".",
+            note: `This child is running in the BACKGROUND. When it finishes you are woken automatically in a new turn with its result, so leaving it uncollected is NOT a failure — carry on with other work, or give your final answer. Call \`agent_job\` action:"wait" (jobId="${jobId}") only if you want to block here and have the result right now.`
+          }
+        };
+      } else {
+        // Forward the job's progress events as turn heartbeats so the parent turn's
+        // idle watchdog stays fed while a long child runs (mirrors how run_shell /
+        // run-control thread onProgress).
+        const unsubscribe = registry.subscribeJob(jobId, (env) => {
+          if (env?.type !== "event" || typeof onProgress !== "function") return;
+          const e = env.data ?? {};
+          const detail = e.type === "agent.progress"
+            ? `child agent running (${e.runningSec ?? 0}s)`
+            : e.type === "agent.started"
+              ? `child agent started${e.task ? `: ${e.task}` : ""}`
+              : `child agent: ${e.type ?? "activity"}`;
+          try { onProgress({ detail }); } catch { /* best-effort */ }
+        });
+        let yld;
+        const childStartedAt = Date.now();
+        try {
+          yld = await registry.awaitJobYield(jobId);
+        } finally {
+          unsubscribe();
+          // The turn sat here the whole time — this is the wall clock a
+          // background default could give back, and the child has stopped
+          // writing the workspace either way. Optional-CALL as well as
+          // optional-chain: a throw from here would land in a `finally` and
+          // swallow the child's actual yield.
+          delegationMetrics?.joinBlocked?.({ surface: "spawn_agent_foreground", ms: Date.now() - childStartedAt });
+          delegationMetrics?.childSettled?.(jobId);
+        }
+        if (yld?.status === "failed") {
+          // Preserve the prior contract: a child failure propagated as a throw
+          // (surfacing as turn.failed), NOT a normal tool result.
+          throw new Error(yld.error || "Child agent failed");
+        }
+        const childResult = yld?.result ?? {};
+        const text = childResult.text ?? "";
+        result = {
+          kind: "spawn_agent",
+          summary: text ? truncateSummary(text) : `Child agent exited (${childResult.exitCode ?? 0})`,
+          data: { ...childResult, text }
+        };
       }
-      if (yld?.status === "failed") {
-        // Preserve the prior contract: a child failure propagated as a throw
-        // (surfacing as turn.failed), NOT a normal tool result.
-        throw new Error(yld.error || "Child agent failed");
-      }
-      const childResult = yld?.result ?? {};
-      const text = childResult.text ?? "";
-      result = {
-        kind: "spawn_agent",
-        summary: text ? truncateSummary(text) : `Child agent exited (${childResult.exitCode ?? 0})`,
-        data: { ...childResult, text }
-      };
     }
   } else if (name.startsWith("jira_") || name.startsWith("confluence_") || name.startsWith("slack_") || name.startsWith("discord_")) {
     result = await runIntegrationTool({ name, args, cwd, gate });

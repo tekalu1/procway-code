@@ -300,11 +300,10 @@ describe("live output === replayed output", () => {
   it("matches the assistant node the transcript replays, byte for byte", () => {
     const text = PARITY_DOCS["every block kind"];
     const node = renderTranscriptNode({ kind: "assistant", text }, { width: 80, colorize: true });
-    // The node carries an "Assistant:" label the live feed does not print;
-    // everything after it is the body, and the "\n\n" is the same separator
-    // `renderTranscriptNodes` puts between two nodes.
-    const body = node.slice(node.indexOf("\n") + 1);
-    expect(streamAll(text, fixedChunks(text, 7), { colorize: true, width: 80 })).toBe(`${body}\n\n`);
+    // The node carries no role label — it IS the body — so the live stream
+    // and the replayed transcript are byte-identical (the old "Assistant:"
+    // label was dropped so resume no longer looks different from live).
+    expect(streamAll(text, fixedChunks(text, 7), { colorize: true, width: 80 })).toBe(`${node}\n\n`);
   });
 
   it("no longer multiplies blank lines the way the newline-cut renderer did", () => {
@@ -354,8 +353,7 @@ describe("live output === replayed output", () => {
       renderer.detach();
 
       const node = renderTranscriptNode({ kind: "assistant", text: partial }, { width: 80, colorize: true, hyperlinks });
-      const body = node.slice(node.indexOf("\n") + 1);
-      expect(writer.text).toBe(`${body}\n\n`);
+      expect(writer.text).toBe(`${node}\n\n`);
       expect(writer.text.includes("\x1b]8;")).toBe(hyperlinks);
     });
   }

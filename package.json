@@ -1,6 +1,6 @@
 {
   "name": "procway-code",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Local coding agent — events-first, multi-provider (Anthropic / OpenAI / OpenRouter), TUI-ready, Headless API",
   "type": "module",
   "bin": {

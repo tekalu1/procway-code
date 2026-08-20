@@ -94,6 +94,25 @@ export class InputController {
     this.lineBuffer = "";
     /** True while a newline-less transient row (spinner) is on screen. */
     this.transientDirty = false;
+    /**
+     * Persistent bottom dock (the always-armed input prompt). A caller may pin
+     * a multi-line PANEL (the always-on TODO) directly above the input, and a
+     * one-row transient STATUS spinner (model waiting / tool bullet) sits above
+     * the PANEL, so both stay at the bottom of the screen while content scrolls
+     * above them. On-screen order (top→bottom): [status][panel][input].
+     */
+    this.dockPanel = null;
+    this.dockPanelRows = 0;
+    this.dockStatus = null;
+    this.dockStatusActive = false;
+    // Number of dock rows currently on screen ([status][panel][editor], from
+    // the dock's top row down to the editor's cursor). `#clearDock` zeroes it,
+    // `#drawDock` / `#startLine` recompute it. `#startLine` (a re-armed base
+    // prompt) uses it to erase a dock left behind by a docked submit instead of
+    // rendering the new editor over it — that leftover row was what let the
+    // TODO panel / `╭─` header and a completed tool's "running" row "flow in
+    // addition to being pinned" on every turn.
+    this._onScreenDockRows = 0;
 
     this.onData = (chunk) => this.#onData(chunk);
     this.onEnd = () => this.#onEnd();
@@ -165,31 +184,163 @@ export class InputController {
    * Write around the active input region: erase it, write, repaint. Every
    * adapter that prints while a prompt is on screen must go through here, or
    * the editor's row bookkeeping desyncs from the terminal.
+   *
+   * With the persistent bottom dock, a newline-terminated write clears the
+   * whole [status][panel][editor] block, appends the content line above it and
+   * rebuilds the dock, so the TODO panel + input stay pinned to the bottom
+   * while the transcript scrolls.
    */
   write(text) {
+    const content = String(text ?? "");
+    // Writing NOTHING must change nothing on screen. `renderAssistantContent()`
+    // returns "" for a round whose assistant message is tool calls only (no
+    // text), and the REPL's non-streaming fallback writes that verbatim — so
+    // every tool-using turn used to send an empty string through here. It fell
+    // into the "partial write" branch below, which tore the dock down and left
+    // the input line invisible for the rest of the session (only Enter, which
+    // re-arms the prompt, brought it back).
+    if (content === "") return;
     const editor = this.current?.editor;
     // A transient row (spinner frame) has no trailing newline, so anything
     // written next would be appended to it — `… (0s)model waiting failed`.
     // Clear it first (P3b-2).
     const prefix = this.transientDirty ? "\r\x1b[2K" : "";
     this.transientDirty = false;
-    if (!editor || !editor.visible) { this.#raw(`${prefix}${text}`); return; }
-    editor.erase();
-    this.#raw(text);
-    editor.render();
+    if (!editor || !this.tty) { this.#raw(`${prefix}${content}`); return; }
+    if (this.#inOverlay()) {
+      // An overlay (approval / secret / picker) owns the screen; no dock.
+      editor.erase();
+      this.#raw(content);
+      editor.render();
+      return;
+    }
+    // `editor.visible === false` means the dock is NOT on screen — either
+    // nothing has been drawn yet or a partial write below hid it. Either way
+    // there is no region to clear, and this write is what puts the dock back:
+    // before, a hidden editor took a bare `#raw` early return, so once the dock
+    // was down nothing could ever rebuild it.
+    if (editor.visible) this.#clearDock(editor);
+    else this.#raw(prefix);
+    this.dockStatusActive = false;
+    this.dockStatus = null;
+    this.#raw(content);
+    if (content.endsWith("\n")) {
+      this.#drawDock(editor);
+    } else {
+      // A rare partial (line-internal) write: leave the editor hidden rather
+      // than paint the dock over an unterminated row; the next full line
+      // rebuilds it (see the `editor.visible` branch above). Erase forward from
+      // where the text ENDS — the old `\r` first moved to column 0, so the
+      // erase wiped the very text this call had just written.
+      this.#raw("\x1b[0J");
+    }
   }
 
   /**
    * Write a row that will be overwritten by the next write (a spinner frame).
-   * Refused while a prompt is on screen: a repainting spinner must never land
-   * on top of an approval question the user is answering.
+   * When the persistent dock is up it lands on the STATUS row — the top of the
+   * dock block, above the pinned panel and input; otherwise it is written as a
+   * transient line at the cursor.
+   * Refused while an intrusive overlay (approval / secret / picker) is reading.
    */
   writeTransient(text) {
     const editor = this.current?.editor;
-    if (editor?.visible) return false;
+    if (editor?.visible && this.#inOverlay()) return false;
+    if (editor?.visible) {
+      if (this.dockStatusActive) {
+        // Repaint the status row in place — the TOP of the dock block, whose
+        // physical offset above the editor is the pinned panel plus one.
+        const up = editor.drawnCursorRow + this.dockPanelRows + 1;
+        this.#raw(`\x1b[${up}A\r\x1b[2K${text}`);
+        this.#raw(`\x1b[${up}B`);
+        if (editor.drawnCursorCol > 0) this.#raw(`\x1b[${editor.drawnCursorCol}C`);
+        this.dockStatus = text;
+        return true;
+      }
+      this.#clearDock(editor);
+      this.dockStatusActive = true;
+      this.dockStatus = text;
+      this.#drawDock(editor);
+      return true;
+    }
     this.#raw(`\r\x1b[2K${text}`);
     this.transientDirty = true;
     return true;
+  }
+
+  /** Drop the transient status row (keep the panel and the input). */
+  clearTransient() {
+    if (!this.dockStatusActive) return;
+    const editor = this.current?.editor;
+    if (editor?.visible && !this.#inOverlay()) {
+      this.#clearDock(editor);
+      this.dockStatusActive = false;
+      this.dockStatus = null;
+      this.#drawDock(editor);
+    } else {
+      this.dockStatusActive = false;
+      this.dockStatus = null;
+    }
+  }
+
+  /** Pin a multi-line panel (e.g. the always-on TODO) above the input. */
+  setDockPanel(text) {
+    const nextPanel = text ? String(text).replace(/\n+$/, "") : null;
+    const nextRows = nextPanel ? nextPanel.split("\n").length : 0;
+    const editor = this.current?.editor;
+    if (editor?.visible && !this.#inOverlay()) {
+      this.#clearDock(editor);
+      this.dockPanel = nextPanel;
+      this.dockPanelRows = nextRows;
+      this.#drawDock(editor);
+    } else {
+      this.dockPanel = nextPanel;
+      this.dockPanelRows = nextRows;
+    }
+  }
+
+  /** True while an intrusive overlay owns the key stream. */
+  #inOverlay() {
+    const activity = this.current;
+    return Boolean(activity && (activity.level > 0 || activity.kind !== "line"));
+  }
+
+  /** Total dock rows above the editor: the pinned panel plus the status row. */
+  #dockHeight() {
+    return this.dockPanelRows + (this.dockStatusActive ? 1 : 0);
+  }
+
+  /**
+   * Move to the top of the dock block ([status][panel][editor]) and clear
+   * everything from there down. Leaves the cursor at column 0 of the top row
+   * and resets the editor's bookkeeping so the next render is a fresh draw.
+   */
+  #clearDock(editor) {
+    const up = (editor?.visible ? editor.drawnCursorRow : 0) + this.#dockHeight();
+    if (up > 0) this.#raw(`\x1b[${up}A`);
+    this.#raw("\r\x1b[0J");
+    if (editor) {
+      editor.visible = false;
+      editor.drawnRows = 0;
+      editor.drawnCursorRow = 0;
+      editor.drawnCursorCol = 0;
+    }
+    // The region is gone — forget how tall it was.
+    this._onScreenDockRows = 0;
+  }
+
+  /** Rebuild the dock block after the cursor was placed at its top row. */
+  #drawDock(editor) {
+    // On-screen order (top→bottom): [status][panel][editor] — the transient
+    // status line (model waiting / tool bullet) sits above the pinned panel.
+    let out = "";
+    if (this.dockStatusActive && this.dockStatus != null) out += `${this.dockStatus}\r\n`;
+    if (this.dockPanel) out += `${this.dockPanel}\r\n`;
+    if (out) this.#raw(out);
+    editor.render();
+    // Remember how much of the screen the dock now occupies (dock-top row down
+    // to the editor's cursor) so a later cleared-and-re-pinned region lines up.
+    this._onScreenDockRows = this.#dockHeight() + (editor.drawnRows || 0);
   }
 
   /** A `{ write }` sink other adapters can hold onto (e.g. interrupt.mjs). */
@@ -197,7 +348,14 @@ export class InputController {
     return {
       write: (text) => this.write(text),
       writeTransient: (text) => this.writeTransient(text),
-      isTTY: this.output?.isTTY === true
+      clearTransient: () => this.clearTransient(),
+      setDockPanel: (text) => this.setDockPanel(text),
+      isTTY: this.output?.isTTY === true,
+      // True in an interactive REPL: sinks that repaint rows in place by
+      // emitting `\x1b[1A` (the timeline's one-row-per-tool trick) must fall
+      // back to plain writes, because the cursor sits on the dock, not below
+      // the tool row.
+      hasDock: this.tty
     };
   }
 
@@ -291,6 +449,17 @@ export class InputController {
     return Boolean(this.current);
   }
 
+  /**
+   * True while an INTENSIVE overlay (approval / secret / picker) owns the key
+   * stream. The persistent level-0 prompt does NOT count as busy: with a dock
+   * always at the bottom, a live spinner may repaint the status row above it.
+   * Background writers (the timeline spinner) check this so a repainting frame
+   * can never land on top of something the user is answering (P3b-2).
+   */
+  get isOverlay() {
+    return this.#inOverlay();
+  }
+
   /* ---------------------------------------------------------------- *
    * Scheduling
    * ---------------------------------------------------------------- */
@@ -357,6 +526,8 @@ export class InputController {
     this.current = activity;
     // Whatever transient row was on screen is about to be repainted over.
     this.transientDirty = false;
+    this.dockStatusActive = false;
+    this.dockStatus = null;
     if (activity.kind === "line") this.#startLine(activity);
     else if (activity.kind === "secret") this.#startSecret(activity);
     else this.#startExclusive(activity);
@@ -388,7 +559,18 @@ export class InputController {
       return;
     }
     this.#refreshMenu(activity, { render: false });
+    // A re-armed base prompt must not paint over a dock left behind by a
+    // docked submit: clear the prior [status][panel][editor] block first, then
+    // re-pin the panel and render the fresh editor on a clean region. Without
+    // the clear the new editor rendered one row below the old dock, leaving
+    // the old panel + `╭─` header + a completed tool's "running" row in the
+    // scrollback *and* pinned — the "flows in addition to being pinned" bug.
+    const priorDockRows = this._onScreenDockRows;
+    if (priorDockRows > 0) this.#raw(`\x1b[${priorDockRows}A\r\x1b[0J`);
+    this._onScreenDockRows = 0;
+    if (this.dockPanel) this.#raw(`${this.dockPanel}\r\n`);
     editor.render();
+    this._onScreenDockRows = this.dockPanelRows + (editor.drawnRows || 0);
     if (activity.replayQueued && this.queuedEvents.length > 0) {
       const queued = this.queuedEvents;
       this.queuedEvents = [];
@@ -489,9 +671,48 @@ export class InputController {
       editor.footer = "";
       editor.render();
     }
-    editor.finish();
+    if (activity.kind === "line" && this.tty && editor.visible) {
+      // A docked editor sits at the BOTTOM row with the pinned panel / status
+      // above it. `finish()`'s bare `\r\n` would scroll those pinned rows into
+      // the scrollback on every submit (the "▌TODO … flowing past" symptom) and
+      // bury the submitted line. Commit the message cleanly and re-pin the dock
+      // instead (mirrors `write()`'s clear → write → redraw discipline).
+      this.#commitDockLine(activity);
+    } else {
+      editor.finish();
+    }
     if (activity.history) activity.history.record(value);
     activity.settle(value);
+  }
+
+  /**
+   * Commit a submitted line from a docked editor into the feed without
+   * scrolling the pinned panel/status rows into it. The editor line was drawn
+   * as the LAST row of the dock, so a plain line-feed here would push the whole
+   * pinned block (TODO panel, status spinner) up into the scrollback and let it
+   * linger as stale feed rows each turn. Instead: erase the dock region, write
+   * the message plus a spacer row (so the re-pinned dock is never flush against
+   * the message — a later `#clearDock` computed from dockHeight would otherwise
+   * reach up and erase it), then redraw the dock from a known baseline.
+   */
+  #commitDockLine(activity) {
+    const editor = activity.editor;
+    const value = editor.value;
+    const prefix = activity.prefix ?? "";
+    // If an intrusive overlay stepped in between typing and Enter, just drop
+    // the editor line the old way.
+    if (this.#inOverlay()) { editor.finish(); return; }
+    this.#clearDock(editor);
+    this.dockStatusActive = false;
+    this.dockStatus = null;
+    if (value.trim() !== "") {
+      // The submitted message, then one spacer row above the dock.
+      this.#raw(`${prefix}${value}\r\n\r\n`);
+    }
+    // Render the dock with an empty editor line — the submitted text is now a
+    // committed feed row, not a pending input.
+    editor.clear();
+    this.#drawDock(editor);
   }
 
   #handleLineKey(activity, event) {

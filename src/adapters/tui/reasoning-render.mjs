@@ -14,8 +14,22 @@
  *  - flushed on the first `assistant.message.delta` (the answer has started)
  *    and at the end of the turn.
  *
- * On/off: `setEnabled(false)` — the REPL binds it to `/thinking [on|off]` and
- * seeds it from `settings.ui.thinking` (default on).
+ * ## Display modes (P3-14)
+ *
+ * A long reasoning phase can occupy most of the screen, so the renderer now
+ * has three modes instead of a bare on/off:
+ *
+ *   - `full`   — stream every reasoning line as it completes (the original
+ *                behaviour; `/thinking on` / setEnabled(true)).
+ *   - `folded` — buffer the whole phase and print ONE summary line at the end
+ *                (e.g. `┊ thinking (42 lines)`). The screen stays small by
+ *                default; the detail is a `/thinking full` away.
+ *   - `hidden` — drop the reasoning entirely (`/thinking off` /
+ *                setEnabled(false)).
+ *
+ * Mode precedence: an explicit `mode:` wins, then `defaultMode:` (what the
+ * REPL seeds), then `enabled === false` → hidden, then `full`. `/thinking`
+ * toggles: bare `/thinking` cycles hidden → folded → full.
  */
 
 import { style } from "./ansi.mjs";
@@ -25,17 +39,32 @@ export function createReasoningRenderer({
   writer = process.stdout,
   width = () => 80,
   colorize = false,
-  enabled = true
+  enabled = true,
+  mode = null,
+  defaultMode = "full"
 } = {}) {
-  return new ReasoningRenderer({ writer, width, colorize, enabled });
+  return new ReasoningRenderer({ writer, width, colorize, enabled, mode, defaultMode });
+}
+
+function normaliseMode(value) {
+  const v = String(value ?? "").toLowerCase();
+  if (v === "hidden" || v === "off" || v === "false") return "hidden";
+  if (v === "folded" || v === "fold") return "folded";
+  return "full";
+}
+
+function resolveInitialMode({ enabled, mode, defaultMode }) {
+  if (mode != null) return normaliseMode(mode);
+  if (enabled === false) return "hidden";
+  return normaliseMode(defaultMode ?? "full");
 }
 
 export class ReasoningRenderer {
-  constructor({ writer, width, colorize, enabled }) {
+  constructor({ writer, width, colorize, enabled = true, mode = null, defaultMode = "full" }) {
     this.writer = writer;
     this.widthOf = typeof width === "function" ? width : () => Number(width) || 80;
     this.colorize = colorize;
-    this.enabled = enabled !== false;
+    this.mode = resolveInitialMode({ enabled, mode, defaultMode });
     this.buffer = "";
     this.bus = null;
     this.subscriptions = [];
@@ -65,23 +94,47 @@ export class ReasoningRenderer {
     this.subscriptions.push({ type, handler });
   }
 
+  /** Set the display mode: "hidden" | "folded" | "full" (also accepts aliases). */
+  setMode(value) {
+    const next = normaliseMode(value);
+    if (next !== this.mode) {
+      this.mode = next;
+      // Switching modes mid-phase: a partial line belongs to the old mode.
+      this.buffer = "";
+    }
+    return this.mode;
+  }
+
+  getMode() {
+    return this.mode;
+  }
+
+  /** Backward-compatible on/off: `false` → hidden, `true` → full. */
   setEnabled(value) {
-    this.enabled = value !== false;
-    if (!this.enabled) this.buffer = "";
-    return this.enabled;
+    const next = value === false ? "hidden" : "full";
+    if (next !== this.mode) this.buffer = "";
+    this.mode = next;
+    return this.mode !== "hidden";
   }
 
   isEnabled() {
-    return this.enabled;
+    return this.mode !== "hidden";
   }
 
-  /** Buffer a delta; emit every complete line. */
+  isFolded() {
+    return this.mode === "folded";
+  }
+
+  /** Buffer a delta; in `full` mode emit every complete line immediately. */
   push(text) {
-    if (!this.enabled || typeof text !== "string" || text === "") return;
+    if (typeof text !== "string" || text === "") return;
+    if (this.mode === "hidden") return;
     this.buffer += text;
+    if (this.mode !== "full") return;
+    // Full mode streams lines as they complete; the tail stays buffered.
     let index = this.buffer.indexOf("\n");
     while (index !== -1) {
-      this.#emit(this.buffer.slice(0, index));
+      this.#emitLine(this.buffer.slice(0, index));
       this.buffer = this.buffer.slice(index + 1);
       index = this.buffer.indexOf("\n");
     }
@@ -92,10 +145,16 @@ export class ReasoningRenderer {
     if (this.buffer === "") return;
     const rest = this.buffer;
     this.buffer = "";
-    if (this.enabled) this.#emit(rest);
+    if (this.mode === "hidden") return;
+    if (this.mode === "folded") {
+      const n = countLines(rest);
+      if (n > 0) this.#emitFoldedSummary(n);
+      return;
+    }
+    this.#emitLine(rest);
   }
 
-  #emit(line) {
+  #emitLine(line) {
     const text = line.trim();
     if (text === "") return;
     const width = Math.max(20, this.widthOf());
@@ -105,4 +164,15 @@ export class ReasoningRenderer {
       .join("\n");
     try { this.writer.write(`${rendered}\n`); } catch { /* ignore */ }
   }
+
+  #emitFoldedSummary(lineCount) {
+    const noun = lineCount === 1 ? "line" : "lines";
+    const text = `┊ thinking (${lineCount} ${noun}) — /thinking full to expand`;
+    const rendered = this.colorize ? style(["muted", "italic"], text) : text;
+    try { this.writer.write(`${rendered}\n`); } catch { /* ignore */ }
+  }
+}
+
+function countLines(text) {
+  return text.split("\n").filter((line) => line.trim() !== "").length;
 }

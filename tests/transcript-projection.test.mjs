@@ -148,6 +148,31 @@ describe("transcriptFromMessages projection", () => {
     expect(stripSystemReminders("hi <system-reminder>x</system-reminder>")).toBe("hi <system-reminder>x</system-reminder>");
   });
 
+  it("projects a wake-marked user message as a `wake` node, not an empty user bubble", () => {
+    // event-wake (issue #143): the whole body is a <system-reminder>, so the
+    // user projection would strip it to "" and every surface would render a
+    // blank message nobody sent.
+    const body = "<system-reminder>\nAUTOMATIC RESUME — this is NOT a message from the user.\n</system-reminder>";
+    const wakeMessage = createMessage({ sessionId: "s", role: "user", content: [{ kind: "text", text: body }] });
+    wakeMessage.wake = true;
+    const nodes = transcriptFromMessages([
+      createMessage({ sessionId: "s", role: "user", content: [{ kind: "text", text: "typed" }] }),
+      wakeMessage
+    ]);
+    expect(nodes[0]).toEqual({ kind: "user", role: "user", text: "typed" });
+    // Node kind of its own, system role, and the FULL body kept for the
+    // transcript reader (the dashboard renders its own localized line).
+    expect(nodes[1]).toEqual({ kind: "wake", role: "system", text: body });
+    expect(nodes.some((node) => node.kind === "user" && node.text === "")).toBe(false);
+  });
+
+  it("leaves an unmarked user message on the normal user path", () => {
+    const nodes = transcriptFromMessages([
+      createMessage({ sessionId: "s", role: "user", content: [{ kind: "text", text: "still me" }] })
+    ]);
+    expect(nodes[0].kind).toBe("user");
+  });
+
   it("returns [] for empty input and ignores non-object entries", () => {
     expect(transcriptFromMessages([])).toEqual([]);
     expect(transcriptFromMessages([null, undefined, 42])).toEqual([]);

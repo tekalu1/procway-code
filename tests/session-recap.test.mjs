@@ -54,9 +54,11 @@ describe("renderSessionRecap (P1-5)", () => {
     const plain = stripAnsi(renderSessionRecap({ session: makeSession(), cwd: "/w" }));
     expect(plain).toContain("You: run the tests");
     expect(plain).toContain('✓ run_shell(command="pnpm test")');
-    expect(plain).toContain("Ran: pnpm test (exit 0)");
-    expect(plain).toContain("Assistant:");
+    // Header-only tools, no role label — same as the live feed.
+    expect(plain).not.toContain("Ran: pnpm test (exit 0)");
+    expect(plain).not.toContain("137 passed");
     expect(plain).toContain("All green.");
+    expect(plain).not.toContain("Assistant");
     expect(plain).not.toContain('{"kind":"run_shell"');
     expect(plain).not.toContain("hidden prompt");
   });

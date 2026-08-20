@@ -25,12 +25,13 @@ export const SLASH_COMMANDS = Object.freeze([
   { name: "/help", description: "List all slash commands with a one-line description" },
   { name: "/history", description: "Print the recent transcript" },
   { name: "/memory", description: "List persisted memory entries" },
+  { name: "/mcp", description: "List MCP servers, or add/remove/reconnect one", args: "[add|remove|reconnect]" },
   { name: "/model", description: "Show the active provider:model" },
   { name: "/plan", description: "Toggle plan mode (queue write tools for end-of-turn approval)" },
   { name: "/resume", description: "Pick a session to resume" },
   { name: "/status", description: "Show workspace, session, model, and mode" },
   { name: "/terminal-setup", description: "Bind Shift+Enter to a newline in this terminal (shows a diff first)" },
-  { name: "/thinking", description: "Show or hide the model's reasoning stream", args: "[on|off]" },
+  { name: "/thinking", description: "Control the model's reasoning display: off (hidden), fold (one-line summary), full (stream)", args: "[off|fold|full]" },
   { name: "/todos", description: "Show the agent's running todo list" },
   { name: "/usage", description: "Show round-by-round usage / cost" }
 ]);

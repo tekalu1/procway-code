@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DelegatedJobRegistry } from "../src/jobs/delegated-jobs.mjs";
+import { DelegatedJobRegistry, resetSharedJobRegistryForTests } from "../src/jobs/delegated-jobs.mjs";
 import { saveSessionState } from "../src/session/store.mjs";
 import { readSnapshot } from "../src/session/snapshot.mjs";
 import { runShellStatus } from "../src/tools/shell.mjs";
+import { AgentSession } from "../src/agent/conversation.mjs";
+import { EventBus } from "../src/core/events/bus.mjs";
 
 // ADR 0037 D4 — delegated jobs survive a session snapshot round-trip.
 
@@ -146,5 +148,43 @@ describe("session snapshot round-trip carries delegatedJobs + loadedTools", () =
     // Raw file too (no whitelist drop).
     const raw = JSON.parse(await readFile(path.join(homeDir, ".procway", "ai-agent", "sessions", "sess-1", "snapshot.json"), "utf8"));
     expect(raw.delegatedJobs).toHaveLength(1);
+  });
+
+  // The write path is gated by TWO independent explicit-copy whitelists —
+  // store.mjs (state → snapshot argument) and snapshot.mjs (snapshot argument →
+  // the JSON on disk). A key missing from either is dropped in SILENCE, and the
+  // read side keeps looking correct because it never receives anything (this is
+  // exactly how `loadedTools` was lost). The test above enters at
+  // saveSessionState; this one enters at AgentSession.save() so the real
+  // dehydrate → store → snapshot → readSnapshot wiring is covered end to end.
+  it("AgentSession.save() carries this session's jobs through both write-side whitelists", async () => {
+    const homeDir = os.homedir(); // tests/setup/test-home.mjs points it at a temp dir
+    const registry = resetSharedJobRegistryForTests();
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "procway-djobs-sess-"));
+    const session = new AgentSession({
+      settings: { tools: {}, session: {}, agents: {} },
+      cwd,
+      sessionId: "sess-save",
+      events: new EventBus()
+    });
+    await session.initialize();
+    // A job owned by THIS session, plus one owned by another (must not leak).
+    registry.spawnJob({ jobId: "job-mine", kind: "process", driver: idleDriver, spec: { command: "sleep 999" }, meta: { sessionId: "sess-save" } });
+    registry.spawnJob({ jobId: "job-theirs", kind: "process", driver: idleDriver, spec: { command: "nope" }, meta: { sessionId: "other" } });
+
+    await session.save({ force: true });
+
+    const snapshot = await readSnapshot({ homeDir, sessionId: "sess-save" });
+    expect(snapshot.delegatedJobs.map((job) => job.jobId)).toEqual(["job-mine"]);
+    // And on disk, not just in the object the reader normalized.
+    const raw = JSON.parse(await readFile(path.join(homeDir, ".procway", "ai-agent", "sessions", "sess-save", "snapshot.json"), "utf8"));
+    expect(raw.delegatedJobs.map((job) => job.jobId)).toEqual(["job-mine"]);
+
+    // Resume side: what restoreFromPersistence feeds back into the registry.
+    const fresh = makeRegistry();
+    expect(fresh.rehydrateJobs(snapshot.delegatedJobs)).toBe(1);
+    expect(fresh.getJob("job-mine").status).toBe("failed"); // 'running' → lost to restart
+    fresh.__resetForTest();
+    resetSharedJobRegistryForTests();
   });
 });

@@ -98,17 +98,20 @@ describePty("pty: /resume", () => {
     });
     expect(run.exitCode).toBe(0);
 
-    // The picker repaints in place and the replay is printed straight after
-    // the last repaint, so one frame carries both: the settled picker (row
-    // two selected) and everything the resumed session printed.
-    const replay = lastFrameWith(run.output, "Resume a session");
-    const plain = plainPty(replay, env);
+    // The picker repaints in place. With the persistent prompt the transcript
+    // lands on the frame AFTER the prompt repaint (not merged into the picker
+    // frame like it was before the always-on input), so pin the picker and the
+    // replay separately instead of folding them together.
+    const picker = lastFrameWith(run.output, "Resume a session");
+    const pickerPlain = plainPty(picker, env);
 
     // The picker row.
-    expect(plain).toContain("run the unit tests");
-    expect(plain).toContain("3 days ago");
+    expect(pickerPlain).toContain("run the unit tests");
+    expect(pickerPlain).toContain("3 days ago");
 
     // The transcript, as prose rather than storage format.
+    const replay = lastFrameWith(run.output, "All 1483 tests passed.");
+    const plain = plainPty(replay, env);
     expect(plain).toContain("run_shell");
     expect(plain).toContain("pnpm test");
     expect(plain).toContain("All 1483 tests passed.");

@@ -96,6 +96,14 @@ export class DelegatedJobRegistry {
     this.noEvictStatuses = new Set(noEvictStatuses);
     /** @type {Map<string, JobEntry>} */
     this.jobs = new Map();
+    /**
+     * Registry-level fan-out for settles (see subscribeSettled). Separate from
+     * the per-job emitters because a consumer that wants "did anything of mine
+     * finish?" cannot subscribe per job: the job it cares about may not exist
+     * yet when it subscribes, and holding a subscription per job would leak.
+     */
+    this.settledEmitter = new EventEmitter();
+    this.settledEmitter.setMaxListeners(0);
   }
 
   /**
@@ -203,6 +211,51 @@ export class DelegatedJobRegistry {
       entry.emitter.off("event", onEvent);
       entry.emitter.off("yield", onYield);
     };
+  }
+
+  /**
+   * Subscribe to EVERY settle in this registry — the registry-level counterpart
+   * of subscribeJob (issue #143, event-wake). One listener sees every job that
+   * leaves 'running', including jobs spawned after the subscription, which is
+   * what a session-level supervisor needs: it must react to "something of mine
+   * finished" without holding a subscription per job.
+   *
+   * Deliberately does NOT replay. subscribeJob replays the ring buffer and the
+   * current yield so a late per-job subscriber still sees the settle; doing the
+   * same here would hand a fresh subscriber the entire settle history of the
+   * process, and a wake supervisor would fire for work that was collected long
+   * ago.
+   *
+   * The payload is a SNAPSHOT taken at settle time, not a live reference:
+   * terminal jobs are evicted after the TTL, so `getJob(jobId)` may already
+   * return null by the time a subscriber acts on it.
+   *
+   *   handler({ jobId, kind, status, result, error, awaiting, meta, restored })
+   *     jobId    the settled job
+   *     kind     its kind ('agent' | 'process' | consumer-specific)
+   *     status   the terminal / paused status it settled with
+   *     meta     a shallow copy of the spawn-time metadata (undefined if none)
+   *     restored true when the job came back from a snapshot (rehydrateJobs)
+   *              and settled afterwards — a consumer may want to treat that
+   *              differently from work this process actually ran.
+   *
+   * Note that rehydrateJobs' own "running → failed (lost to a restart)"
+   * conversion does NOT emit: it is a bookkeeping repair, not a settle, and
+   * emitting would fire a burst of wakes the instant a session resumes.
+   *
+   * A throwing handler can never break the registry (same discipline as
+   * subscribeJob). Returns an unsubscribe function.
+   *
+   * @param {(payload: object) => void} handler
+   * @returns {() => void}
+   */
+  subscribeSettled(handler) {
+    if (typeof handler !== "function") return () => {};
+    const onSettled = (payload) => {
+      try { handler(payload); } catch { /* best-effort subscriber */ }
+    };
+    this.settledEmitter.on("settled", onSettled);
+    return () => { this.settledEmitter.off("settled", onSettled); };
   }
 
   /**
@@ -425,6 +478,7 @@ export class DelegatedJobRegistry {
       if (entry.evictTimer) this.clearTimeoutImpl(entry.evictTimer);
     }
     this.jobs.clear();
+    this.settledEmitter.removeAllListeners();
   }
 
   // --- internals ---
@@ -456,6 +510,7 @@ export class DelegatedJobRegistry {
     try {
       entry.emitter.emit("yield", this._yieldPayload(entry.state));
     } catch { /* best-effort */ }
+    this._emitSettled(entry);
     // A no-evict pause keeps the job live indefinitely so resumeJob/awaitJob‐
     // Yield can rendezvous; everything else is evicted after the TTL (a driver
     // may hand a per-settle ttlMs to widen the window for a resumable terminal,
@@ -473,7 +528,32 @@ export class DelegatedJobRegistry {
     try {
       entry.emitter.emit("yield", this._yieldPayload(entry.state));
     } catch { /* best-effort */ }
+    this._emitSettled(entry);
     this._scheduleEvict(entry);
+  }
+
+  /**
+   * Registry-level settle fan-out (subscribeSettled). Called from BOTH settle
+   * paths — _settle (a driver's onYield) and _fail (a synchronous throw or a
+   * rejected promise from driver.start) — because a consumer that only heard
+   * about the first would silently never be woken for a job that died at spawn.
+   */
+  _emitSettled(entry) {
+    const s = entry.state;
+    const payload = {
+      jobId: s.jobId,
+      kind: s.kind,
+      status: s.status,
+      result: s.result,
+      error: s.error,
+      awaiting: s.awaiting,
+      // Shallow copy: the payload must stay valid after the job is evicted.
+      meta: s.meta ? { ...s.meta } : undefined,
+      restored: s.restored === true
+    };
+    try {
+      this.settledEmitter.emit("settled", payload);
+    } catch { /* best-effort: a settle sink must never break the driver */ }
   }
 
   _scheduleEvict(entry, ttlMs) {
@@ -522,6 +602,10 @@ export function getSharedJobRegistry() {
 
 /** Test-only: swap in a fresh shared registry. */
 export function resetSharedJobRegistryForTests() {
+  // Tear the outgoing registry down first: its jobs would keep evict timers,
+  // and its subscribeSettled listeners would keep the previous test's
+  // supervisors reachable from a registry nobody can reach any more.
+  try { SHARED_REGISTRY?.__resetForTest(); } catch { /* best-effort */ }
   SHARED_REGISTRY = new DelegatedJobRegistry();
   return SHARED_REGISTRY;
 }

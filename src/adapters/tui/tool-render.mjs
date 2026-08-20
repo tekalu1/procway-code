@@ -13,10 +13,10 @@ import { sanitizeInline, sanitizeTerminalText } from "./sanitize.mjs";
  *
  *   ● run_shell(command="pnpm test")          <- live, call started
  *   ✓ run_shell(command="pnpm test")          <- live, call finished
- *   ✓ run_shell(command="pnpm test")          <- replay, with the result body
- *     Ran: pnpm test (exit 0)
- *     Test Files  137 passed
- *     … (312 more lines)
+ *   ✓ run_shell(command="pnpm test")          <- replay, header only
+ *
+ * (The replayed transcript passes NO `result`, so both surfaces print the
+ * single header line — a recovered session no longer dumps the tool's body.)
  *
  * The renderer is deliberately a pure function: callers own the
  * `process.stdout.write` boundary so the streaming write path stays
@@ -52,11 +52,12 @@ export function renderToolCall({
   expanded = false,
   previewLines = TOOL_PREVIEW_LINES,
   maxChars = TOOL_RESULT_MAX_CHARS,
-  colorize = true
+  colorize = true,
+  frame
 } = {}) {
   const resolvedName = name ?? result?.kind ?? "tool";
   const resolvedStatus = normaliseStatus({ status, ok, result });
-  const headerLine = renderHeader({ name: resolvedName, args, status: resolvedStatus, colorize });
+  const headerLine = renderHeader({ name: resolvedName, args, status: resolvedStatus, colorize, frame });
   if (!result) return `${headerLine}\n`;
   // P3e-3. THE widest injection surface in the program: this body is a
   // `read_file` of an attacker-controlled repository, a `run_shell` stdout, a
@@ -97,7 +98,7 @@ function normaliseStatus({ status, ok, result }) {
   return "start";
 }
 
-function renderHeader({ name, args, status, colorize }) {
+function renderHeader({ name, args, status, colorize, frame }) {
   const marker = MARKERS[status] ?? MARKERS.ok;
   // `path=…` and `dir=…` interpolate a file path straight in (the other
   // formatters go through JSON.stringify, which escapes controls itself), and
@@ -106,10 +107,15 @@ function renderHeader({ name, args, status, colorize }) {
   // is also what the approval prompt shows above the y/n question.
   const safeName = sanitizeInline(name);
   const argText = sanitizeInline(formatArgs(name, args ?? {}));
+  // `frame` swaps the "started" ● marker for a live spinner glyph (same accent
+  // palette, same single cell), so a running tool reads as *active* rather
+  // than a static dot. Undefined on completion / replay — behaviour unchanged.
+  const glyph = status === "start" && frame !== undefined
+    ? (colorize ? style(marker.palette, frame) : frame)
+    : (colorize ? style(marker.palette, marker.glyph) : marker.glyph);
   if (!colorize) {
-    return argText.length > 0 ? `${marker.glyph} ${safeName}(${argText})` : `${marker.glyph} ${safeName}`;
+    return argText.length > 0 ? `${glyph} ${safeName}(${argText})` : `${glyph} ${safeName}`;
   }
-  const glyph = style(marker.palette, marker.glyph);
   const label = style(["accent", "bold"], safeName);
   const tail = argText.length > 0 ? style("muted", `(${argText})`) : "";
   return `${glyph} ${label}${tail}`;
@@ -146,7 +152,14 @@ function formatArgs(name, args) {
   if (name === "Glob") return `pattern=${JSON.stringify(args.pattern ?? "")}`;
   if (name === "Grep") return `pattern=${JSON.stringify(args.pattern ?? "")}`;
   if (name === "run_shell") return `command=${JSON.stringify(truncate(args.command ?? "", 72))}`;
-  if (name === "spawn_agent") return `task=${JSON.stringify(truncate(args.task ?? "", 60))}`;
+  if (name === "spawn_agent") {
+    const task = `task=${JSON.stringify(truncate(args.task ?? "", 60))}`;
+    return args.runInBackground === true ? `${task}, background` : task;
+  }
+  if (name === "agent_job") {
+    const action = `action=${args.action ?? ""}`;
+    return args.jobId ? `${action}, job=${shortJobId(args.jobId)}` : action;
+  }
   if (name === "apply_patch") return "patch=...";
   return Object.keys(args)
     .slice(0, 3)
@@ -187,8 +200,26 @@ function formatResult({ name, result }) {
     return result.summary;
   }
   if (name === "spawn_agent") {
-    const text = result.data?.text ?? "";
+    const data = result.data ?? {};
+    // Issue #142: a BACKGROUND spawn has no text yet — the useful body is the
+    // jobId the model has to wait on, not an empty result.
+    if (data.background === true) {
+      return `${result.summary}\njobId=${data.jobId ?? "?"} (running in background — collect it with agent_job action="wait")`;
+    }
+    const text = data.text ?? "";
     return text ? `${result.summary}\n${text}` : result.summary;
+  }
+  if (name === "agent_job") {
+    const data = result.data ?? {};
+    const segments = [result.summary];
+    if (Array.isArray(data.jobs)) {
+      for (const job of data.jobs) {
+        segments.push(`- ${shortJobId(job.jobId)} ${job.status}${job.task ? ` — ${job.task}` : ""}`);
+      }
+    }
+    if (typeof data.text === "string" && data.text.trim().length > 0) segments.push(data.text.trimEnd());
+    if (typeof data.error === "string" && data.error.length > 0) segments.push(`(error) ${data.error}`);
+    return segments.join("\n");
   }
   if (typeof result.summary === "string" && result.summary.length > 0) return result.summary;
   if (typeof result === "string") return result;
@@ -200,6 +231,11 @@ function shortFormat(value) {
   if (typeof value === "string") return JSON.stringify(truncate(value, 30));
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return JSON.stringify(value).slice(0, 30);
+}
+
+/** Job ids are UUIDs; the first 8 chars are what every job-facing summary uses. */
+function shortJobId(jobId) {
+  return typeof jobId === "string" ? jobId.slice(0, 8) : "?";
 }
 
 function truncate(text, max) {
