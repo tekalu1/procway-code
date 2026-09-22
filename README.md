@@ -18,17 +18,14 @@ GUI integrations.
 
 ## Install
 
-While the version number carries a `-alpha` suffix, releases are published
-under the `alpha` dist-tag, not `latest` — ask for it by name:
-
 ```bash
-npm install -g procway-code@alpha
+npm install -g procway-code
 # or
-pnpm add -g procway-code@alpha
+pnpm add -g procway-code
 ```
 
-Plain `npm install -g procway-code` starts working from the first stable
-release; until then there is no `latest` to resolve.
+Until the first stable release, `latest` is the newest pre-release
+(`-alpha.N`), so the plain install gets it.
 
 Requires **Node.js ≥ 20** (tested on 20, 22 and 24).
 
@@ -39,7 +36,7 @@ One optional dependency is installed by default:
   build; if it is missing, only `session.encryption.provider: "os-keychain"`
   is unavailable — the `passphrase` and `none` providers are unaffected)
 
-To skip it: `npm install -g --omit=optional procway-code@alpha`.
+To skip it: `npm install -g --omit=optional procway-code`.
 
 ### Tracing (opt-in, installed separately)
 

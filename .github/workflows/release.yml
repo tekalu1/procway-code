@@ -3,8 +3,10 @@
 #   git tag v0.1.0-alpha.3 && git push origin v0.1.0-alpha.3
 #
 # The tag must match `version` in package.json and point at a commit on main.
-# A pre-release version (`-alpha.N`) goes out under its pre-release dist-tag
-# (`alpha`); a plain version goes out under `latest`.
+# A stable version goes out under `latest`. A pre-release (`-alpha.N`) also
+# goes out under `latest` while no stable version exists on npm, and under its
+# own dist-tag (`alpha`) after that, so it never displaces a stable release.
+# Only one dist-tag is set: trusted publishing covers `npm publish` alone.
 #
 # Authentication is npm trusted publishing (OIDC): no npm token is stored in
 # this repository. The trusted publisher is configured on npmjs.com for this
@@ -46,9 +48,18 @@ jobs:
             echo "::error::tag ${GITHUB_REF_NAME} does not point at a commit on main"
             exit 1
           fi
+          name="$(node -p 'require("./package.json").name')"
           case "$version" in
-            *-*) pre="${version#*-}"; dist_tag="${pre%%.*}"; prerelease=true ;;
-            *)   dist_tag=latest; prerelease=false ;;
+            *-*)
+              prerelease=true
+              pre="${version#*-}"; dist_tag="${pre%%.*}"
+              # No stable version on npm yet → let `latest` follow pre-releases.
+              stable="$(npm view "$name" versions --json | node -e '
+                const v = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                console.log([].concat(v).filter((x) => !x.includes("-")).length)')"
+              if [ "$stable" = "0" ]; then dist_tag=latest; fi
+              ;;
+            *) dist_tag=latest; prerelease=false ;;
           esac
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "dist_tag=${dist_tag}" >> "$GITHUB_OUTPUT"

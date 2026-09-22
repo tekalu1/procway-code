@@ -86,16 +86,15 @@ un-published: an npm version number can never be reused.
 `prepublishOnly` runs `pnpm test && pnpm lint`, so a broken tree cannot be
 published by accident. Two rules beyond that:
 
-- **Pre-release versions go under a pre-release dist-tag.** The workflow
-  derives it from the version (`-alpha.N` → `alpha`). When publishing by hand,
-  pass `npm publish --tag alpha` yourself. Without the flag npm would move
-  `latest` to a pre-release, and every `npm install procway-code` would get it.
+- **`latest` follows pre-releases only until the first stable release.**
+  While no stable version exists on npm, the workflow publishes a pre-release
+  under `latest`, so `npm install procway-code` gets the newest one. Once a
+  stable version exists, a pre-release goes under its own dist-tag instead
+  (`-beta.N` → `beta`) and `latest` stays on the stable line. When publishing
+  by hand, pass the same `--tag` yourself.
 
-  One caveat worth knowing so it is not mistaken for a slip: on the **very
-  first** publish of a package, npm points `latest` at that version regardless
-  of `--tag`, because the registry needs `latest` to resolve to something. It
-  corrects itself as soon as a stable version is published normally, and
-  `latest` cannot be deleted in the meantime.
+  The workflow sets one dist-tag per publish: trusted publishing only covers
+  `npm publish`, and `npm dist-tag` would need a stored token.
 - **`files` is an allowlist, and the tests treat it as one.**
   `tests/package-manifest.test.mjs` asserts that entry points, licence files
   and the `web/` assets `serve` loads from the install root are all covered.
