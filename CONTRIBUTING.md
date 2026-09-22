@@ -70,13 +70,26 @@ Notes:
 
 ## Releases (maintainers)
 
+Releases are published by `.github/workflows/release.yml` when a version tag
+is pushed. Bump `version` in `package.json`, wait for CI on `main` to pass,
+then:
+
+```bash
+git tag v0.1.0-alpha.3 && git push origin v0.1.0-alpha.3
+```
+
+The workflow refuses a tag that does not match `package.json` or is not on
+`main`, publishes with provenance through npm trusted publishing (no token in
+the repository), and creates the GitHub release. A pushed tag cannot be
+un-published: an npm version number can never be reused.
+
 `prepublishOnly` runs `pnpm test && pnpm lint`, so a broken tree cannot be
 published by accident. Two rules beyond that:
 
-- **Pre-release versions go under a pre-release dist-tag.** While
-  `package.json` says `-alpha`, publish with `npm publish --tag alpha`. Without
-  the flag npm would move `latest` to a pre-release, and every
-  `npm install procway-code` would get it.
+- **Pre-release versions go under a pre-release dist-tag.** The workflow
+  derives it from the version (`-alpha.N` → `alpha`). When publishing by hand,
+  pass `npm publish --tag alpha` yourself. Without the flag npm would move
+  `latest` to a pre-release, and every `npm install procway-code` would get it.
 
   One caveat worth knowing so it is not mistaken for a slip: on the **very
   first** publish of a package, npm points `latest` at that version regardless

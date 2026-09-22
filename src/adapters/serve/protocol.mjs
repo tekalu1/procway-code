@@ -31,7 +31,8 @@ export const COMMANDS = Object.freeze([
   "abort",
   "listSessions",
   "loadSession",
-  "wake"
+  "wake",
+  "steer"
 ]);
 
 export function isServerMessage(value) {
@@ -43,7 +44,13 @@ export function isClientMessage(value) {
 }
 
 export function makeReady({ sessionId, version }) {
-  return { kind: "ready", sessionId, version, protocolVersion: PROTOCOL_VERSION };
+  // `commands` is the capability list. A command this agent does not know is
+  // dropped at the parse layer (parseClientMessage returns null), so the client
+  // gets NO response frame and its request hangs — there is no other way to
+  // tell "unsupported" from "slow". Hosts that use commands added after the
+  // first release (e.g. `steer`) must gate on this list and treat its ABSENCE
+  // (pre-capability agents) as "only the original COMMANDS exist".
+  return { kind: "ready", sessionId, version, protocolVersion: PROTOCOL_VERSION, commands: COMMANDS };
 }
 
 export function makeEvent(event) {
@@ -233,6 +240,36 @@ export function normalizeWakeItems(args) {
   });
   if (normalized.length === 0) throw new Error("wake: no item carries a jobId");
   return normalized;
+}
+
+/**
+ * Validate + normalize the `steer` command's args (mid-turn user message).
+ *
+ * `steer` hands a message the user typed WHILE a turn is running to that same
+ * turn: it is parked on the session and folded in at the next round boundary,
+ * so the model answers it inside the turn instead of after it. Unlike `wake`
+ * this is a real user utterance, so `prompt` is validated exactly like
+ * `runTurn`'s (a non-empty string). `clientMessageId` is the caller's own id
+ * for the message, echoed back on the `user.prompt.submitted` event that
+ * announces the fold — that echo is the only "the agent has READ it" signal
+ * (the command's own ack only means "parked").
+ *
+ * @param {object} args
+ * @returns {{ prompt: string, clientMessageId: string | null }}
+ */
+export function normalizeSteerArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("steer: args must be an object");
+  }
+  if (typeof args.prompt !== "string" || args.prompt.length === 0) {
+    throw new Error("steer: prompt is required");
+  }
+  if (args.clientMessageId !== undefined && args.clientMessageId !== null
+      && typeof args.clientMessageId !== "string") {
+    throw new Error("steer: clientMessageId must be a string");
+  }
+  const clientMessageId = typeof args.clientMessageId === "string" ? args.clientMessageId.trim() : "";
+  return { prompt: args.prompt, clientMessageId: clientMessageId || null };
 }
 
 /**

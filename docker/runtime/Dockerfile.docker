@@ -1,0 +1,107 @@
+# ============================================================
+# procway-code-runtime-docker — the docker-enabled runtime image (ADR 0039 §D4).
+#
+# Derived from the DEFAULT runtime image (docker/runtime/Dockerfile) so the two
+# never drift: everything the AI session needs is already in the base, and this
+# layer adds ONLY the container toolchain:
+#   - dockerd + docker CLI + buildx / compose plugins (upstream Debian repo)
+#   - legacy iptables (gVisor implements no nftables; an nft-backed `iptables`
+#     makes dockerd abort at startup)
+#   - a `docker` wrapper on PATH that absorbs the known gVisor limits LOUDLY
+#
+# This is a SEPARATE catalog entry, never the default. `dockerEnabled` is its own
+# profile axis and must NOT be derived from the image name (ADR 0039 §D1): the
+# capabilities that make dockerd work are granted by the engine from that axis,
+# and only under a gvisor RuntimeClass (§D2). Consequently this image deliberately
+# does NOT set PROCWAY_DOCKER_ENABLED — running it without the axis just yields a
+# session where dockerd was never started.
+#
+# The base runs as root with no USER directive and nothing here changes that:
+# dockerd needs root INSIDE the sandbox, and gVisor already de-privileges that
+# root (syscalls are served by the sentry, not the host kernel).
+#
+# Build (from the repo root, same context as the base image):
+#   docker build -f docker/runtime/Dockerfile.docker \
+#     --build-arg RUNTIME_BASE_IMAGE=procway-code-runtime:phase-a1 \
+#     -t procway-code-runtime-docker:phase-a1 .
+# deploy.sh does this for you under PROCWAY_DOCKER_IMAGE_BUILD=1.
+# ============================================================
+ARG RUNTIME_BASE_IMAGE=procway-code-runtime:phase-a1
+FROM ${RUNTIME_BASE_IMAGE}
+
+# ---------------------------------------------------------------------------
+# Docker Engine — installed from Docker's own apt repo, the same flow the base
+# image uses for `gh` (Debian's docker.io package lags several majors and does
+# not ship the compose/buildx plugins at all).
+#
+# The codename is read from /etc/os-release instead of being hard-coded to
+# bookworm: when the base image's Debian release moves, a wrong-codename repo
+# would either 404 at `apt-get update` (loud) or silently install packages built
+# for another release (quiet, and much worse).
+#
+# containerd.io is pulled in by docker-ce anyway; listed explicitly because it is
+# the piece that actually runs the nested containers, so an upstream packaging
+# change that drops the dependency must fail here rather than at runtime.
+# ---------------------------------------------------------------------------
+RUN install -m 0755 -d /usr/share/keyrings \
+ && curl -fsSL https://download.docker.com/linux/debian/gpg \
+      | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
+ && chmod go+r /usr/share/keyrings/docker-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+      > /etc/apt/sources.list.d/docker.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# iptables: nft → legacy.
+#
+# Debian bookworm's `iptables` command is an alternatives symlink that points at
+# iptables-nft by default. gVisor's netstack does not implement nftables at all
+# (`Failed to initialize nft: Protocol not supported`), so any dockerd startup
+# path that touches iptables dies on a runsc sandbox. Switching the alternative
+# to the legacy backend is what makes the tool usable at all inside gVisor.
+#
+# We still start dockerd with --iptables=false (entrypoint.sh; gVisor has no NAT
+# targets either, ADR 0039 §D6), so this is belt-and-braces for the daemon's own
+# probes and for anything the session runs by hand — but it costs nothing and the
+# failure mode without it is an opaque "daemon won't start".
+#
+# The verification RUN is the point of this layer: `update-alternatives --set`
+# succeeds even when the target is not what we think it is, so assert on the
+# backend the binaries actually report (`iptables v1.8.x (legacy)`).
+# ---------------------------------------------------------------------------
+RUN update-alternatives --set iptables /usr/sbin/iptables-legacy \
+ && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
+ && iptables --version  | grep -q legacy \
+ && ip6tables --version | grep -q legacy
+
+# ---------------------------------------------------------------------------
+# `docker` wrapper (ADR 0039 §D6).
+#
+# gVisor breaks two docker behaviours that users take for granted; the wrapper
+# makes both visible instead of letting them fail mysteriously:
+#   - `docker build` gets --network=host injected (the default bridge has no
+#     outbound route without MASQUERADE) and SAYS so on stderr;
+#   - `docker compose` prints one warning that service-name DNS does not resolve.
+#
+# /usr/local/bin precedes /usr/bin on this image's PATH (same mechanism the base
+# uses to shadow the distro git), so this file wins over the real CLI at
+# /usr/bin/docker, which the wrapper then execs by absolute path. The final RUN
+# asserts both halves of that arrangement — a PATH change in a future base image
+# would otherwise silently disable the wrapper.
+# ---------------------------------------------------------------------------
+COPY docker/runtime/docker-wrapper.sh /usr/local/bin/docker
+RUN chmod 0755 /usr/local/bin/docker \
+ && [ -x /usr/bin/docker ] \
+ && [ "$(command -v docker)" = /usr/local/bin/docker ] \
+ && /usr/bin/docker --version
+
+# /var/lib/docker is where the engine mounts the per-session PVC subPath
+# `docker-root` (ADR 0039 §D5 — image layers on the PVC, NOT tmpfs, so they do
+# not eat the 4Gi memory limit). Created here so an image run WITHOUT that mount
+# still has a valid data root instead of failing on a read-only rootfs.
+RUN mkdir -p /var/lib/docker
+
+# Deliberately no ENTRYPOINT/CMD/HEALTHCHECK override: the base contract holds
+# and entrypoint.sh starts dockerd itself when PROCWAY_DOCKER_ENABLED=1.

@@ -13,6 +13,7 @@ import {
   parseClientMessage,
   validateListSessionsArgs,
   validateLoadSessionArgs,
+  normalizeSteerArgs,
   normalizeWakeItems,
   MAX_WAKE_ITEMS
 } from "../src/adapters/serve/protocol.mjs";
@@ -30,6 +31,29 @@ describe("serve protocol", () => {
     expect(COMMANDS).toContain("loadSession");
     // event-wake (issue #143): the host's push channel for settled run jobs.
     expect(COMMANDS).toContain("wake");
+    // mid-turn user message, folded into the running turn at a round boundary.
+    expect(COMMANDS).toContain("steer");
+  });
+
+  // A command this agent does not know never gets a response frame (it is
+  // dropped in parseClientMessage), so a host cannot tell "unsupported" from
+  // "slow". The ready frame advertises the list so it can gate before sending.
+  it("advertises the command list on the ready frame", () => {
+    const ready = makeReady({ sessionId: "s1", version: "0.1.0" });
+    expect(ready.commands).toEqual(COMMANDS);
+    expect(ready.commands).toContain("steer");
+  });
+
+  it("normalizeSteerArgs validates the prompt and passes clientMessageId through", () => {
+    expect(normalizeSteerArgs({ prompt: "and also check the logs", clientMessageId: "m-1" }))
+      .toEqual({ prompt: "and also check the logs", clientMessageId: "m-1" });
+    // The id is optional — a caller that does not correlate deliveries omits it.
+    expect(normalizeSteerArgs({ prompt: "hi" })).toEqual({ prompt: "hi", clientMessageId: null });
+    expect(normalizeSteerArgs({ prompt: "hi", clientMessageId: "  " })).toEqual({ prompt: "hi", clientMessageId: null });
+    expect(() => normalizeSteerArgs({ prompt: "" })).toThrow(/prompt is required/);
+    expect(() => normalizeSteerArgs({ prompt: 42 })).toThrow(/prompt is required/);
+    expect(() => normalizeSteerArgs({ prompt: "hi", clientMessageId: 7 })).toThrow(/clientMessageId/);
+    expect(() => normalizeSteerArgs(null)).toThrow(/args must be an object/);
   });
 
   // ADR 0030 D4: the serve protocol negotiates via `protocolVersion` on
@@ -46,7 +70,7 @@ describe("serve protocol", () => {
 
   it("makeReady / makeEvent / makeResponse build valid server messages", () => {
     const ready = makeReady({ sessionId: "s1", version: "0.1.0" });
-    expect(ready).toEqual({ kind: "ready", sessionId: "s1", version: "0.1.0", protocolVersion: 1 });
+    expect(ready).toEqual({ kind: "ready", sessionId: "s1", version: "0.1.0", protocolVersion: 1, commands: COMMANDS });
     expect(isServerMessage(ready)).toBe(true);
 
     const event = makeEvent({ type: "turn.completed", round: 0, exitCode: 0 });

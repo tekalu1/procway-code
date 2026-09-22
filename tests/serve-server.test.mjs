@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import http from "node:http";
 import net from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -139,8 +140,9 @@ describe("serve server", () => {
     const messages = await collectMessages(ws, (msg) => msg && msg.kind === "ready");
     const ready = messages.find((m) => m.parsed?.kind === "ready").parsed;
     // protocolVersion is the serve-protocol negotiation field (ADR 0030 D4),
-    // independent of the package `version`.
-    expect(ready).toMatchObject({ kind: "ready", version: "0.1.0-alpha.1", protocolVersion: 1 });
+    // independent of the package `version`, which comes from package.json.
+    const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    expect(ready).toMatchObject({ kind: "ready", version, protocolVersion: 1 });
     expect(typeof ready.sessionId).toBe("string");
     ws.close();
   });

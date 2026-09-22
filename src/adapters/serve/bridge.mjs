@@ -1,3 +1,4 @@
+import { PACKAGE_VERSION } from "../../version.mjs";
 import {
   compactCommand,
   historyCommand,
@@ -13,14 +14,15 @@ import {
   validateListSessionsArgs,
   validateLoadSessionArgs,
   normalizeRunTurnAttachments,
+  normalizeSteerArgs,
   normalizeWakeItems
 } from "./protocol.mjs";
 
 /**
  * Bridge a WebSocket connection to an AgentSession. The bridge:
  *   1. forwards every event the session emits to the client as `{ kind: "event", event }`,
- *   2. interprets client commands (`runTurn`, `approve`, `compact`, `history`,
- *      `abort`, `listSessions`, `loadSession`) and replies with
+ *   2. interprets client commands (`runTurn`, `steer`, `approve`, `compact`,
+ *      `history`, `abort`, `listSessions`, `loadSession`) and replies with
  *      `{ kind: "response", id, ok, ... }`.
  *   3. tears down the subscription on `ws.close`, awaiting in-flight event-log
  *      flushes before resolving.
@@ -46,7 +48,7 @@ export function attachBridge({
   cwd = process.cwd(),
   settings = null,
   sessionFactory = null,
-  version = "0.1.0-alpha.1",
+  version = PACKAGE_VERSION,
   logger = null
 }) {
   if (!session) throw new TypeError("attachBridge: session is required");
@@ -298,6 +300,43 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
           logger(`bridge: wake received jobs=${items.length}${which} accepted=${accepted} deduped=${deduped}`);
         }
         ws.send(JSON.stringify(makeResponse({ id, ok: true, result: { queued: accepted > 0, accepted, deduped } })));
+        return;
+      }
+      case "steer": {
+        // A message the user typed WHILE this turn is running. Neither runTurn
+        // (rejected with turn_in_progress, payload lost) nor wake (a synthetic
+        // turn injected AFTER the current one) can reach the model mid-turn —
+        // this parks it on the session and the turn folds it in at its next
+        // round boundary, so the answer comes inside the same turn.
+        let steerArgs;
+        try {
+          steerArgs = normalizeSteerArgs(args);
+        } catch (error) {
+          ws.send(JSON.stringify(makeResponse({ id, ok: false, error: { code: "invalid_args", message: error?.message ?? String(error) } })));
+          return;
+        }
+        if (typeof state.session.steer !== "function" || state.session.runningTurn !== true) {
+          ws.send(JSON.stringify(makeResponse({
+            id,
+            ok: false,
+            error: { code: "no_active_turn", message: "No turn is running for this session." }
+          })));
+          return;
+        }
+        const queued = state.session.steer(steerArgs.prompt, { clientMessageId: steerArgs.clientMessageId });
+        if (!queued) {
+          // The turn ended between the check above and the call.
+          ws.send(JSON.stringify(makeResponse({
+            id,
+            ok: false,
+            error: { code: "no_active_turn", message: "No turn is running for this session." }
+          })));
+          return;
+        }
+        // "queued", NOT "the model has read it": the fold happens at the next
+        // round boundary and is announced by `user.prompt.submitted` with
+        // `steer: true` (or, if the turn dies first, by `steer.dropped`).
+        ws.send(JSON.stringify(makeResponse({ id, ok: true, result: { queued: true } })));
         return;
       }
       case "approve": {

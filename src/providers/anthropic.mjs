@@ -1,3 +1,4 @@
+import { createStreamRetryBudget, chargeStreamRetry, fetchStreamingWithRetry, isTransientStreamError, streamFrameError } from "./openai-compatible.mjs";
 import { applyPromptCacheBreakpoints, fromAnthropicContent, toAnthropicMessages, toAnthropicTools } from "./format/anthropic.mjs";
 import { parseToolArgs } from "./format/tool-args.mjs";
 import { parseSseStream } from "./sse.mjs";
@@ -12,6 +13,7 @@ export async function runAnthropicProvider({
   tools,
   prompt,
   fetchImpl = globalThis.fetch,
+  sleepImpl,
   stream = true,
   // The turn's AbortSignal (session.abort() / idle watchdog). Threaded into the
   // fetch AND the SSE read loop so a Stop tears the HTTP request down instead
@@ -68,7 +70,7 @@ export async function runAnthropicProvider({
   };
 
   if (stream && provider.stream !== false) {
-    return runStreaming({ endpoint, headers, body, fetchImpl, signal });
+    return runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider, signal });
   }
   return runNonStreaming({ endpoint, headers, body, fetchImpl, signal });
 }
@@ -105,17 +107,11 @@ async function runNonStreaming({ endpoint, headers, body, fetchImpl, signal }) {
   };
 }
 
-async function runStreaming({ endpoint, headers, body, fetchImpl, signal }) {
-  const response = await fetchImpl(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ...body, stream: true }),
-    ...(signal ? { signal } : {})
-  });
-  if (!response.ok) {
-    const errText = typeof response.text === "function" ? await response.text() : "";
-    throw new Error(`Provider request failed: ${response.status} ${response.statusText}\n${errText}`);
-  }
+async function runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, provider, signal }) {
+  const budget = createStreamRetryBudget(provider);
+  const request = { method: "POST", headers, body: JSON.stringify({ ...body, stream: true }), ...(signal ? { signal } : {}) };
+  const openResponse = () => fetchStreamingWithRetry({ endpoint, request, fetchImpl, sleepImpl, budget, signal });
+  const response = await openResponse();
 
   const sseEvents = [];
   /** @type {Array<{deltaText: string, raw: object}>} */
@@ -126,29 +122,47 @@ async function runStreaming({ endpoint, headers, body, fetchImpl, signal }) {
 
   const consumePromise = (async () => {
     try {
-      for await (const sse of parseSseStream(response.body, { signal })) {
-        sseEvents.push(sse);
-        if (sse?.type === "content_block_delta" && typeof sse?.delta?.type === "string") {
-          // Extended-thinking deltas stream as `thinking_delta` (text in
-          // `delta.thinking`) ahead of the visible answer. Tag them
-          // kind:"reasoning" so the orchestrator routes them to the live
-          // thinking view, matching the openai-codex contract.
-          if (sse.delta.type === "thinking_delta" && typeof sse.delta.thinking === "string" && sse.delta.thinking.length > 0) {
-            chunkBuffer.push({ deltaText: sse.delta.thinking, kind: "reasoning", raw: sse });
-            if (chunkResolver) {
-              const r = chunkResolver;
-              chunkResolver = null;
-              r();
-            }
-          } else if (sse.delta.type === "text_delta" && typeof sse.delta.text === "string" && sse.delta.text.length > 0) {
-            chunkBuffer.push({ deltaText: sse.delta.text, raw: sse });
-            if (chunkResolver) {
-              const r = chunkResolver;
-              chunkResolver = null;
-              r();
+      let current = response;
+      for (;;) {
+        sseEvents.length = 0;
+        let lastError = null;
+        let emittedDelta = false;
+        for await (const sse of parseSseStream(current.body, { signal })) {
+          lastError = sse?.type === "error" ? (sse.error ?? sse) : null;
+          if (lastError) break;
+          sseEvents.push(sse);
+          if (sse?.type === "content_block_delta" && typeof sse?.delta?.type === "string") {
+            // Extended-thinking deltas stream as `thinking_delta` (text in
+            // `delta.thinking`) ahead of the visible answer. Tag them
+            // kind:"reasoning" so the orchestrator routes them to the live
+            // thinking view, matching the openai-codex contract.
+            if (sse.delta.type === "thinking_delta" && typeof sse.delta.thinking === "string" && sse.delta.thinking.length > 0) {
+              emittedDelta = true;
+              chunkBuffer.push({ deltaText: sse.delta.thinking, kind: "reasoning", raw: sse });
+              if (chunkResolver) {
+                const r = chunkResolver;
+                chunkResolver = null;
+                r();
+              }
+            } else if (sse.delta.type === "text_delta" && typeof sse.delta.text === "string" && sse.delta.text.length > 0) {
+              emittedDelta = true;
+              chunkBuffer.push({ deltaText: sse.delta.text, raw: sse });
+              if (chunkResolver) {
+                const r = chunkResolver;
+                chunkResolver = null;
+                r();
+              }
             }
           }
         }
+
+        if (!lastError) break;
+        if (emittedDelta || signal?.aborted || budget.spent >= budget.max || !isTransientStreamError(lastError)) {
+          throw streamFrameError(lastError, "anthropic");
+        }
+        console.error(`[anthropic] stream failed after HTTP 200 (${streamFrameError(lastError, "anthropic").message}); retrying`);
+        await chargeStreamRetry(budget, sleepImpl, signal);
+        current = await openResponse();
       }
     } catch (error) {
       streamError = error;

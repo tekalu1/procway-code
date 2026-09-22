@@ -1,0 +1,9 @@
+# Per-Dockerfile ignore for docker/runtime/Dockerfile.docker.
+# BuildKit >=1.5 picks this up automatically when -f points at that Dockerfile.
+#
+# This image is a thin derivative of procway-code-runtime (everything else is
+# already baked into the base), so the ONLY file it needs from the repo is the
+# docker wrapper. Excluding everything else keeps the build context at a few KB
+# instead of the tens of MB the base image's context costs.
+*
+!docker/runtime/docker-wrapper.sh

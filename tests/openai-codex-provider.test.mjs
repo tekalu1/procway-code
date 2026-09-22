@@ -507,3 +507,168 @@ describe("runOpenAiCodexProvider (openai-codex-via-proxy)", () => {
     delete process.env.PROCWAY_PROXY_TOKEN;
   });
 });
+
+describe("runOpenAiCodexProvider (in-stream transient errors)", () => {
+  // Regression: the upstream answered HTTP 200 and then gave up mid-stream with
+  // "Our servers are currently overloaded. Please try again later." The HTTP
+  // retry loop never saw it (it only inspects the response headers), so the turn
+  // — and the whole run — failed on a condition that a re-send clears.
+  const overloadedFrame = {
+    event: "error",
+    data: {
+      type: "error",
+      code: "server_error",
+      message: "Our servers are currently overloaded. Please try again later."
+    }
+  };
+  const okFrames = [
+    { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "recovered" } },
+    { event: "response.completed", data: { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1 } } } }
+  ];
+
+  it("re-sends the request when the stream fails with an overloaded error before any output (non-streaming)", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return calls === 1 ? okResponse([overloadedFrame]) : okResponse(okFrames);
+    });
+    const result = await runOpenAiCodexProvider({
+      provider: baseProvider({ retryBaseDelayMs: 0 }),
+      prompt: "hi",
+      fetchImpl,
+      stream: false
+    });
+    expect(result.message.content).toBe("recovered");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-sends and yields the retried stream's deltas exactly once (streaming)", async () => {
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return calls === 1 ? okResponse([overloadedFrame]) : okResponse(okFrames);
+    });
+    const handle = await runOpenAiCodexProvider({
+      provider: baseProvider({ retryBaseDelayMs: 0 }),
+      prompt: "hi",
+      fetchImpl
+    });
+    const deltas = [];
+    for await (const chunk of handle.deltaStream) {
+      if (chunk.kind === "text") deltas.push(chunk.deltaText);
+    }
+    const final = await handle.finalize();
+    expect(deltas).toEqual(["recovered"]);
+    expect(final.message.content).toBe("recovered");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("shares one retry budget with the HTTP layer (a 503 handshake + a stream error do not multiply)", async () => {
+    const calls = [];
+    const fetchImpl = vi.fn(async () => {
+      calls.push(1);
+      if (calls.length === 1) return { ok: false, status: 503, statusText: "Service Unavailable", text: async () => "busy" };
+      if (calls.length === 2) return okResponse([overloadedFrame]);
+      return okResponse(okFrames);
+    });
+    const result = await runOpenAiCodexProvider({
+      provider: baseProvider({ retryBaseDelayMs: 0, maxRetries: 2 }),
+      prompt: "hi",
+      fetchImpl,
+      stream: false
+    });
+    // 1 handshake retry + 1 stream retry = the whole budget; the third attempt
+    // is the last one allowed, and it succeeded.
+    expect(result.message.content).toBe("recovered");
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("does NOT re-send a permanent error (invalid_request_error)", async () => {
+    const fetchImpl = vi.fn(async () =>
+      okResponse([
+        {
+          event: "response.failed",
+          data: {
+            type: "response.failed",
+            response: { error: { type: "invalid_request_error", message: "Please try again with a smaller prompt" } }
+          }
+        }
+      ])
+    );
+    await expect(
+      runOpenAiCodexProvider({ provider: baseProvider({ retryBaseDelayMs: 0 }), prompt: "x", fetchImpl, stream: false })
+    ).rejects.toThrow("openai-codex provider stream error: Please try again with a smaller prompt");
+    // The prose says "try again" but the machine-readable type is permanent —
+    // the permanent marker must win, or we burn tokens on a request that can
+    // never succeed.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT re-send once a delta has already reached the consumer", async () => {
+    // The consumer contract has no 'reset the stream' signal: the delta is
+    // already in the transcript, so a retry would duplicate the text.
+    const fetchImpl = vi.fn(async () =>
+      okResponse([
+        { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "half " } },
+        overloadedFrame
+      ])
+    );
+    const handle = await runOpenAiCodexProvider({
+      provider: baseProvider({ retryBaseDelayMs: 0 }),
+      prompt: "hi",
+      fetchImpl
+    });
+    const deltas = [];
+    for await (const chunk of handle.deltaStream) {
+      if (chunk.kind === "text") deltas.push(chunk.deltaText);
+    }
+    await expect(handle.finalize()).rejects.toThrow(/openai-codex provider stream error: Our servers are currently overloaded/);
+    expect(deltas).toEqual(["half "]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after maxRetries and keeps the original error wording, plus the attempt count", async () => {
+    const fetchImpl = vi.fn(async () => okResponse([overloadedFrame]));
+    await expect(
+      runOpenAiCodexProvider({
+        provider: baseProvider({ retryBaseDelayMs: 0, maxRetries: 1 }),
+        prompt: "x",
+        fetchImpl,
+        stream: false
+      })
+    ).rejects.toThrow(
+      "openai-codex provider stream error: Our servers are currently overloaded. Please try again later. (2 attempts)"
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the single-attempt wording byte-identical when no retry happened", async () => {
+    const fetchImpl = vi.fn(async () =>
+      okResponse([{ event: "response.failed", data: { type: "response.failed", response: { error: { message: "internal" } } } }])
+    );
+    await expect(
+      runOpenAiCodexProvider({ provider: baseProvider({ retryBaseDelayMs: 0 }), prompt: "x", fetchImpl, stream: false })
+    ).rejects.toThrow("openai-codex provider stream error: internal");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts immediately when Stop lands during the retry backoff", async () => {
+    // Without signal wiring in sleep(), a Stop pressed during the backoff waited
+    // out the full delay before anything noticed.
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(async () => okResponse([overloadedFrame]));
+    const pending = runOpenAiCodexProvider({
+      // Long enough that the rejection can only come from the abort.
+      provider: baseProvider({ retryBaseDelayMs: 5000, maxRetries: 3 }),
+      prompt: "x",
+      fetchImpl,
+      signal: controller.signal,
+      stream: false
+    });
+    const startedAt = Date.now();
+    setTimeout(() => controller.abort(new Error("stopped by user")), 50);
+    await expect(pending).rejects.toThrow("stopped by user");
+    expect(Date.now() - startedAt).toBeLessThan(4000);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});

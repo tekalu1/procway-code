@@ -714,3 +714,78 @@ describe("serve bridge — wake", () => {
     await bridge.detach();
   });
 });
+
+// The `steer` command — a message the user typed WHILE a turn is running.
+// Unlike runTurn (refused with turn_in_progress, payload lost) it is accepted
+// during a turn; unlike wake it is a real user utterance and is folded into
+// the RUNNING turn rather than injected as a later synthetic one.
+describe("serve bridge — steer", () => {
+  async function steerSession(sessionId) {
+    return createAgentSession({
+      settings: settingsForCliAgent(),
+      cwd,
+      sessionId,
+      events: new EventBus()
+    });
+  }
+
+  function sendSteer(ws, id, args) {
+    ws.emit("message", JSON.stringify({ kind: "command", command: "steer", id, args }));
+  }
+
+  function responseFor(ws, id) {
+    return ws.sent.map((raw) => JSON.parse(raw)).find((m) => m.id === id);
+  }
+
+  it("parks the message on the running turn and acks queued", async () => {
+    const session = await steerSession("bridge-steer-1");
+    // Simulate an in-flight turn (the real one is driven by the WS client).
+    session.runningTurn = true;
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendSteer(ws, "S1", { prompt: "and check the logs too", clientMessageId: "m-7" });
+    await waitFor(() => responseFor(ws, "S1"));
+
+    expect(responseFor(ws, "S1")).toMatchObject({ kind: "response", ok: true, result: { queued: true } });
+    // "queued", not "read": the fold happens at the turn's next round boundary.
+    expect(session.pendingSteer).toEqual([{ prompt: "and check the logs too", clientMessageId: "m-7" }]);
+
+    session.runningTurn = false;
+    await bridge.detach();
+  });
+
+  it("answers no_active_turn when nothing is running", async () => {
+    const session = await steerSession("bridge-steer-2");
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendSteer(ws, "S2", { prompt: "hello", clientMessageId: "m-8" });
+    await waitFor(() => responseFor(ws, "S2"));
+
+    expect(responseFor(ws, "S2")).toMatchObject({ ok: false, error: { code: "no_active_turn" } });
+    expect(session.pendingSteer).toHaveLength(0);
+    await bridge.detach();
+  });
+
+  it("answers invalid_args for a malformed steer", async () => {
+    const session = await steerSession("bridge-steer-3");
+    session.runningTurn = true;
+    const ws = fakeWs();
+    const bridge = attachBridge({ session, ws, version: "0.0.1" });
+    ws.sent.length = 0;
+
+    sendSteer(ws, "S3", { prompt: "" });
+    sendSteer(ws, "S4", { prompt: "ok", clientMessageId: 42 });
+    await waitFor(() => responseFor(ws, "S3") && responseFor(ws, "S4"));
+
+    expect(responseFor(ws, "S3")).toMatchObject({ ok: false, error: { code: "invalid_args" } });
+    expect(responseFor(ws, "S4")).toMatchObject({ ok: false, error: { code: "invalid_args" } });
+    expect(session.pendingSteer).toHaveLength(0);
+
+    session.runningTurn = false;
+    await bridge.detach();
+  });
+});

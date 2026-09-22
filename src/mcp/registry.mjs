@@ -76,7 +76,6 @@ export class McpToolRegistry {
           function: {
             name: prefixedName,
             description: `[MCP ${serverId}] ${tool.description ?? ""}`,
-            input_schema: tool.inputSchema ?? tool.parameters ?? {},
             parameters: tool.inputSchema ?? tool.parameters ?? {}
           }
         });

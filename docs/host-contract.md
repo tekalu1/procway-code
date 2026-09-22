@@ -237,8 +237,10 @@ path → 404, non-WebSocket upgrade → 400.
 - client → server: `command` (`{kind:"command", command, id?, args?}`)
 
 **COMMANDS**: `runTurn`, `approve`, `interaction.resolve`, `compact`, `history`,
-`abort`, `listSessions`, `loadSession`, `wake`. Unknown commands / invalid JSON are
-ignored at the parse layer. `runTurn` accepts up to 16 attachments
+`abort`, `listSessions`, `loadSession`, `wake`, `steer`. Unknown commands / invalid
+JSON are ignored at the parse layer — **no response frame is sent**, so a host
+must not tell "unsupported" from "slow" by waiting. Gate on the `commands` list
+the `ready` frame carries (below). `runTurn` accepts up to 16 attachments
 `[{id, mime?, name?}]` — ids are host attachment ids fetched over HTTP
 (§1 `PROCWAY_DASHBOARD_URL`), never read from a shared volume.
 
@@ -305,14 +307,60 @@ the HOST's registry, not in this process, so the host must push that settle back
 - The ack means "queued", not "the model has read it": the wake turn is injected
   later, detached, after a short coalescing window.
 
+**`steer` — a message the user typed WHILE a turn is running.** `runTurn` would be
+refused (`turn_in_progress`) and the text lost; `wake` is a synthetic turn injected
+*after* the current one. `steer` parks the message on the running turn and the turn
+folds it into the conversation at its next round boundary (before a model round,
+right after the previous round's tool results), so the model answers it **inside
+that turn**.
+
+```jsonc
+// client → server
+{ "kind": "command", "id": "<uuid>", "command": "steer", "args": {
+    "prompt": "and check the logs too",   // required, non-empty (same rule as runTurn)
+    "clientMessageId": "<host message id>" // optional; echoed back on delivery
+} }
+
+// server → client
+{ "kind": "response", "id": "<uuid>", "ok": true,  "result": { "queued": true } }
+{ "kind": "response", "id": "<uuid>", "ok": false, "error": { "code": "no_active_turn", "message": "…" } }
+{ "kind": "response", "id": "<uuid>", "ok": false, "error": { "code": "invalid_args",  "message": "…" } }
+```
+
+- **The ack means "parked", not "the model has read it."** Delivery is announced
+  separately, by the `user.prompt.submitted` event that carries `steer: true` and
+  the `clientMessageId` the host sent. A host that shows "delivered" on the ack
+  will show it too early.
+- `no_active_turn` means there was nothing to steer — send the message as a normal
+  `runTurn` instead. It is the expected answer for a session sitting idle, and for
+  a turn that is parked waiting on an approval / a user interaction.
+- Messages are folded in arrival order, and are ordinary user messages in the
+  transcript and the snapshot (no `wake` mark): a reload shows them in the place
+  they were read, between the tool results and the answer.
+- **A turn that dies before the next boundary drops what it parked** and says so
+  with a `steer.dropped` event `{ reason: "interrupted" | "turn_failed" |
+  "tool_loop_exceeded", count, clientMessageIds }`. The host is then responsible
+  for re-sending those ids. `steer.dropped` may arrive AFTER the turn's
+  `turn.failed` / `turn.completed`, so do not route it through per-turn state that
+  the terminal event tears down. A turn that merely *pauses* (deferred user interaction,
+  parked approval) keeps them: the round that resumes it folds them in.
+- If the model produces a final answer without calling a tool while a message is
+  parked, the turn takes **one more model round** to answer it rather than ending.
+  That extra round counts against `tools.maxToolRounds` like any other.
+
 **Ready handshake & versioning.** Immediately after the upgrade the server sends:
 
 ```json
-{ "kind": "ready", "sessionId": "<id>", "version": "<package version>", "protocolVersion": 1 }
+{ "kind": "ready", "sessionId": "<id>", "version": "<package version>",
+  "protocolVersion": 1, "commands": ["runTurn", "…", "steer"] }
 ```
 
 - `protocolVersion` (integer, currently **1**) is the protocol contract;
   `version` is the package version, informational only.
+- `commands` is the capability list. Commands added after the first release
+  (`steer`) must be gated on it: an agent that does not know a command answers
+  nothing at all. Treat a `ready` **without** `commands` (pre-capability agents)
+  as "only the original set exists" and fall back rather than waiting for a reply.
 - Compat policy: backward-compatible additions (new commands, new fields on
   existing messages) keep the number; breaking changes (message shapes,
   semantics of existing COMMANDS) bump it.

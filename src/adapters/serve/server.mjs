@@ -7,6 +7,7 @@ import { loadSessionState } from "../../session/store.mjs";
 import { compareTokens, extractTokenFromUrl, readAuthToken } from "./auth.mjs";
 import { attachBridge } from "./bridge.mjs";
 import { WsConnection, buildHandshakeResponse } from "./ws-server.mjs";
+import { PACKAGE_VERSION } from "../../version.mjs";
 
 const PUBLIC_HOSTS = new Set(["0.0.0.0", "::", "::0"]);
 
@@ -46,7 +47,7 @@ export async function startServer({
   onWarn = null,
   onLog = null,
   sessionFactory = defaultSessionFactory,
-  version = "0.1.0-alpha.1"
+  version = PACKAGE_VERSION
 } = {}) {
   const authToken = token ?? readAuthToken();
   if (!authToken) {

@@ -1,0 +1,82 @@
+# Publish to npm when a version tag is pushed.
+#
+#   git tag v0.1.0-alpha.3 && git push origin v0.1.0-alpha.3
+#
+# The tag must match `version` in package.json and point at a commit on main.
+# A pre-release version (`-alpha.N`) goes out under its pre-release dist-tag
+# (`alpha`); a plain version goes out under `latest`.
+#
+# Authentication is npm trusted publishing (OIDC): no npm token is stored in
+# this repository. The trusted publisher is configured on npmjs.com for this
+# repository and this workflow file name, so renaming the file breaks publish.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: npm publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # npm trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag against package.json and main
+        id: meta
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not point at a commit on main"
+            exit 1
+          fi
+          case "$version" in
+            *-*) pre="${version#*-}"; dist_tag="${pre%%.*}"; prerelease=true ;;
+            *)   dist_tag=latest; prerelease=false ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=${dist_tag}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+      - name: Install pnpm
+        # Version comes from `packageManager` in package.json.
+        uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm >= 11.5.1; early Node 24 builds bundle older.
+      - run: npm install -g npm@^11.5.1
+
+      - run: pnpm install --frozen-lockfile
+
+      # `prepublishOnly` runs `pnpm test && pnpm lint` before anything uploads.
+      - name: Publish
+        run: npm publish --provenance --access public --tag "${{ steps.meta.outputs.dist_tag }}"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--generate-notes --verify-tag)
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "${GITHUB_REF_NAME}" "${flags[@]}"

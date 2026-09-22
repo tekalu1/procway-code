@@ -232,7 +232,95 @@ if [ "${nvm_seeded}" != "1" ] && [ -s "${NVM_SNAPSHOT}/nvm.sh" ]; then
   seed_nvm_background &
 fi
 
-# ----- 1b. Profile setup script (ADR 0033 §D3) -------------------------------
+# ----- 1b. dockerd (ADR 0040 §D6) -------------------------------------------
+# PROCWAY_DOCKER_ENABLED=1 is the ONLY switch (the engine stamps it from the
+# `dockerEnabled` profile axis). Unset ⇒ this whole block is a no-op, so the
+# default image and every existing session behave exactly as before.
+#
+# Starts in the BACKGROUND, like the setup script below: dockerd takes seconds to
+# come up and the dashboard's readiness gate is the serve probe, so it must not
+# sit on the cold-start critical path. Everything is FAIL-SOFT — a dockerd that
+# refuses to start leaves a LIVE session plus a logged reason, never a dead Pod.
+# That is why DOCKERD_PID is deliberately absent from the `wait -n` list in §6.
+#
+# --iptables=false --ip6tables=false is mandatory, not a preference: gVisor's
+# netstack implements no NAT targets at all, so docker's bridge driver cannot
+# install its rules and the daemon aborts during startup. The consequences (no
+# outbound from the default bridge, no service-name DNS) are absorbed and
+# announced by the `docker` wrapper baked into the docker-enabled image.
+DOCKERD_PID=""
+DOCKERD_READY_MARKER="/tmp/.procway-dockerd-ready"
+
+start_dockerd() {
+  local data_root="${PROCWAY_DOCKER_DATA_ROOT:-/var/lib/docker}"
+  local state_dir="${HOME:-/home/procway}/.procway"
+  local log_file="${state_dir}/dockerd.log"
+  if ! mkdir -p "$state_dir" 2>/dev/null; then
+    log "warn: dockerd skipped (${state_dir} not writable — nowhere to keep dockerd.log)"
+    return 0
+  fi
+  # The engine mounts the session PVC's `docker-root` subPath here (ADR 0040 §D5).
+  # Without that mount this path is on the read-only rootfs, and dockerd would
+  # die on its first write — check up front so the log names the real cause.
+  if ! mkdir -p "$data_root" 2>/dev/null || [ ! -w "$data_root" ]; then
+    log "warn: dockerd skipped (${data_root} not writable — the PVC subPath 'docker-root' is not mounted)"
+    return 0
+  fi
+  log "starting dockerd (data-root ${data_root}, log ${log_file})"
+  echo "=== dockerd start $(date -Is 2>/dev/null) data-root=${data_root} ===" >> "$log_file" 2>&1
+  # dockerd is backgrounded DIRECTLY (not wrapped in a `{ … } &` group) so that
+  # DOCKERD_PID is dockerd's own pid: the §6 trap kills that pid, and a SIGTERM
+  # sent to a wrapper subshell would not reach the daemon — it would be orphaned
+  # with its overlay2 state unflushed.
+  # --feature containerd-snapshotter=false は «必須»。docker 29 の既定である
+  # containerd イメージストアは gVisor 下でイメージ書き出しに失敗する:
+  #   failed to open writer: ref moby/1/... locked for 37ms: unavailable
+  # 本番ノード（k3s / VM）で再現し、classic overlay2 に切り替えると通った。
+  # gVisor 公式も Docker v29+ には «tmpfs を /var/lib/docker に張る» か
+  # «containerd-snapshotter=false» のどちらかを要求している。前者はイメージ層で
+  # メモリ上限を食い潰すので採れない（ADR 0040 §D5）。
+  # ⚠️ ローカル(k3d/WSL2)では既定のままでもビルドが通ってしまい、本番でだけ落ちた。
+  #    タイミング依存の競合らしく «ローカルで緑» は根拠にならない。
+  dockerd --data-root "$data_root" --iptables=false --ip6tables=false \
+    --feature containerd-snapshotter=false >> "$log_file" 2>&1 &
+  DOCKERD_PID=$!
+}
+
+# Readiness poll, also in the background. It writes a marker on tmpfs (per Pod
+# boot, NOT on the PVC) so the setup script below can wait for a usable daemon
+# instead of racing it — a setup script doing `docker pull` on a cold session
+# would otherwise fail on "cannot connect to the Docker daemon" ~always.
+wait_dockerd_ready_background() {
+  local log_file="${HOME:-/home/procway}/.procway/dockerd.log"
+  local i
+  for i in $(seq 1 60); do
+    if ! kill -0 "$DOCKERD_PID" 2>/dev/null; then
+      log "warn: dockerd exited during startup — see ${log_file} (session continues WITHOUT docker)"
+      return 0
+    fi
+    if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+      : > "$DOCKERD_READY_MARKER" 2>/dev/null || true
+      log "dockerd ready (server $(docker version --format '{{.Server.Version}}' 2>/dev/null))"
+      return 0
+    fi
+    sleep 1
+  done
+  log "warn: dockerd not ready within 60s — see ${log_file} (session continues WITHOUT docker)"
+}
+
+if [ "${PROCWAY_DOCKER_ENABLED:-}" = "1" ]; then
+  if command -v dockerd >/dev/null 2>&1; then
+    start_dockerd
+    [ -n "$DOCKERD_PID" ] && wait_dockerd_ready_background &
+  else
+    # Naming the exact misconfiguration matters: `dockerEnabled` (the profile
+    # axis) and the image are INDEPENDENT by design (ADR 0040 §D1), so this is
+    # the one combination that looks enabled but can never work.
+    log "warn: PROCWAY_DOCKER_ENABLED=1 but dockerd is absent — this is the DEFAULT runtime image; the profile must also select the docker-enabled image (ADR 0040 §D4)"
+  fi
+fi
+
+# ----- 1c. Profile setup script (ADR 0033 §D3) -------------------------------
 # PROCWAY_SETUP_SCRIPT_B64 carries the profile-resolved setup script (base64).
 # Runs in the BACKGROUND after serve (off the cold-start critical path), ONCE
 # per PVC: the marker under $HOME/.procway (home-dotprocway PVC subPath) is
@@ -262,6 +350,18 @@ run_setup_script_background() {
   if [ -f "$marker" ]; then
     log "setup-script: already ran for hash ${hash} (skip)"
     rm -f "$script_file"; return 0
+  fi
+  # A docker-enabled session's setup script is the natural place to `docker pull`
+  # base images, and both this and dockerd start in the background — so wait for
+  # the readiness marker (§1b) first. Bounded: if dockerd never came up the
+  # marker never appears, we lose 60s and the script still runs (fail-soft, and
+  # §1b has already logged why docker is missing).
+  if [ "${PROCWAY_DOCKER_ENABLED:-}" = "1" ]; then
+    local w
+    for w in $(seq 1 60); do
+      [ -f "$DOCKERD_READY_MARKER" ] && break
+      sleep 1
+    done
   fi
   local timeout_s="${PROCWAY_SETUP_SCRIPT_TIMEOUT:-600}"
   log "setup-script: running (hash ${hash}, timeout ${timeout_s}s, log ${log_file})"
@@ -352,7 +452,10 @@ NOVNC_PID=$!
 log "boot sequence complete (serve started first; desktop stack up)"
 
 # ----- 6. Wait & propagate exit --------------------------------------------
-trap 'log "received signal, terminating children"; kill ${AGENT_PID} ${NOVNC_PID} ${VNC_PID} ${OPENBOX_PID} ${XVFB_PID} 2>/dev/null || true' INT TERM
+# DOCKERD_PID is included so dockerd gets a SIGTERM and flushes its overlay2
+# state to the PVC on a graceful stop; it stays OUT of the `wait -n` list below
+# because its death must NOT tear the session down (ADR 0040 §D6 fail-soft).
+trap 'log "received signal, terminating children"; kill ${AGENT_PID} ${NOVNC_PID} ${VNC_PID} ${OPENBOX_PID} ${XVFB_PID} ${DOCKERD_PID:-} 2>/dev/null || true' INT TERM
 
 # `wait -n` returns when the first child exits. That child names which
 # subsystem died; report it before tearing the rest down.
@@ -377,6 +480,6 @@ for entry in \
 done
 
 log "shutting down remaining children"
-kill "${AGENT_PID}" "${NOVNC_PID}" "${VNC_PID}" "${OPENBOX_PID}" "${XVFB_PID}" 2>/dev/null || true
+kill "${AGENT_PID}" "${NOVNC_PID}" "${VNC_PID}" "${OPENBOX_PID}" "${XVFB_PID}" ${DOCKERD_PID:-} 2>/dev/null || true
 wait || true
 exit "${EXIT_CODE}"

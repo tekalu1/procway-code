@@ -1,7 +1,7 @@
 import { getValidCredentials } from "../auth/refresh-guard.mjs";
 import { messageContentToText } from "../core/types/message.mjs";
 import { parseSseStream } from "./sse.mjs";
-import { ProviderRequestError, isRetryableNetworkError } from "./openai-compatible.mjs";
+import { ProviderRequestError, isRetryableNetworkError, isTransientStreamError } from "./openai-compatible.mjs";
 import { normalizeReasoningEffort } from "./reasoning.mjs";
 import { isInlineImageBlock, imageBlockToDataUrl } from "./image-hydration.mjs";
 import { llmFetch } from "./llm-fetch.mjs";
@@ -25,7 +25,7 @@ const ZERO_USAGE = Object.freeze({ inputTokens: 0, outputTokens: 0 });
  * 401 (one retry).
  *
  * @param {object} args
- * @param {{ type: "openai-codex"; authProfile?: string; baseUrl?: string; defaultModel?: string; clientVersion?: string; originator?: string; maxRetries?: number }} args.provider
+ * @param {{ type: "openai-codex"; authProfile?: string; baseUrl?: string; defaultModel?: string; clientVersion?: string; originator?: string; maxRetries?: number; retryBaseDelayMs?: number }} args.provider
  * @param {string} [args.model]
  * @param {string} [args.prompt]
  * @param {Array<object>} [args.messages]
@@ -113,39 +113,84 @@ export async function runOpenAiCodexProvider({
         Accept: "text/event-stream"
       });
 
-  const response = await fetchWithAuthRetry({
+  // ONE retry budget for the whole call. The upstream can refuse in two
+  // places — before the headers (429/5xx → fetchWithAuthRetry) or, having
+  // already answered 200, as a `response.failed` / `error` frame inside the
+  // SSE body ("Our servers are currently overloaded. Please try again later.",
+  // observed in production). Both are the same transient condition, so they
+  // draw down a single budget instead of multiplying into (maxRetries+1)^2
+  // requests.
+  const budget = createRetryBudget(provider.maxRetries ?? 2, provider.retryBaseDelayMs ?? 1000);
+  const openResponse = () => fetchWithAuthRetry({
     profileId,
     url,
     body,
     buildHeaders,
     fetchImpl,
     signal,
-    maxRetries: provider.maxRetries ?? 2,
+    budget,
     viaProxy
   });
 
-  return stream ? runStreaming(response) : runNonStreaming(response);
+  // The first attempt is awaited here (not inside the stream consumer) so a
+  // fatal HTTP failure still rejects this call itself — the turn orchestrator
+  // relies on that to avoid emitting `assistant.message.started` for a turn
+  // that never opened.
+  const response = await openResponse();
+
+  return stream
+    ? runStreaming({ response, openResponse, budget, signal })
+    : runNonStreaming({ response, openResponse, budget, signal });
 }
 
-async function fetchWithAuthRetry({ profileId, url, body, buildHeaders, fetchImpl, signal, maxRetries, viaProxy = false }) {
+/**
+ * Retry budget shared by the HTTP handshake and the SSE body.
+ * `spent` doubles as the exponent for {@link backoffMs}, so the delay sequence
+ * is unchanged (1s, 2s, …) no matter which layer consumed the attempt.
+ */
+function createRetryBudget(maxRetries, baseDelayMs) {
+  return {
+    spent: 0,
+    max: Math.max(0, Number(maxRetries) || 0),
+    baseDelayMs: Number.isFinite(Number(baseDelayMs)) ? Number(baseDelayMs) : 1000
+  };
+}
+
+function budgetAvailable(budget) {
+  return budget.spent < budget.max;
+}
+
+/** Back off for this attempt, then charge it to the budget. Aborts promptly. */
+async function chargeBudget(budget, signal) {
+  await sleep(backoffMs(budget.spent, budget.baseDelayMs), signal);
+  budget.spent += 1;
+}
+
+async function fetchWithAuthRetry({ profileId, url, body, buildHeaders, fetchImpl, signal, budget, viaProxy = false }) {
   // via-proxy mode carries no local credentials — the dashboard broker injects
   // them. Skip OAuth resolution and the 401 force-refresh dance entirely.
   let credentials = viaProxy ? null : await getValidCredentials(profileId);
   let forceRefreshed = false;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+  // Unbounded-looking, but every `continue` is bounded: the retrying paths all
+  // charge the shared budget first, and the 401 branch is gated by
+  // `forceRefreshed` so it can fire at most once.
+  for (;;) {
+    throwIfAborted(signal);
     let response;
     const startedAt = Date.now();
+    const attemptNo = budget.spent;
     try {
       response = await fetchImpl(url, { method: "POST", headers: buildHeaders(credentials), body, signal });
     } catch (error) {
-      if (attempt >= maxRetries || !isRetryableNetworkError(error)) throw error;
+      throwIfAborted(signal);
+      if (!budgetAvailable(budget) || !isRetryableNetworkError(error)) throw error;
       // Diagnostic for the recurring ~300s stalls: surfaces how long the
       // attempt waited and which undici error fired (e.g. UND_ERR_HEADERS_TIMEOUT
       // ≈ a hung connection that never sent headers) before we retry.
       const code = error?.code ?? error?.cause?.code ?? error?.name ?? "unknown";
-      console.error(`[openai-codex] request attempt ${attempt} failed after ${Date.now() - startedAt}ms (${code}); retrying`);
-      await sleep(backoffMs(attempt));
+      console.error(`[openai-codex] request attempt ${attemptNo} failed after ${Date.now() - startedAt}ms (${code}); retrying`);
+      await chargeBudget(budget, signal);
       continue;
     }
 
@@ -162,6 +207,8 @@ async function fetchWithAuthRetry({ profileId, url, body, buildHeaders, fetchImp
           retryable: false
         });
       }
+      // A token refresh is not a transient upstream failure — it costs no
+      // retry budget and no backoff.
       continue;
     }
 
@@ -169,8 +216,8 @@ async function fetchWithAuthRetry({ profileId, url, body, buildHeaders, fetchImp
 
     const text = await response.text();
     const retryable = isRetryableStatus(response.status);
-    if (retryable && attempt < maxRetries) {
-      await sleep(backoffMs(attempt));
+    if (retryable && budgetAvailable(budget)) {
+      await chargeBudget(budget, signal);
       continue;
     }
     throw new ProviderRequestError({
@@ -180,7 +227,6 @@ async function fetchWithAuthRetry({ profileId, url, body, buildHeaders, fetchImp
       retryable
     });
   }
-  throw new Error("openai-codex provider: retry loop exhausted without resolution");
 }
 
 /**
@@ -294,12 +340,17 @@ function applyEvent(state, event) {
   }
 }
 
-function buildFinalResult(state) {
+function buildFinalResult(state, { attempts = 1 } = {}) {
   if (state.lastError) {
     const message = typeof state.lastError.message === "string"
       ? state.lastError.message
       : JSON.stringify(state.lastError);
-    throw new Error(`openai-codex provider stream error: ${message}`);
+    // Keep the historical prefix + message verbatim (log greps and the
+    // dashboard's failure copy match on it); only append the attempt count,
+    // and only when we actually retried, so the single-attempt text is
+    // byte-identical to before.
+    const suffix = attempts > 1 ? ` (${attempts} attempts)` : "";
+    throw new Error(`openai-codex provider stream error: ${message}${suffix}`);
   }
   const toolCalls = [...state.toolCallsByIndex.entries()]
     .sort((a, b) => a[0] - b[0])
@@ -337,16 +388,58 @@ function buildFinalResult(state) {
   };
 }
 
-async function runNonStreaming(response) {
-  const state = createAggregator();
-  for await (const event of parseSseStream(response.body)) {
-    applyEvent(state, event);
-  }
-  return buildFinalResult(state);
+/**
+ * Decide whether a finished-but-failed stream is worth re-sending.
+ *
+ * `emittedDelta` is the load-bearing guard. The consumer contract
+ * (`{ deltaStream, finalize }`, drained by turn-orchestrator) has NO way to
+ * say "discard what I already gave you": every text/reasoning delta is
+ * forwarded straight to `assistant.message.delta` /
+ * `assistant.reasoning.delta` and is already on the user's screen. Re-running
+ * the request after that would replay the answer from the top and the viewer
+ * would see the text twice. So we only retry BEFORE the first visible delta —
+ * which is exactly where the production failure lands, because an overloaded
+ * upstream refuses at the head of the stream, before any token is produced.
+ * Heartbeats and tool-call argument deltas do not count: neither reaches the
+ * transcript (heartbeats become `activity.tick`; tool args are only read from
+ * the aggregate at `finalize()`).
+ */
+function shouldRetryStream({ state, emittedDelta, budget, signal }) {
+  if (!state.lastError) return false;
+  if (emittedDelta) return false;
+  if (signal?.aborted) return false;
+  if (!budgetAvailable(budget)) return false;
+  return isTransientStreamError(state.lastError);
 }
 
-function runStreaming(response) {
-  const state = createAggregator();
+function describeStreamError(lastError) {
+  return typeof lastError?.message === "string" ? lastError.message : JSON.stringify(lastError);
+}
+
+async function runNonStreaming({ response, openResponse, budget, signal }) {
+  let current = response;
+  let attempts = 1;
+  for (;;) {
+    const state = createAggregator();
+    for await (const event of parseSseStream(current.body)) {
+      applyEvent(state, event);
+    }
+    // Nothing was handed to a consumer on this path, so `emittedDelta` is
+    // always false — any transient in-stream failure is safe to re-send.
+    if (!shouldRetryStream({ state, emittedDelta: false, budget, signal })) {
+      return buildFinalResult(state, { attempts });
+    }
+    console.error(`[openai-codex] stream failed after HTTP 200 (${describeStreamError(state.lastError)}); retrying`);
+    await chargeBudget(budget, signal);
+    current = await openResponse();
+    attempts += 1;
+  }
+}
+
+function runStreaming({ response, openResponse, budget, signal }) {
+  /** @type {ReturnType<typeof createAggregator>} */
+  let state = createAggregator();
+  let attempts = 1;
   const chunkBuffer = [];
   let chunkResolver = null;
   let streamDone = false;
@@ -373,17 +466,31 @@ function runStreaming(response) {
     }
   };
   const consumePromise = (async () => {
+    let current = response;
     try {
-      for await (const event of parseSseStream(response.body)) {
-        const delta = applyEvent(state, event);
-        if (delta) {
-          pushChunk({ deltaText: delta.deltaText, kind: delta.kind, raw: event });
-        } else if (Date.now() - lastChunkAt >= HEARTBEAT_THROTTLE_MS) {
-          // A non-delta frame (keepalive / tool-arg delta / item.added / …) —
-          // proof of life. Throttle so a chatty stream doesn't flood the event
-          // log; one bump per 5s is ample for a 90s+ watchdog.
-          pushChunk({ kind: "heartbeat", raw: event });
+      for (;;) {
+        // Fresh aggregator per attempt: a retried request replays the answer
+        // from scratch, so carrying the failed attempt's partial text over
+        // would duplicate it in the final message.
+        state = createAggregator();
+        let emittedDelta = false;
+        for await (const event of parseSseStream(current.body)) {
+          const delta = applyEvent(state, event);
+          if (delta) {
+            emittedDelta = true;
+            pushChunk({ deltaText: delta.deltaText, kind: delta.kind, raw: event });
+          } else if (Date.now() - lastChunkAt >= HEARTBEAT_THROTTLE_MS) {
+            // A non-delta frame (keepalive / tool-arg delta / item.added / …) —
+            // proof of life. Throttle so a chatty stream doesn't flood the event
+            // log; one bump per 5s is ample for a 90s+ watchdog.
+            pushChunk({ kind: "heartbeat", raw: event });
+          }
         }
+        if (!shouldRetryStream({ state, emittedDelta, budget, signal })) break;
+        console.error(`[openai-codex] stream failed after HTTP 200 (${describeStreamError(state.lastError)}); retrying`);
+        await chargeBudget(budget, signal);
+        current = await openResponse();
+        attempts += 1;
       }
     } catch (error) {
       streamError = error;
@@ -416,7 +523,7 @@ function runStreaming(response) {
     finalize: async () => {
       await consumePromise;
       if (streamError) throw streamError;
-      return buildFinalResult(state);
+      return buildFinalResult(state, { attempts });
     }
   };
 }
@@ -720,10 +827,35 @@ function isRetryableStatus(status) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
-function backoffMs(attempt) {
-  return 1000 * 2 ** attempt;
+function backoffMs(attempt, baseMs = 1000) {
+  return baseMs * 2 ** attempt;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Rethrow the abort reason (the unified interrupt Error) when the turn was
+ *  cancelled, so no retry loop re-issues a request the user stopped. */
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+}
+
+/**
+ * Backoff sleep that a Stop cuts short. Without the signal wiring, pressing
+ * Stop during a retry backoff left the user waiting out the full delay before
+ * the abort was noticed.
+ */
+function sleep(ms, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Aborted"));
+  if (!signal || typeof signal.addEventListener !== "function") {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("Aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

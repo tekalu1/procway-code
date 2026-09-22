@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ProviderRequestError, isRetryableNetworkError, runOpenAiCompatibleProvider } from "../src/providers/openai-compatible.mjs";
+import { ProviderRequestError, isRetryableNetworkError, isTransientStreamError, runOpenAiCompatibleProvider } from "../src/providers/openai-compatible.mjs";
 
 describe("runOpenAiCompatibleProvider", () => {
   it("posts chat completions request and returns message content (non-streaming)", async () => {
@@ -427,5 +427,39 @@ describe("runOpenAiCompatibleProvider (openai-via-proxy)", () => {
     // The broker strips this inbound token and attaches the real Bearer upstream.
     expect(fetchImpl.mock.calls[0][1].headers.Authorization).toBe("Bearer sess-secret");
     delete process.env.PROCWAY_PROXY_TOKEN;
+  });
+});
+
+describe("isTransientStreamError", () => {
+  // Errors that arrive INSIDE an open SSE stream never reach the HTTP retry
+  // paths — this predicate is the only thing that can tell a re-sendable
+  // "overloaded" from a request that is simply wrong.
+  it("accepts the known transient markers", () => {
+    expect(isTransientStreamError({ code: "server_error", message: "oops" })).toBe(true);
+    expect(isTransientStreamError({ code: "rate_limit_exceeded" })).toBe(true);
+    expect(isTransientStreamError({ type: "overloaded_error" })).toBe(true);
+    expect(isTransientStreamError({ type: "rate_limit_error" })).toBe(true);
+    expect(isTransientStreamError({ status: 503 })).toBe(true);
+    expect(isTransientStreamError({ status: 429 })).toBe(true);
+  });
+
+  it("accepts the bare production message with no machine code", () => {
+    expect(isTransientStreamError({
+      message: "Our servers are currently overloaded. Please try again later."
+    })).toBe(true);
+  });
+
+  it("rejects permanent errors even when the prose sounds retryable", () => {
+    expect(isTransientStreamError({ type: "invalid_request_error", message: "try again later" })).toBe(false);
+    expect(isTransientStreamError({ code: "context_length_exceeded", message: "overloaded" })).toBe(false);
+    expect(isTransientStreamError({ code: "invalid_api_key" })).toBe(false);
+    expect(isTransientStreamError({ status: 400, message: "bad tool schema" })).toBe(false);
+  });
+
+  it("rejects anything unrecognized (a wrong retry costs a billed request)", () => {
+    expect(isTransientStreamError({ message: "something went wrong" })).toBe(false);
+    expect(isTransientStreamError({ type: "response.failed" })).toBe(false);
+    expect(isTransientStreamError(null)).toBe(false);
+    expect(isTransientStreamError("overloaded")).toBe(false);
   });
 });

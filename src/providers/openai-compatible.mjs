@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { normalizeOpenAiContent, normalizeOpenAiToolCalls, toOpenAiMessages } from "./format/openai.mjs";
 import { parseSseStream } from "./sse.mjs";
 import { normalizeReasoningEffort } from "./reasoning.mjs";
@@ -89,15 +90,16 @@ async function runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, pro
     body: JSON.stringify({ ...body, stream: true, stream_options: { include_usage: true } }),
     ...(signal ? { signal } : {})
   };
-  const response = await fetchStreamingWithRetry({
+  const budget = createStreamRetryBudget(provider);
+  const openResponse = () => fetchStreamingWithRetry({
     endpoint,
     request,
     fetchImpl,
     sleepImpl,
     signal,
-    maxRetries: provider.maxRetries ?? 2,
-    retryBaseDelayMs: provider.retryBaseDelayMs ?? 1000
+    budget
   });
+  const response = await openResponse();
 
   const sseEvents = [];
   const chunkBuffer = [];
@@ -107,30 +109,48 @@ async function runStreaming({ endpoint, headers, body, fetchImpl, sleepImpl, pro
 
   const consumePromise = (async () => {
     try {
-      for await (const sse of parseSseStream(response.body, { signal })) {
-        sseEvents.push(sse);
-        // Reasoning ("thinking") deltas arrive out of band before visible
-        // output. Tag them with kind:"reasoning" so the turn orchestrator
-        // routes them to assistant.reasoning.delta and the dashboard renders
-        // the live thinking view — same contract as openai-codex.
-        const reasoningText = extractOpenAiReasoningDeltaText(sse);
-        if (reasoningText) {
-          chunkBuffer.push({ deltaText: reasoningText, kind: "reasoning", raw: sse });
-          if (chunkResolver) {
-            const r = chunkResolver;
-            chunkResolver = null;
-            r();
+      let current = response;
+      for (;;) {
+        sseEvents.length = 0;
+        let lastError = null;
+        let emittedDelta = false;
+        for await (const sse of parseSseStream(current.body, { signal })) {
+          lastError = sse?.error;
+          if (lastError) break;
+          sseEvents.push(sse);
+          // Reasoning ("thinking") deltas arrive out of band before visible
+          // output. Tag them with kind:"reasoning" so the turn orchestrator
+          // routes them to assistant.reasoning.delta and the dashboard renders
+          // the live thinking view — same contract as openai-codex.
+          const reasoningText = extractOpenAiReasoningDeltaText(sse);
+          if (reasoningText) {
+            emittedDelta = true;
+            chunkBuffer.push({ deltaText: reasoningText, kind: "reasoning", raw: sse });
+            if (chunkResolver) {
+              const r = chunkResolver;
+              chunkResolver = null;
+              r();
+            }
+          }
+          const deltaText = extractOpenAiDeltaText(sse);
+          if (deltaText) {
+            emittedDelta = true;
+            chunkBuffer.push({ deltaText, raw: sse });
+            if (chunkResolver) {
+              const r = chunkResolver;
+              chunkResolver = null;
+              r();
+            }
           }
         }
-        const deltaText = extractOpenAiDeltaText(sse);
-        if (deltaText) {
-          chunkBuffer.push({ deltaText, raw: sse });
-          if (chunkResolver) {
-            const r = chunkResolver;
-            chunkResolver = null;
-            r();
-          }
+
+        if (!lastError) break;
+        if (emittedDelta || signal?.aborted || budget.spent >= budget.max || !isTransientStreamError(lastError)) {
+          throw streamFrameError(lastError, "openai-compatible");
         }
+        console.error(`[openai-compatible] stream failed after HTTP 200 (${streamFrameError(lastError, "openai-compatible").message}); retrying`);
+        await chargeStreamRetry(budget, sleepImpl, signal);
+        current = await openResponse();
       }
     } catch (error) {
       streamError = error;
@@ -355,33 +375,44 @@ async function fetchWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetr
   throw lastError;
 }
 
-async function fetchStreamingWithRetry({ endpoint, request, fetchImpl, sleepImpl, maxRetries, retryBaseDelayMs, signal = null }) {
-  let lastError = null;
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+/** HTTP failures and SSE error frames consume the same bounded retry budget. */
+export function createStreamRetryBudget(provider) {
+  return { spent: 0, max: Math.max(0, Number(provider.maxRetries ?? 2) || 0),
+    baseDelayMs: provider.retryBaseDelayMs ?? 1000 };
+}
+
+export async function chargeStreamRetry(budget, sleepImpl = sleep, signal, response = null) {
+  throwIfAborted(signal);
+  await sleepImpl(getRetryDelayMs({ response, attempt: budget.spent, retryBaseDelayMs: budget.baseDelayMs }), signal);
+  throwIfAborted(signal);
+  budget.spent += 1;
+}
+
+export function streamFrameError(payload, provider) {
+  const description = typeof payload?.message === "string" ? payload.message : JSON.stringify(payload);
+  return new Error(`${provider} provider stream error: ${description}`);
+}
+
+export async function fetchStreamingWithRetry({ endpoint, request, fetchImpl, sleepImpl = sleep, budget, signal = null }) {
+  for (;;) {
     throwIfAborted(signal);
     let response;
     try {
       response = await fetchImpl(endpoint, request);
     } catch (err) {
       throwIfAborted(signal);
-      lastError = err;
-      if (!isRetryableNetworkError(err) || attempt >= maxRetries) break;
-      await sleepImpl(getRetryDelayMs({ response: null, attempt, retryBaseDelayMs }));
+      if (!isRetryableNetworkError(err) || budget.spent >= budget.max) throw err;
+      await chargeStreamRetry(budget, sleepImpl, signal);
       continue;
     }
     if (response.ok) return response;
     const text = typeof response.text === "function" ? await response.text() : "";
     const retryable = isRetryableStatus(response.status);
-    lastError = new ProviderRequestError({
-      status: response.status,
-      statusText: response.statusText,
-      body: text,
-      retryable
-    });
-    if (!retryable || attempt >= maxRetries) break;
-    await sleepImpl(getRetryDelayMs({ response, attempt, retryBaseDelayMs }));
+    if (!retryable || budget.spent >= budget.max) {
+      throw new ProviderRequestError({ status: response.status, statusText: response.statusText, body: text, retryable });
+    }
+    await chargeStreamRetry(budget, sleepImpl, signal, response);
   }
-  throw lastError;
 }
 
 /** Rethrow the abort reason (the unified interrupt Error) when the turn was
@@ -424,6 +455,98 @@ export function isRetryableNetworkError(err) {
   return false;
 }
 
+/**
+ * Error payloads that arrive INSIDE an already-open SSE stream (HTTP 200 was
+ * returned, then the provider gave up mid-response). These never reach the
+ * HTTP-level retry paths above — `fetchWithRetry` / `fetchStreamingWithRetry`
+ * only see status codes, and by the time the body says
+ * "Our servers are currently overloaded. Please try again later." the response
+ * has long since been accepted.
+ *
+ * The classification is deliberately conservative: a wrong "transient" verdict
+ * re-sends a whole (billed) request, so we require a POSITIVE match on a known
+ * transient marker AND the absence of any known permanent marker. Anything
+ * unrecognized is treated as permanent and surfaces to the caller as before.
+ *
+ * @param {unknown} payload  The `error` object from the stream frame — e.g.
+ *   `{ code, type, message, status }` from an OpenAI Responses
+ *   `response.failed` / `error` event, or an Anthropic `error` event's
+ *   `{ type, message }`.
+ * @returns {boolean}
+ */
+export function isTransientStreamError(payload) {
+  if (payload == null || typeof payload !== "object") return false;
+
+  const code = typeof payload.code === "string" ? payload.code.toLowerCase() : "";
+  const type = typeof payload.type === "string" ? payload.type.toLowerCase() : "";
+  const message = typeof payload.message === "string" ? payload.message : "";
+
+  // Permanent wins over everything: a 400 whose prose happens to say
+  // "try again" must not be re-sent.
+  if (PERMANENT_STREAM_ERROR_MARKERS.has(code)) return false;
+  if (PERMANENT_STREAM_ERROR_MARKERS.has(type)) return false;
+
+  if (TRANSIENT_STREAM_ERROR_MARKERS.has(code)) return true;
+  if (TRANSIENT_STREAM_ERROR_MARKERS.has(type)) return true;
+
+  const status = Number(payload.status ?? payload.status_code ?? payload.statusCode);
+  if (Number.isFinite(status) && (status === 429 || (status >= 500 && status <= 599))) return true;
+
+  return TRANSIENT_STREAM_MESSAGE_RE.test(message);
+}
+
+// Positive markers. `overloaded` is the one observed in production against
+// chatgpt.com/backend-api/codex; the rest are the sibling codes the same
+// families emit (OpenAI `server_error` / `rate_limit_exceeded`, Anthropic
+// `overloaded_error` / `api_error`-adjacent service errors).
+const TRANSIENT_STREAM_ERROR_MARKERS = new Set([
+  "server_error",
+  "server_error_type",
+  "internal_error",
+  "internal_server_error",
+  "service_unavailable",
+  "service_unavailable_error",
+  "overloaded",
+  "overloaded_error",
+  "rate_limit",
+  "rate_limited",
+  "rate_limit_error",
+  "rate_limit_exceeded",
+  "slow_down",
+  "timeout",
+  "gateway_timeout"
+]);
+
+// Negative markers. Re-sending any of these burns tokens for the same failure:
+// the request is malformed, too long, or not permitted, and will be until the
+// caller changes something.
+const PERMANENT_STREAM_ERROR_MARKERS = new Set([
+  "invalid_request",
+  "invalid_request_error",
+  "invalid_prompt",
+  "invalid_value",
+  "invalid_api_key",
+  "context_length_exceeded",
+  "string_above_max_length",
+  "authentication_error",
+  "permission_error",
+  "permission_denied",
+  "not_found_error",
+  "model_not_found",
+  "insufficient_quota",
+  "billing_hard_limit_reached",
+  "content_policy_violation",
+  "content_filter",
+  "unsupported_value",
+  "unsupported_parameter",
+  "unsupported_country_region_territory"
+]);
+
+// Prose fallback for providers that ship a bare message with no machine code —
+// which is exactly the shape of the production `overloaded` failure.
+const TRANSIENT_STREAM_MESSAGE_RE =
+  /(overloaded|try again (?:later|in a|shortly)|temporarily|please retry|service is unavailable|at capacity)/i;
+
 function getRetryDelayMs({ response, attempt, retryBaseDelayMs }) {
   // Network failures (no response yet) skip Retry-After parsing and go
   // straight to exponential backoff.
@@ -436,6 +559,6 @@ function getRetryDelayMs({ response, attempt, retryBaseDelayMs }) {
   return retryBaseDelayMs * 2 ** attempt;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return delay(ms, undefined, { signal });
 }

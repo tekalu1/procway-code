@@ -25,6 +25,7 @@ import { ulid } from "./ulid.mjs";
  *   | "attachment.produced"
  *   | "turn.completed"
  *   | "turn.failed"
+ *   | "steer.dropped"
  * )} AgentEventType
  */
 
@@ -34,7 +35,12 @@ import { ulid } from "./ulid.mjs";
  * @typedef {EventEnvelope & (
  *   | { type: "session.created", cwd: string, provider: string, model: string, compatibilityMode?: string }
  *   | { type: "session.resumed", from: { eventCount: number, snapshotId?: string } }
- *   | { type: "user.prompt.submitted", messageId: string, content: import("../types/message.mjs").ContentBlock[], wake?: true }
+ *       // `wake: true` — a synthetic turn the wake supervisor injected (its body
+ *       // is entirely a <system-reminder>, not something the user typed).
+ *       // `steer: true` — a message the user typed mid-turn, folded in at a
+ *       // round boundary; `clientMessageId` echoes the caller's own id, and
+ *       // this event is the only "the agent has READ it" signal `steer` has.
+ *   | { type: "user.prompt.submitted", messageId: string, content: import("../types/message.mjs").ContentBlock[], wake?: true, steer?: true, clientMessageId?: string }
  *   | { type: "assistant.message.started",   messageId: string, round: number }
  *   | { type: "assistant.message.delta",     messageId: string, deltaText: string }
  *   | { type: "assistant.reasoning.delta",   messageId: string, deltaText: string }
@@ -73,6 +79,11 @@ import { ulid } from "./ulid.mjs";
  *       // thumbnail/download, a bound Slack thread re-uploads it (Phase 3).
  *   | { type: "turn.completed",  round: number, exitCode: number, messageId?: string }
  *   | { type: "turn.failed",     round: number, error: { message: string, code?: string }, messageId?: string }
+ *       // Steer messages this turn will never read: the turn was interrupted,
+ *       // failed, or ran out of rounds before the next boundary. The `steer`
+ *       // ack only promised "parked", so the caller must be told which of its
+ *       // ids it has to send again.
+ *   | { type: "steer.dropped",   reason: "interrupted" | "turn_failed" | "tool_loop_exceeded", count: number, clientMessageIds: string[] }
  *   | { type: "todos.updated",   todos: Array<{ id: string, content: string, status: "pending"|"in_progress"|"completed", activeForm: string }> }
  *   | { type: "memory.loaded",   count: number, types: { user: number, feedback: number, project: number, reference: number } }
  *   | { type: "memory.written",  name: string, type: string, action: "create" | "update" }
@@ -111,6 +122,7 @@ export const EVENT_TYPES = Object.freeze([
   "attachment.produced",
   "turn.completed",
   "turn.failed",
+  "steer.dropped",
   "todos.updated",
   "memory.loaded",
   "memory.written",

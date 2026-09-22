@@ -180,6 +180,10 @@ export class AgentSession {
     this.pausedForInput = null;
     this.initialized = false;
     this.interruptRequested = false;
+    // Mid-turn user messages parked by the serve `steer` command, folded into
+    // the running turn at the next round boundary (#drainPendingSteer). FIFO —
+    // two messages typed in a row must reach the model in that order.
+    this.pendingSteer = [];
     // A+B: procway worker enforcement. `procwayMeta` is set once when the
     // first runTurn prompt carries a `role: "worker"` Meta block; subsequent
     // ChatPanel turns inherit it. `pendingTaskCompletionReminder` is raised
@@ -751,6 +755,84 @@ export class AgentSession {
     this.turnAbortController = null;
   }
 
+  /**
+   * Park a message the user typed WHILE this turn is running (serve `steer`).
+   * The turn folds it in at its next round boundary, so the model answers it
+   * inside the same turn instead of after it.
+   *
+   * Deliberately NOT a runTurn: a concurrent runTurn is rejected
+   * (`turn_in_progress`) and a wake is a synthetic turn injected AFTER the
+   * current one — neither can reach the model mid-turn.
+   *
+   * Returns false when no turn is running: there is nothing to steer, and the
+   * caller should send the message as a normal turn instead.
+   *
+   * @param {string} prompt
+   * @param {{ clientMessageId?: string | null }} [options]
+   * @returns {boolean} true when the message was parked (NOT "the model read it")
+   */
+  steer(prompt, { clientMessageId = null } = {}) {
+    if (typeof prompt !== "string" || prompt.length === 0) {
+      throw new TypeError("steer: prompt is required");
+    }
+    if (!this.runningTurn) return false;
+    this.pendingSteer.push({
+      prompt,
+      clientMessageId: typeof clientMessageId === "string" && clientMessageId ? clientMessageId : null
+    });
+    return true;
+  }
+
+  /**
+   * Fold every parked steer message into the conversation, in arrival order.
+   * Called at each round boundary (before the model round) so the model sees
+   * them right after the last tool results.
+   *
+   * The emitted `user.prompt.submitted` carries `steer: true` (plus the
+   * caller's `clientMessageId`) — display surfaces use it to mark the message
+   * as delivered; it is NOT a wake, so no `wake: true` and no synthetic-body
+   * handling: this is a real thing the user typed.
+   */
+  async #drainPendingSteer() {
+    if (this.pendingSteer.length === 0) return 0;
+    const batch = this.pendingSteer.splice(0);
+    for (const parked of batch) {
+      const message = createMessage({
+        role: "user",
+        sessionId: this.sessionId,
+        content: [{ kind: "text", text: parked.prompt }]
+      });
+      this.messages.push(message);
+      this.events.emit(createEvent("user.prompt.submitted", {
+        sessionId: this.sessionId,
+        messageId: message.id,
+        content: message.content,
+        steer: true,
+        ...(parked.clientMessageId ? { clientMessageId: parked.clientMessageId } : {})
+      }));
+    }
+    await this.save();
+    return batch.length;
+  }
+
+  /**
+   * Announce steer messages this turn will never read. The `steer` ack means
+   * "parked", so the caller believes the message was accepted — if the turn
+   * dies (interrupt, failure, round budget) before the next boundary, the only
+   * honest thing is to say so with the ids the caller sent, so it can re-send.
+   * Silence would strand the message in "delivered, unanswered" forever.
+   */
+  #dropPendingSteer(reason) {
+    if (this.pendingSteer.length === 0) return;
+    const dropped = this.pendingSteer.splice(0);
+    this.events.emit(createEvent("steer.dropped", {
+      sessionId: this.sessionId,
+      reason,
+      count: dropped.length,
+      clientMessageIds: dropped.map((parked) => parked.clientMessageId).filter(Boolean)
+    }));
+  }
+
   async startMcpTools() {
     if (!this.mcpRegistry) {
       // Dashboard-distributed remote MCP servers (connections snapshot) merge
@@ -1288,10 +1370,18 @@ export class AgentSession {
             error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE }
           }));
           this.resetInterrupt();
+          this.#dropPendingSteer("interrupted");
           this.raisePendingTaskCompletionIfNeeded();
           await this.save({ force: true });
           return { error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE } };
         }
+        // The round boundary: everything the previous round's tools produced is
+        // in the transcript, nothing is in flight. Messages the user typed while
+        // that round ran go in HERE, so the model reads them as part of this
+        // turn. (Round 0 drains too — a steer parked by a paused turn's
+        // continuation, or one that raced the very first model call, must not
+        // wait for a tool round that may never happen.)
+        await this.#drainPendingSteer();
         const response = await executeModelRound({
           session: this,
           round,
@@ -1323,10 +1413,18 @@ export class AgentSession {
               messageId: turnUserMessageId,
               error: outcome.response?.error ?? { message: "Turn stopped", code: "stopped" }
             }));
+            this.#dropPendingSteer("turn_failed");
             this.raisePendingTaskCompletionIfNeeded();
             await this.save({ force: true });
             return outcome.response;
           }
+          // The model answered without calling a tool, so there is no tool
+          // round to carry a parked steer — but the user typed it DURING this
+          // turn and expects an answer in it. Take one more round: the loop top
+          // folds the message in and the model replies to it here. Bounded by
+          // the same maxToolRounds as any other round (and by the interrupt
+          // check at the loop top), so this cannot spin.
+          if (this.pendingSteer.length > 0 && isToolRoundAllowed(round + 1, maxToolRounds)) continue;
           await this.maybeAutoCompact();
           if (this.planMode?.isActive() && this.planMode.hasPending()) {
             try {
@@ -1352,6 +1450,9 @@ export class AgentSession {
             exitCode: 0,
             messageId: turnUserMessageId
           }));
+          // Only reachable when the extra round above was refused by the round
+          // budget — the turn ends with the message unread.
+          this.#dropPendingSteer("tool_loop_exceeded");
           this.raisePendingTaskCompletionIfNeeded();
           await this.save({ force: true });
           return outcome.response;
@@ -1385,6 +1486,10 @@ export class AgentSession {
           // A returned hearing is the natural hand-off — it is NOT a missing
           // `task complete`, so do not raise the completion reminder (that would
           // make the next resume turn nag about a task the user just deferred).
+          // pendingSteer is deliberately NOT dropped on either wind-down: the
+          // turn is paused, not dead, and the round that resumes it (a new
+          // runTurn for a hearing, #continueParkedRounds for an approval) folds
+          // the message in at its first boundary.
           await this.save({ force: true });
           return { paused: true, pausedForInput: this.pausedForInput };
         }
@@ -1415,6 +1520,7 @@ export class AgentSession {
         messageId: turnUserMessageId,
         error: { message: `Tool loop exceeded maxToolRounds (${maxToolRounds})`, code: "tool_loop_exceeded" }
       }));
+      this.#dropPendingSteer("tool_loop_exceeded");
       this.raisePendingTaskCompletionIfNeeded();
       await this.save({ force: true });
       return createToolLoopExceededResponse(maxToolRounds);
@@ -1432,6 +1538,7 @@ export class AgentSession {
           error: { message: mapped.message, code: mapped.code }
         }));
       }
+      this.#dropPendingSteer(mapped.userAbort ? "interrupted" : "turn_failed");
       this.raisePendingTaskCompletionIfNeeded();
       // best-effort: don't mask the original error if save() also throws
       try { await this.save({ force: true }); } catch { /* swallow */ }
