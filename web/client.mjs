@@ -78,9 +78,11 @@ function renderEvent(event) {
       appendLog(`[tool result] ${event.ok ? "ok" : "err"} ${event?.result?.summary ?? ""}`);
       return;
     case "turn.completed":
+      if (event.continuing === true) break;
       appendLog(`[turn done] round=${event.round} exit=${event.exitCode}`);
       return;
     case "turn.failed":
+      if (event.continuing === true) break;
       appendLog(`[turn failed] ${event?.error?.message ?? "unknown"}`);
       return;
     case "session.created":

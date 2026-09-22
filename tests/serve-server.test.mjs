@@ -142,7 +142,7 @@ describe("serve server", () => {
     // protocolVersion is the serve-protocol negotiation field (ADR 0030 D4),
     // independent of the package `version`, which comes from package.json.
     const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-    expect(ready).toMatchObject({ kind: "ready", version, protocolVersion: 1 });
+    expect(ready).toMatchObject({ kind: "ready", version, protocolVersion: 2 });
     expect(typeof ready.sessionId).toBe("string");
     ws.close();
   });

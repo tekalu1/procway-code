@@ -1,5 +1,5 @@
 import { applyUnifiedPatch, listFiles, readTextFile, searchFiles, writeTextFile } from "./filesystem.mjs";
-import { editFile } from "./edit.mjs";
+import { editFile, matchEdit } from "./edit.mjs";
 import { runGlob } from "./glob.mjs";
 import { runGrep } from "./grep.mjs";
 import { runShell, runShellKill, runShellLogs, runShellStatus, runShellWait } from "./shell.mjs";
@@ -43,10 +43,10 @@ async function readPriorContent(cwd, filePath) {
 
 function simulateEdit(before, oldString, newString, replaceAll) {
   if (typeof before !== "string" || typeof oldString !== "string" || typeof newString !== "string") return null;
-  if (replaceAll) return before.split(oldString).join(newString);
-  const idx = before.indexOf(oldString);
-  if (idx === -1) return before;
-  return `${before.slice(0, idx)}${newString}${before.slice(idx + oldString.length)}`;
+  const { needle, replacement, offsets } = matchEdit(before, oldString, newString);
+  if (offsets.length === 0) return before;
+  if (replaceAll) return before.split(needle).join(replacement);
+  return `${before.slice(0, offsets[0])}${replacement}${before.slice(offsets[0] + needle.length)}`;
 }
 
 /**

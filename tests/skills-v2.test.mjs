@@ -73,4 +73,36 @@ describe("skills v2", () => {
       await rm(otherCwd, { recursive: true, force: true });
     }
   });
+
+  it("loads user-scope claude skills from ~/.claude/skills in claude mode", async () => {
+    // tests/setup/test-home.mjs redirects os.homedir() to a fresh temp dir
+    // per test file, so writing under the home dir is safe and isolated.
+    const home = os.homedir();
+    const userSkillPath = path.join(home, ".claude", "skills", "user-skill", "SKILL.md");
+    await mkdir(path.dirname(userSkillPath), { recursive: true });
+    await writeFile(userSkillPath, "# user skill", "utf8");
+    try {
+      const skills = await scanSkills({ cwd, settings: DEFAULT_SETTINGS });
+      const userSkill = skills.find((entry) => entry.path.endsWith(path.join(".claude", "skills", "user-skill", "SKILL.md")));
+      expect(userSkill).toBeTruthy();
+      expect(userSkill.scannerId).toBe("user-claude-skills");
+    } finally {
+      await rm(path.join(home, ".claude"), { recursive: true, force: true });
+    }
+  });
+
+  it("does not list a skill twice when cwd is the home dir (./.claude/skills == ~/.claude/skills)", async () => {
+    const home = os.homedir();
+    const skillPath = path.join(home, ".claude", "skills", "home-skill", "SKILL.md");
+    await mkdir(path.dirname(skillPath), { recursive: true });
+    await writeFile(skillPath, "# home skill", "utf8");
+    try {
+      const skills = await scanSkills({ cwd: home, settings: DEFAULT_SETTINGS });
+      const matches = skills.filter((entry) => entry.name === "home-skill");
+      expect(matches).toHaveLength(1);
+      expect(matches[0].scannerId).toBe("claude-skills");
+    } finally {
+      await rm(path.join(home, ".claude"), { recursive: true, force: true });
+    }
+  });
 });

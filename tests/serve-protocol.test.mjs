@@ -60,8 +60,8 @@ describe("serve protocol", () => {
   // `ready` — an integer independent of the package version. Bump this
   // assertion ONLY on a breaking protocol change (message shapes, semantics
   // of existing COMMANDS); backward-compatible additions keep it at 1.
-  it("stamps protocolVersion 1 on the ready frame, independent of the package version", () => {
-    expect(PROTOCOL_VERSION).toBe(1);
+  it("stamps protocolVersion 2 on the ready frame, independent of the package version", () => {
+    expect(PROTOCOL_VERSION).toBe(2);
     const ready = makeReady({ sessionId: "s1", version: "0.1.0" });
     expect(ready.protocolVersion).toBe(PROTOCOL_VERSION);
     // The package version stays as-is, informational only.
@@ -70,7 +70,7 @@ describe("serve protocol", () => {
 
   it("makeReady / makeEvent / makeResponse build valid server messages", () => {
     const ready = makeReady({ sessionId: "s1", version: "0.1.0" });
-    expect(ready).toEqual({ kind: "ready", sessionId: "s1", version: "0.1.0", protocolVersion: 1, commands: COMMANDS });
+    expect(ready).toEqual({ kind: "ready", sessionId: "s1", version: "0.1.0", protocolVersion: 2, capabilities: ["prompt-queue"], commands: COMMANDS });
     expect(isServerMessage(ready)).toBe(true);
 
     const event = makeEvent({ type: "turn.completed", round: 0, exitCode: 0 });

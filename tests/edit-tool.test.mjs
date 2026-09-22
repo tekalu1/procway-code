@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { editFile } from "../src/tools/edit.mjs";
+import { editFile, matchEdit } from "../src/tools/edit.mjs";
 
 let cwd;
 
@@ -66,5 +66,48 @@ describe("editFile", () => {
     const result = await editFile({ cwd, filePath: "a.txt", oldString: "a", newString: "a" });
     expect(result.summary).toMatch(/^Edit failed/);
     expect(result.data.error).toContain("must differ");
+  });
+
+  describe("line endings", () => {
+    const read = () => readFile(path.join(cwd, "a.txt"), "utf8");
+
+    it("matches an LF snippet in a CRLF file and keeps CRLF", async () => {
+      await writeFile(path.join(cwd, "a.txt"), "one\r\ntwo\r\nthree\r\n", "utf8");
+      const result = await editFile({ cwd, filePath: "a.txt", oldString: "one\ntwo", newString: "uno\ndos" });
+      expect(result.data.replacedCount).toBe(1);
+      expect(await read()).toBe("uno\r\ndos\r\nthree\r\n");
+    });
+
+    it("writes CRLF when only newString spans lines", async () => {
+      await writeFile(path.join(cwd, "a.txt"), "one\r\ntwo\r\n", "utf8");
+      await editFile({ cwd, filePath: "a.txt", oldString: "one", newString: "one\nhalf" });
+      expect(await read()).toBe("one\r\nhalf\r\ntwo\r\n");
+    });
+
+    it("keeps an LF file LF when newString carries CRLF", async () => {
+      await writeFile(path.join(cwd, "a.txt"), "one\ntwo\n", "utf8");
+      await editFile({ cwd, filePath: "a.txt", oldString: "one", newString: "one\r\nhalf" });
+      expect(await read()).toBe("one\nhalf\ntwo\n");
+    });
+
+    it("counts CRLF matches for ambiguity and replaceAll", async () => {
+      await writeFile(path.join(cwd, "a.txt"), "a\r\nb\r\na\r\nb\r\n", "utf8");
+      const ambiguous = await editFile({ cwd, filePath: "a.txt", oldString: "a\nb", newString: "c\nd" });
+      expect(ambiguous.data.candidates).toHaveLength(2);
+      expect(ambiguous.data.candidates[1]).toEqual(expect.objectContaining({ line: 3, column: 1 }));
+      const all = await editFile({ cwd, filePath: "a.txt", oldString: "a\nb", newString: "c\nd", replaceAll: true });
+      expect(all.data.replacedCount).toBe(2);
+      expect(await read()).toBe("c\r\nd\r\nc\r\nd\r\n");
+    });
+
+    it("leaves line breaks outside the edit alone in a mixed file", async () => {
+      await writeFile(path.join(cwd, "a.txt"), "one\r\ntwo\nthree\r\n", "utf8");
+      await editFile({ cwd, filePath: "a.txt", oldString: "one\ntwo", newString: "uno\ndos" });
+      expect(await read()).toBe("uno\r\ndos\nthree\r\n");
+    });
+
+    it("finds nothing for an empty oldString instead of looping", () => {
+      expect(matchEdit("abc", "", "x").offsets).toEqual([]);
+    });
   });
 });

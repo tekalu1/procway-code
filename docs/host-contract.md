@@ -339,11 +339,18 @@ that turn**.
   they were read, between the tool results and the answer.
 - **A turn that dies before the next boundary drops what it parked** and says so
   with a `steer.dropped` event `{ reason: "interrupted" | "turn_failed" |
-  "tool_loop_exceeded", count, clientMessageIds }`. The host is then responsible
+  "tool_loop_exceeded" | "turn_completed", count, clientMessageIds }`. The host is then responsible
   for re-sending those ids. `steer.dropped` may arrive AFTER the turn's
   `turn.failed` / `turn.completed`, so do not route it through per-turn state that
   the terminal event tears down. A turn that merely *pauses* (deferred user interaction,
   parked approval) keeps them: the round that resumes it folds them in.
+- A turn saves its snapshot BEFORE it emits `turn.completed` / `turn.failed`, and
+  the session no longer counts as running once that frame is on the wire. A
+  `steer` acked while that final save is in flight is still honoured: it is folded
+  in with one more round (the terminal frame follows the answer), or announced
+  with `steer.dropped` when no round is left (`tool_loop_exceeded`) or the turn
+  ended on a `plan_apply` approval (`turn_completed`). A `steer` sent after the
+  terminal frame gets `no_active_turn`.
 - If the model produces a final answer without calling a tool while a message is
   parked, the turn takes **one more model round** to answer it rather than ending.
   That extra round counts against `tools.maxToolRounds` like any other.
@@ -352,10 +359,10 @@ that turn**.
 
 ```json
 { "kind": "ready", "sessionId": "<id>", "version": "<package version>",
-  "protocolVersion": 1, "commands": ["runTurn", "…", "steer"] }
+  "protocolVersion": 2, "capabilities": ["prompt-queue"], "commands": ["runTurn", "…", "steer"] }
 ```
 
-- `protocolVersion` (integer, currently **1**) is the protocol contract;
+- `protocolVersion` (integer, currently **2**) is the protocol contract;
   `version` is the package version, informational only.
 - `commands` is the capability list. Commands added after the first release
   (`steer`) must be gated on it: an agent that does not know a command answers
@@ -368,6 +375,26 @@ that turn**.
   (pre-negotiation agents) as `1`, and fail loudly when the value is outside the
   supported range — never mis-operate silently. Opaque WS relays in between need
   not (and should not) parse frames to gate.
+
+**Queued prompts (v2).** `prompt.enqueue` takes `{promptId, prompt, attachments?}`
+and acknowledges acceptance; it does not mean the model has read the prompt.
+The session persists the queue and broadcasts `prompt.queue.updated` with
+`prompts: [{id, prompt, attachments}]`, including on reconnect. `prompt.sendNow`
+takes `{promptId}`, moves that item to the front and interrupts the active turn.
+`prompt.remove` takes `{promptId}` and returns `{removed, prompts}`. `prompt.list`
+returns `{prompts}`. The attachment contract is identical to `runTurn`.
+
+The run lease includes all queued follow-ups and the final snapshot save.
+**Ignore `turn.completed` / `turn.failed` frames with `continuing: true` for
+completion decisions.** Only the final terminal frame (without `continuing`)
+permits a worker host to advance its task or destroy its runtime. Once that final
+frame is sent, the snapshot is saved and a new `runTurn` is accepted; a `runTurn`
+sent while the lease still holds (e.g. right after a `continuing: true` frame) is
+answered with `turn_in_progress` — use `prompt.enqueue` for that. A plain
+`abort` stops draining but retains unsent prompts. Approval/input waits and
+provider errors also retain unsent prompts; opening a saved transcript never
+executes them. These changed terminal semantics require v2 rather than silently
+letting a v1 host tear down a queued conversation.
 - Clients should wait for `ready` before sending commands (commands that race the
   handshake are buffered server-side as a robustness measure, not a guarantee).
 

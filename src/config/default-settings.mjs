@@ -142,6 +142,15 @@ export const DEFAULT_SETTINGS = Object.freeze({
         enabled: true
       },
       {
+        id: "user-claude-skills",
+        roots: ["~/.claude/skills"],
+        glob: "*/SKILL.md",
+        compatibility: "claude",
+        activeInModes: ["claude", "mixed"],
+        priority: 60,
+        enabled: true
+      },
+      {
         id: "workspace-procway-skills",
         roots: ["./.procway/ai-agent/skills"],
         glob: "*/SKILL.md",

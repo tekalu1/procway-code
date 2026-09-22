@@ -7,6 +7,7 @@ import { writeArchivedSnapshot, readSnapshot, SnapshotThrottle } from "../sessio
 import { migrateLegacyFormatIfNeeded } from "../session/migration.mjs";
 import { createChildAgentManager } from "./child-agent.mjs";
 import { createWakeSupervisor } from "./wake-supervisor.mjs";
+import { PromptQueue } from "./prompt-queue.mjs";
 import { createDelegationMetrics } from "../telemetry/delegation-metrics.mjs";
 import {
   requiresFileMutation,
@@ -203,6 +204,8 @@ export class AgentSession {
     // page reload / history-load can re-render the in-progress UI (Stop button)
     // for a turn that's still going inside this session.
     this.runningTurn = false;
+    this.promptQueue = new PromptQueue(this, (prompt, options) => this.#runSingleTurn(prompt, options));
+    this.saveChain = Promise.resolve();
     // event-wake (issue #143): the per-session supervisor that turns "a
     // background child / run settled while nothing was listening" into a fresh
     // turn. Created here (one per session, keyed by this session's id) and
@@ -221,7 +224,7 @@ export class AgentSession {
       : createWakeSupervisor({
         sessionId: this.sessionId,
         injectTurn: (text) => this.runTurn(text, { wake: true }),
-        isTurnRunning: () => this.runningTurn,
+        isTurnRunning: () => this.runningTurn || this.promptQueue.active,
         metrics: this.delegationMetrics,
         onError: (error, context) => {
           console.warn(`[wake] injection failed (${context?.phase ?? "?"}): ${error?.message ?? error}`);
@@ -377,8 +380,18 @@ export class AgentSession {
     const allEvents = await readEventLog({ sessionId: this.sessionId, encryptionKey: this.encryptionKey });
     this.eventCount = allEvents.length;
     const snapshotEventCount = Number.isFinite(snapshot.eventCount) ? Number(snapshot.eventCount) : 0;
+    this.promptQueue.items = Array.isArray(snapshot.pendingPrompts) ? snapshot.pendingPrompts : [];
     if (allEvents.length > snapshotEventCount) {
       const trailing = allEvents.slice(snapshotEventCount);
+      for (const event of trailing) {
+        if (event.type === "prompt.queue.updated" && Array.isArray(event.prompts)) {
+          const previous = new Map(this.promptQueue.items.map(item => [item.id, item]));
+          this.promptQueue.items = event.prompts.map(item => ({
+            id: item.id, prompt: item.prompt,
+            options: { ...previous.get(item.id)?.options, attachments: item.attachments ?? [] }
+          }));
+        }
+      }
       const projected = messagesFromEvents(trailing);
       if (projected.length > 0) {
         this.messages.push(...projected);
@@ -693,6 +706,10 @@ export class AgentSession {
    * happened, so the user sees one continuous turn.
    */
   async #continueParkedRounds(turnMessageId) {
+    return this.promptQueue.run(null, { runProviderImpl: this.turnRunProviderImpl }, () => this.#resumeParkedRounds(turnMessageId));
+  }
+
+  async #resumeParkedRounds(turnMessageId) {
     if (this.runningTurn) return;
     this.pausedForInput = null;
     this.pausedForApproval = null;
@@ -738,6 +755,7 @@ export class AgentSession {
    * Returns true when an abort was registered.
    */
   abort() {
+    if (!this.promptQueue.interruptId) this.promptQueue.stopped = true;
     if (this.interruptRequested) return false;
     this.interruptRequested = true;
     try {
@@ -1083,7 +1101,11 @@ export class AgentSession {
     return result;
   }
 
-  async runTurn(prompt, {
+  runTurn(prompt, options = {}) {
+    return this.promptQueue.run(prompt, options);
+  }
+
+  async #runSingleTurn(prompt, {
     maxToolRounds = this.settings.tools?.maxToolRounds ?? 150,
     systemPromptAppend = null,
     toolPolicy = null,
@@ -1363,16 +1385,17 @@ export class AgentSession {
           // Same wording as the mid-stream / mid-tool interrupt paths
           // (describeTurnAbort) — a Stop must not read differently just
           // because of WHEN it landed.
+          // Save, THEN announce (#163 — see the turn.completed path below).
+          this.resetInterrupt();
+          this.raisePendingTaskCompletionIfNeeded();
+          await this.save({ force: true });
+          this.#dropPendingSteer("interrupted");
           this.events.emit(createEvent("turn.failed", {
             sessionId: this.sessionId,
             round,
             messageId: turnUserMessageId,
             error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE }
           }));
-          this.resetInterrupt();
-          this.#dropPendingSteer("interrupted");
-          this.raisePendingTaskCompletionIfNeeded();
-          await this.save({ force: true });
           return { error: { message: USER_INTERRUPT_MESSAGE, code: USER_INTERRUPT_CODE } };
         }
         // The round boundary: everything the previous round's tools produced is
@@ -1407,15 +1430,15 @@ export class AgentSession {
           // clears runningTurn — otherwise the wedged turn blocks every new
           // message.
           if (outcome.action === "stop") {
+            this.raisePendingTaskCompletionIfNeeded();
+            await this.save({ force: true });
+            this.#dropPendingSteer("turn_failed");
             this.events.emit(createEvent("turn.failed", {
               sessionId: this.sessionId,
               round,
               messageId: turnUserMessageId,
               error: outcome.response?.error ?? { message: "Turn stopped", code: "stopped" }
             }));
-            this.#dropPendingSteer("turn_failed");
-            this.raisePendingTaskCompletionIfNeeded();
-            await this.save({ force: true });
             return outcome.response;
           }
           // The model answered without calling a tool, so there is no tool
@@ -1426,6 +1449,7 @@ export class AgentSession {
           // check at the loop top), so this cannot spin.
           if (this.pendingSteer.length > 0 && isToolRoundAllowed(round + 1, maxToolRounds)) continue;
           await this.maybeAutoCompact();
+          let planApplyParked = false;
           if (this.planMode?.isActive() && this.planMode.hasPending()) {
             try {
               await this.planMode.promptApply({
@@ -1442,19 +1466,34 @@ export class AgentSession {
               // discards it when the user decides. Fall through to the normal
               // turn end — the approval card is already on its way.
               if (!(error instanceof ApprovalParkSignal)) throw error;
+              planApplyParked = true;
             }
           }
+          // Save, THEN announce (#163). A host acts on `turn.completed` at once
+          // — reads snapshot.json, sends the next runTurn — so the snapshot must
+          // already hold the answer, and nothing awaitable may sit between the
+          // emit and the caller's finally that clears runningTurn (only
+          // microtasks run in between, so no command arriving over the wire can
+          // still find this turn "running").
+          this.raisePendingTaskCompletionIfNeeded();
+          await this.save({ force: true });
+          // runningTurn is still true during that save, so a `steer` can be
+          // parked (and acked) right here. Nothing after this point reads
+          // pendingSteer, so fold it in with one more round like the check
+          // above does — the user typed it before this turn said it was done.
+          // Not after a parked plan_apply: re-entering would park a second
+          // approval for the same plan.
+          if (this.pendingSteer.length > 0 && !planApplyParked && isToolRoundAllowed(round + 1, maxToolRounds)) continue;
+          // Otherwise the turn ends with the message unread (the extra round was
+          // refused by the round budget, or the turn is folded on a plan_apply
+          // approval): say so, never strand it.
+          this.#dropPendingSteer(planApplyParked ? "turn_completed" : "tool_loop_exceeded");
           this.events.emit(createEvent("turn.completed", {
             sessionId: this.sessionId,
             round,
             exitCode: 0,
             messageId: turnUserMessageId
           }));
-          // Only reachable when the extra round above was refused by the round
-          // budget — the turn ends with the message unread.
-          this.#dropPendingSteer("tool_loop_exceeded");
-          this.raisePendingTaskCompletionIfNeeded();
-          await this.save({ force: true });
           return outcome.response;
         }
 
@@ -1477,20 +1516,22 @@ export class AgentSession {
         // hint; this is the guarantee.
         if (this.pausedForInput) {
           await this.maybeAutoCompact();
-          this.events.emit(createEvent("turn.completed", {
-            sessionId: this.sessionId,
-            round,
-            exitCode: 0,
-            messageId: turnUserMessageId
-          }));
           // A returned hearing is the natural hand-off — it is NOT a missing
           // `task complete`, so do not raise the completion reminder (that would
           // make the next resume turn nag about a task the user just deferred).
           // pendingSteer is deliberately NOT dropped on either wind-down: the
           // turn is paused, not dead, and the round that resumes it (a new
           // runTurn for a hearing, #continueParkedRounds for an approval) folds
-          // the message in at its first boundary.
+          // the message in at its first boundary — including one parked while
+          // the save below is in flight.
+          // Save, THEN announce (#163 — see the turn.completed path above).
           await this.save({ force: true });
+          this.events.emit(createEvent("turn.completed", {
+            sessionId: this.sessionId,
+            round,
+            exitCode: 0,
+            messageId: turnUserMessageId
+          }));
           return { paused: true, pausedForInput: this.pausedForInput };
         }
 
@@ -1503,26 +1544,27 @@ export class AgentSession {
         // auto-compaction here: the placeholder tool_result must survive
         // verbatim for the in-place replacement on resume.
         if (Array.isArray(this.pausedForApproval) && this.pausedForApproval.length > 0) {
+          // Save, THEN announce (#163 — see the turn.completed path above).
+          await this.save({ force: true });
           this.events.emit(createEvent("turn.completed", {
             sessionId: this.sessionId,
             round,
             exitCode: 0,
             messageId: turnUserMessageId
           }));
-          await this.save({ force: true });
           return { paused: true, pausedForApproval: this.pausedForApproval.slice() };
         }
       }
 
+      this.raisePendingTaskCompletionIfNeeded();
+      await this.save({ force: true });
+      this.#dropPendingSteer("tool_loop_exceeded");
       this.events.emit(createEvent("turn.failed", {
         sessionId: this.sessionId,
         round: lastRound,
         messageId: turnUserMessageId,
         error: { message: `Tool loop exceeded maxToolRounds (${maxToolRounds})`, code: "tool_loop_exceeded" }
       }));
-      this.#dropPendingSteer("tool_loop_exceeded");
-      this.raisePendingTaskCompletionIfNeeded();
-      await this.save({ force: true });
       return createToolLoopExceededResponse(maxToolRounds);
     } catch (error) {
       // Map a turn-idle watchdog abort to a clear, retryable message instead of
@@ -1530,6 +1572,14 @@ export class AgentSession {
       // orchestrator's turn.failed mapping). Distinct from a user Stop
       // (interruptRequested path → "Turn interrupted by user").
       const mapped = describeTurnAbort(this, error);
+      this.raisePendingTaskCompletionIfNeeded();
+      // best-effort: don't mask the original error if save() also throws.
+      // Save, THEN announce (#163 — see the turn.completed path above). When
+      // the orchestrator already emitted turn.failed (turnFailedEmitted) that
+      // ordering is out of our hands, but the steer drop still comes after the
+      // save so nothing parked during it is stranded.
+      try { await this.save({ force: true }); } catch { /* swallow */ }
+      this.#dropPendingSteer(mapped.userAbort ? "interrupted" : "turn_failed");
       if (error?.turnFailedEmitted !== true) {
         this.events.emit(createEvent("turn.failed", {
           sessionId: this.sessionId,
@@ -1538,10 +1588,6 @@ export class AgentSession {
           error: { message: mapped.message, code: mapped.code }
         }));
       }
-      this.#dropPendingSteer(mapped.userAbort ? "interrupted" : "turn_failed");
-      this.raisePendingTaskCompletionIfNeeded();
-      // best-effort: don't mask the original error if save() also throws
-      try { await this.save({ force: true }); } catch { /* swallow */ }
       // A user Stop that landed MID-round (in the provider stream or a tool)
       // must settle exactly like one that landed between rounds: the same
       // `{ error }` return, not a thrown DOMException. Without this the caller
@@ -1712,7 +1758,15 @@ export class AgentSession {
     return this.compact();
   }
 
-  async save({ force = false } = {}) {
+  save(options = {}) {
+    // Queue mutations and model turns both save. Serialize them so an older
+    // write cannot truncate or overwrite a newer queue/transcript snapshot.
+    const write = this.saveChain.catch(() => {}).then(() => this.#saveSnapshot(options));
+    this.saveChain = write;
+    return write;
+  }
+
+  async #saveSnapshot({ force = false } = {}) {
     if (this.settings.session?.enabled === false) return;
     await this.flushEventLog();
     if (!this.snapshotThrottle.shouldWrite({ eventCount: this.eventCount, force })) return;
@@ -1727,6 +1781,7 @@ export class AgentSession {
         updatedAt: new Date().toISOString(),
         eventCount: this.eventCount,
         messages: this.messages,
+        pendingPrompts: this.promptQueue.items,
         todos: this.todoStore.todos,
         planMode: { active: this.planMode.active, queue: this.planMode.queue },
         usageEvents: typeof this.usageTracker?.raw === "function" ? this.usageTracker.raw() : [],

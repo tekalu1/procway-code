@@ -58,7 +58,15 @@ export function attachBridge({
 
   const eventForwarder = (event) => {
     try {
-      ws.send(JSON.stringify(makeEvent(event)));
+      // A worker must wait for the complete queue chain, including the last
+      // snapshot save. A prompt can arrive after turn.completed was emitted
+      // but before that save finishes. Only the lease's settled event is final.
+      const intermediate = state.session.promptQueue?.active
+        && (event.type === "turn.completed" || event.type === "turn.failed");
+      ws.send(JSON.stringify(makeEvent(intermediate ? { ...event, continuing: true } : event)));
+      if (event.type === "prompt.queue.updated" && event.settled) {
+        ws.send(JSON.stringify(makeEvent(event.settled)));
+      }
     } catch (error) {
       if (logger) logger(`bridge: forward failed ${error?.message ?? error}`);
     }
@@ -146,6 +154,9 @@ export function attachBridge({
   // still be blocked on one right now. Replay the live coordinators' pending
   // requests so the client rebuilds them — same timing gap as the transcript.
   replayPendingRequests({ session: state.session, ws, logger });
+  if (state.session.promptQueue) {
+    ws.send(JSON.stringify(makeEvent({ type: "prompt.queue.updated", sessionId: state.session.sessionId, prompts: state.session.promptQueue.list() })));
+  }
 
   return { detach };
 }
@@ -213,6 +224,25 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
   const args = (message.args && typeof message.args === "object") ? message.args : {};
   try {
     switch (message.command) {
+      case "prompt.enqueue": {
+        const prompt = typeof args.prompt === "string" ? args.prompt : "";
+        const attachments = normalizeRunTurnAttachments(args.attachments);
+        if (!prompt.trim() && !attachments.length) throw new Error("A prompt or attachment is required");
+        const options = { attachments };
+        if (state.session.origin === "worker") options.approvalMode = "full-auto";
+        await state.session.promptQueue.enqueue(args.promptId, prompt || "(file attached)", options);
+        ws.send(JSON.stringify(makeResponse({ id, ok: true })));
+        return;
+      }
+      case "prompt.sendNow":
+      case "prompt.remove":
+      case "prompt.list": {
+        const queue = state.session.promptQueue;
+        if (message.command === "prompt.sendNow") await queue.sendNow(args.promptId);
+        const removed = message.command === "prompt.remove" ? await queue.remove(args.promptId) : undefined;
+        ws.send(JSON.stringify(makeResponse({ id, ok: true, result: { prompts: queue.list(), ...(removed !== undefined ? { removed } : {}) } })));
+        return;
+      }
       case "runTurn": {
         const prompt = typeof args.prompt === "string" ? args.prompt : "";
         if (prompt.length === 0) throw new Error("runTurn: prompt is required");
@@ -222,7 +252,12 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
         // generic error frame. Concurrent turns on the one shared session
         // interleave their deltas on the EventBus and the client renders the
         // garbled/tripled text — see conversation.mjs runTurn for the full why.
-        if (state.session.runningTurn === true) {
+        // The prompt-queue lease counts too: between a `continuing: true`
+        // terminal frame and the final one the session is not running a model
+        // turn, but the lease still holds (final snapshot save / next queued
+        // prompt) and session.runTurn would refuse — answer with the same
+        // structured code instead of a bare error string (#163).
+        if (state.session.runningTurn === true || state.session.promptQueue?.active === true) {
           ws.send(JSON.stringify(makeResponse({
             id,
             ok: false,
@@ -368,6 +403,7 @@ async function handleMessage({ state, ws, raw, cwd, settings, sessionFactory, ev
         return;
       }
       case "abort": {
+        if (state.session.promptQueue) state.session.promptQueue.stopped = true;
         const aborted = typeof state.session.abort === "function" ? state.session.abort() : false;
         ws.send(JSON.stringify(makeResponse({ id, ok: true, result: { aborted } })));
         return;

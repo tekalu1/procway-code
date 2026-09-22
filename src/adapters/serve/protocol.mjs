@@ -20,10 +20,16 @@ export const CLIENT_KINDS = Object.freeze(["command"]);
  * changes (message shapes, semantics of existing COMMANDS) bump it. Hosts
  * treat a `ready` without `protocolVersion` (pre-ADR-0030 agents) as 1.
  */
-export const PROTOCOL_VERSION = 1;
+// v2: terminal turn events with continuing:true are intermediate; worker
+// hosts must wait for the final event before advancing or destroying a Pod.
+export const PROTOCOL_VERSION = 2;
 
 export const COMMANDS = Object.freeze([
   "runTurn",
+  "prompt.enqueue",
+  "prompt.sendNow",
+  "prompt.remove",
+  "prompt.list",
   "approve",
   "interaction.resolve",
   "compact",
@@ -50,7 +56,7 @@ export function makeReady({ sessionId, version }) {
   // tell "unsupported" from "slow". Hosts that use commands added after the
   // first release (e.g. `steer`) must gate on this list and treat its ABSENCE
   // (pre-capability agents) as "only the original COMMANDS exist".
-  return { kind: "ready", sessionId, version, protocolVersion: PROTOCOL_VERSION, commands: COMMANDS };
+  return { kind: "ready", sessionId, version, protocolVersion: PROTOCOL_VERSION, capabilities: ["prompt-queue"], commands: COMMANDS };
 }
 
 export function makeEvent(event) {

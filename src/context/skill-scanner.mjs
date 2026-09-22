@@ -8,10 +8,17 @@ export async function scanSkills({ cwd = process.cwd(), settings }) {
   const workspaceDir = path.resolve(cwd);
   const scanners = getActiveSkillScanners(settings);
   const found = [];
+  // A workspace-relative root and a user-scope root can resolve to the same
+  // directory (e.g. ./.claude/skills vs ~/.claude/skills when cwd is the home
+  // dir). Scan each directory once — the first scanner in settings order wins.
+  const seenRoots = new Set();
 
   for (const scanner of scanners) {
     for (const root of scanner.roots ?? []) {
       const rootPath = resolveConfiguredPath(root, workspaceDir);
+      const rootKey = process.platform === "win32" ? rootPath.toLowerCase() : rootPath;
+      if (seenRoots.has(rootKey)) continue;
+      seenRoots.add(rootKey);
       const files = await findSkillFiles(rootPath, scanner.glob ?? "*/SKILL.md");
       for (const filePath of files) {
         const raw = await readFile(filePath, "utf8");

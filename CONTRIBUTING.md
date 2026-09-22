@@ -102,7 +102,7 @@ published by accident. Two rules beyond that:
   added to `files` *and* to that test — a local run cannot tell the difference,
   but an installed copy can.
 
-Check what would ship with `npm pack --dry-run` before publishing.
+Check what would ship with `npm pack --dry-run` before pushing the tag.
 
 ## Reporting issues
 

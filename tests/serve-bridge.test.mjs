@@ -74,11 +74,11 @@ describe("serve bridge", () => {
     });
     const ws = fakeWs();
     const bridge = attachBridge({ session, ws, version: "0.0.1" });
-    expect(ws.sent).toHaveLength(1);
+    expect(ws.sent).toHaveLength(2);
     const ready = JSON.parse(ws.sent[0]);
     // protocolVersion is the serve-protocol negotiation field (ADR 0030 D4),
     // independent of the package `version` above.
-    expect(ready).toMatchObject({ kind: "ready", sessionId: "bridge-1", version: "0.0.1", protocolVersion: 1 });
+    expect(ready).toMatchObject({ kind: "ready", sessionId: "bridge-1", version: "0.0.1", protocolVersion: 2 });
 
     await session.runTurn("hello");
     await session.flushEventLog();

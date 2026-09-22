@@ -95,6 +95,9 @@ describe("wake drain — `-p` waits for uncollected background work", () => {
     const clock = fakeClock();
     let releaseTurn;
     const turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+    let markPollHeld, releasePoll;
+    const pollHeld = new Promise(resolve => { markPollHeld = resolve; });
+    const pollGate = new Promise(resolve => { releasePoll = resolve; });
     const order = [];
     let fired = false;
 
@@ -112,6 +115,10 @@ describe("wake drain — `-p` waits for uncollected background work", () => {
           supervisor.state.outstanding = false;
           void supervisor.fire();       // detached, exactly like the real fire()
           await new Promise((resolve) => setImmediate(resolve));
+          // Hold fake time here: a fast machine can otherwise advance the
+          // entire five-minute deadline before a real 10ms timer fires.
+          markPollHeld();
+          await pollGate;
         }
         await clock.sleep(ms);
       }
@@ -119,11 +126,12 @@ describe("wake drain — `-p` waits for uncollected background work", () => {
 
     let settled = false;
     void drain.then(() => { settled = true; });
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await pollHeld;
     expect(order).toEqual(["turn-start"]);
     expect(settled).toBe(false);
 
     releaseTurn();
+    releasePoll();
     const result = await drain;
     expect(order).toEqual(["turn-start", "turn-end"]);
     expect(result).toEqual({ turns: 1, reason: "settled" });

@@ -5,6 +5,7 @@ import { ulid } from "./ulid.mjs";
  *   | "session.created"
  *   | "session.resumed"
  *   | "user.prompt.submitted"
+ *   | "prompt.queue.updated"
  *   | "assistant.message.started"
  *   | "assistant.message.delta"
  *   | "assistant.reasoning.delta"
@@ -41,6 +42,7 @@ import { ulid } from "./ulid.mjs";
  *       // round boundary; `clientMessageId` echoes the caller's own id, and
  *       // this event is the only "the agent has READ it" signal `steer` has.
  *   | { type: "user.prompt.submitted", messageId: string, content: import("../types/message.mjs").ContentBlock[], wake?: true, steer?: true, clientMessageId?: string }
+ *   | { type: "prompt.queue.updated", prompts: Array<{ id: string, prompt: string, attachments: object[] }>, settled?: object }
  *   | { type: "assistant.message.started",   messageId: string, round: number }
  *   | { type: "assistant.message.delta",     messageId: string, deltaText: string }
  *   | { type: "assistant.reasoning.delta",   messageId: string, deltaText: string }
@@ -83,7 +85,7 @@ import { ulid } from "./ulid.mjs";
  *       // failed, or ran out of rounds before the next boundary. The `steer`
  *       // ack only promised "parked", so the caller must be told which of its
  *       // ids it has to send again.
- *   | { type: "steer.dropped",   reason: "interrupted" | "turn_failed" | "tool_loop_exceeded", count: number, clientMessageIds: string[] }
+ *   | { type: "steer.dropped",   reason: "interrupted" | "turn_failed" | "tool_loop_exceeded" | "turn_completed", count: number, clientMessageIds: string[] }
  *   | { type: "todos.updated",   todos: Array<{ id: string, content: string, status: "pending"|"in_progress"|"completed", activeForm: string }> }
  *   | { type: "memory.loaded",   count: number, types: { user: number, feedback: number, project: number, reference: number } }
  *   | { type: "memory.written",  name: string, type: string, action: "create" | "update" }
@@ -96,6 +98,7 @@ import { ulid } from "./ulid.mjs";
  */
 
 export const EVENT_TYPES = Object.freeze([
+  "prompt.queue.updated",
   "session.created",
   "session.resumed",
   "user.prompt.submitted",

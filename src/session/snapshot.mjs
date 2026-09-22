@@ -73,6 +73,7 @@ export async function writeSnapshot({ homeDir = os.homedir(), sessionId, snapsho
       ? { delegatedJobs: snapshot.delegatedJobs }
       : {}),
     // ADR 0037 D1: parked tool approvals (checkpoint for approve-after-restart).
+    ...(Array.isArray(snapshot?.pendingPrompts) ? { pendingPrompts: snapshot.pendingPrompts } : {}),
     ...(Array.isArray(snapshot?.parkedApprovals) && snapshot.parkedApprovals.length > 0
       ? { parkedApprovals: snapshot.parkedApprovals }
       : {})

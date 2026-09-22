@@ -102,6 +102,7 @@ export async function saveSessionState({ homeDir = os.homedir(), sessionId, stat
     snapshot: {
       eventCount: Number.isFinite(state?.eventCount) ? Number(state.eventCount) : 0,
       messages,
+      pendingPrompts: state?.pendingPrompts,
       usage: state?.usage,
       todos: state?.todos,
       planMode: state?.planMode,
